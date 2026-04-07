@@ -20,7 +20,7 @@ export function IntegrationGrid() {
     <Card>
       <CardHeader>
         <CardTitle>Integrations</CardTitle>
-        <Link href="/integrations" className="text-xs text-brand-light hover:underline">
+        <Link href="/app/integrations" className="text-xs text-brand-light hover:underline">
           Configure
         </Link>
       </CardHeader>

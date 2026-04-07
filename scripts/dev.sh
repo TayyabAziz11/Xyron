@@ -22,11 +22,11 @@ echo "Backend API started (PID: $BACKEND_PID) on http://localhost:8000"
 cd "$REPO_ROOT/web"
 npm run dev &
 FRONTEND_PID=$!
-echo "Web dashboard started (PID: $FRONTEND_PID) on http://localhost:3000"
+echo "Web dashboard started (PID: $FRONTEND_PID) on http://localhost:3001"
 
 echo ""
 echo "AI Operator running:"
-echo "  Dashboard: http://localhost:3000"
+echo "  Dashboard: http://localhost:3001"
 echo "  API:       http://localhost:8000"
 echo "  API Docs:  http://localhost:8000/docs"
 echo ""

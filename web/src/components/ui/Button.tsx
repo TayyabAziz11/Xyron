@@ -1,3 +1,6 @@
+'use client'
+
+import { motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { LoadingSpinner } from './LoadingSpinner'
 import type { LucideIcon } from 'lucide-react'
@@ -39,18 +42,26 @@ export function Button({
   className,
   children,
   disabled,
-  ...props
+  onClick,
+  type,
+  ...rest
 }: ButtonProps) {
   return (
-    <button
+    <motion.button
+      whileTap={{ scale: 0.97 }}
+      transition={{ duration: 0.1 }}
+      type={type}
+      onClick={onClick}
+      disabled={disabled || loading}
       className={cn(
         'inline-flex items-center justify-center rounded-lg font-medium transition-colors focus:outline-none disabled:cursor-not-allowed',
         variantClasses[variant],
         sizeClasses[size],
         className,
       )}
-      disabled={disabled || loading}
-      {...props}
+      // Pass remaining safe HTML attrs via data- or aria- only — keep spread minimal
+      aria-disabled={disabled || loading}
+      {...(rest as object)}
     >
       {loading ? (
         <LoadingSpinner size="sm" />
@@ -58,6 +69,6 @@ export function Button({
         <Icon className={size === 'sm' ? 'h-3.5 w-3.5' : 'h-4 w-4'} />
       ) : null}
       {children}
-    </button>
+    </motion.button>
   )
 }

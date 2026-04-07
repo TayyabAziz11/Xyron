@@ -9,6 +9,12 @@ export interface ApiResponse<T> {
 // Commands
 export type CommandStatus = 'queued' | 'running' | 'completed' | 'failed'
 
+export interface CommandIntent {
+  agent: string
+  skill: string
+  confidence: string
+}
+
 export interface Command {
   id: string
   text: string
@@ -18,6 +24,7 @@ export interface Command {
   result?: string
   error?: string
   agent?: string
+  intent?: CommandIntent
 }
 
 // Approvals

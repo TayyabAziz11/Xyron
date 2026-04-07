@@ -1,10 +1,9 @@
 import type { Metadata } from 'next'
 import './globals.css'
-import { AppShell } from '@/components/layout/AppShell'
 
 export const metadata: Metadata = {
   title: 'AI Operator',
-  description: 'Professional AI agent dashboard',
+  description: 'Professional AI agent — automate work with human-in-the-loop approval',
 }
 
 export default function RootLayout({
@@ -15,7 +14,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body>
-        <AppShell>{children}</AppShell>
+        {children}
       </body>
     </html>
   )

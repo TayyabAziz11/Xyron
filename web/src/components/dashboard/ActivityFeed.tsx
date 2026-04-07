@@ -24,7 +24,7 @@ export function ActivityFeed() {
     <Card>
       <CardHeader>
         <CardTitle>Recent Activity</CardTitle>
-        <Link href="/activity" className="text-xs text-brand-light hover:underline">
+        <Link href="/app/activity" className="text-xs text-brand-light hover:underline">
           View all
         </Link>
       </CardHeader>

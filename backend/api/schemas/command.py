@@ -21,6 +21,13 @@ class CommandSubmit(BaseModel):
     text: str = Field(..., min_length=1, max_length=4096, description="Natural language command text")
 
 
+class CommandIntent(BaseModel):
+    """Classified intent from the command text."""
+    agent: str
+    skill: str
+    confidence: str
+
+
 class Command(BaseModel):
     """A submitted command with lifecycle state."""
     model_config = ConfigDict(use_enum_values=True)
@@ -33,6 +40,7 @@ class Command(BaseModel):
     result: Optional[str] = None
     error: Optional[str] = None
     agent: Optional[str] = None  # which agent handled it
+    intent: Optional[CommandIntent] = None  # classified intent
 
 
 class CommandResult(BaseModel):

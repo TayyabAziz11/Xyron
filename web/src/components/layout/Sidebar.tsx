@@ -10,6 +10,7 @@ import {
   Puzzle,
   GitBranch,
   Settings,
+  ArrowLeft,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { StatusDot } from '@/components/ui/StatusDot'
@@ -18,13 +19,13 @@ import { api } from '@/lib/api'
 import { useApprovals } from '@/hooks/useApprovals'
 
 const navItems = [
-  { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { href: '/command', label: 'Command Center', icon: Terminal },
-  { href: '/approvals', label: 'Approvals', icon: CheckCircle, showBadge: true },
-  { href: '/activity', label: 'Activity', icon: Activity },
-  { href: '/integrations', label: 'Integrations', icon: Puzzle },
-  { href: '/workflows', label: 'Workflows', icon: GitBranch },
-  { href: '/settings', label: 'Settings', icon: Settings },
+  { href: '/app/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/app/command-center', label: 'Command Center', icon: Terminal },
+  { href: '/app/approvals', label: 'Approvals', icon: CheckCircle, showBadge: true },
+  { href: '/app/activity', label: 'Activity', icon: Activity },
+  { href: '/app/integrations', label: 'Integrations', icon: Puzzle },
+  { href: '/app/workflows', label: 'Workflows', icon: GitBranch },
+  { href: '/app/settings', label: 'Settings', icon: Settings },
 ]
 
 export function Sidebar() {
@@ -80,6 +81,17 @@ export function Sidebar() {
           })}
         </ul>
       </nav>
+
+      {/* Back to home */}
+      <div className="px-2 pb-2">
+        <Link
+          href="/"
+          className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-text-muted hover:text-text-secondary hover:bg-surface-hover transition-colors"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Back to home
+        </Link>
+      </div>
 
       {/* System status */}
       <div className="border-t border-surface-border p-4">

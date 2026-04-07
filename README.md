@@ -98,7 +98,9 @@ ai-operator/
 
 ---
 
-## Running the Backend
+## Running
+
+### Backend API
 
 ```bash
 cd backend
@@ -109,6 +111,50 @@ pip install -e .
 # Copy and fill in environment variables
 cp .env.example .env
 
+# Run the FastAPI server
+uvicorn api.main:app --reload --port 8000
+```
+
+### Web Dashboard
+
+```bash
+cd web
+npm install
+npm run dev      # starts on http://localhost:3001
+```
+
+### URLs
+
+| Surface | URL |
+|---|---|
+| Homepage | http://localhost:3001 |
+| Dashboard | http://localhost:3001/app/dashboard |
+| Command Center | http://localhost:3001/app/command-center |
+| Approvals | http://localhost:3001/app/approvals |
+| Activity | http://localhost:3001/app/activity |
+| Integrations | http://localhost:3001/app/integrations |
+| Workflows | http://localhost:3001/app/workflows |
+| Settings | http://localhost:3001/app/settings |
+| API | http://localhost:8000 |
+| API Docs | http://localhost:8000/docs |
+
+### Route structure
+
+```
+/               → Public landing page (homepage)
+/app            → Redirects to /app/dashboard
+/app/dashboard  → Main dashboard
+/app/command-center  → Command input + history
+/app/approvals  → Approval queue
+/app/activity   → Audit log
+/app/integrations → Integration status
+/app/workflows  → Workflow tracker
+/app/settings   → System settings
+```
+
+### Legacy scripts
+
+```bash
 # Run the agent daemon
 python scripts/agent_daemon.py
 

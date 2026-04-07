@@ -5,13 +5,13 @@ import { Bell } from 'lucide-react'
 import { useApprovals } from '@/hooks/useApprovals'
 
 const pageTitles: Record<string, { title: string; subtitle: string }> = {
-  '/dashboard': { title: 'Dashboard', subtitle: 'Your AI operations at a glance' },
-  '/command': { title: 'Command Center', subtitle: 'Tell AI Operator what to do' },
-  '/approvals': { title: 'Approvals', subtitle: 'Review and act on pending requests' },
-  '/activity': { title: 'Activity', subtitle: 'Audit trail of all agent actions' },
-  '/integrations': { title: 'Integrations', subtitle: 'Connected services and their status' },
-  '/workflows': { title: 'Workflows', subtitle: 'Active and completed agent tasks' },
-  '/settings': { title: 'Settings', subtitle: 'System configuration and status' },
+  '/app/dashboard': { title: 'Dashboard', subtitle: 'Your AI operations at a glance' },
+  '/app/command-center': { title: 'Command Center', subtitle: 'Tell AI Operator what to do' },
+  '/app/approvals': { title: 'Approvals', subtitle: 'Review and act on pending requests' },
+  '/app/activity': { title: 'Activity', subtitle: 'Audit trail of all agent actions' },
+  '/app/integrations': { title: 'Integrations', subtitle: 'Connected services and their status' },
+  '/app/workflows': { title: 'Workflows', subtitle: 'Active and completed agent tasks' },
+  '/app/settings': { title: 'Settings', subtitle: 'System configuration and status' },
 }
 
 export function Header() {

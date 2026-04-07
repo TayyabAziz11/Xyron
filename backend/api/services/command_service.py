@@ -11,9 +11,31 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from ..schemas.command import Command, CommandStatus
+from ..schemas.command import Command, CommandIntent, CommandStatus
 
 
+# ── Intent classification ────────────────────────────────────────────────────
+INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
+    (["email", "mail", "inbox", "message", "send", "draft", "reply"], "email", "email_draft"),
+    (["linkedin", "post", "publish", "content", "article"], "linkedin", "linkedin_draft"),
+    (["approval", "approve", "pending", "review"], "approval", "list_approvals"),
+    (["summary", "summarize", "report", "briefing"], "reporting", "daily_summary"),
+    (["workflow", "task", "process", "run"], "workflow", "list_workflows"),
+    (["integration", "status", "health", "check"], "integration", "integration_status"),
+    (["activity", "log", "history", "audit"], "activity", "activity_summary"),
+]
+
+
+def classify_intent(text: str) -> CommandIntent:
+    """Simple keyword-based intent classifier."""
+    text_lower = text.lower()
+    for keywords, agent, skill in INTENT_PATTERNS:
+        if any(kw in text_lower for kw in keywords):
+            return CommandIntent(agent=agent, skill=skill, confidence="keyword_match")
+    return CommandIntent(agent="general", skill="general_query", confidence="fallback")
+
+
+# ── Service ──────────────────────────────────────────────────────────────────
 class CommandService:
     """In-memory command store with FIFO eviction (max 200 commands)."""
 
@@ -23,8 +45,9 @@ class CommandService:
         self._store: OrderedDict[str, Command] = OrderedDict()
 
     def submit(self, text: str) -> Command:
-        """Create and queue a new command."""
-        cmd = Command(text=text, status=CommandStatus.queued)
+        """Create, classify intent, and queue a new command."""
+        intent = classify_intent(text)
+        cmd = Command(text=text, status=CommandStatus.queued, intent=intent)
         self._store[cmd.id] = cmd
 
         # Evict oldest if over capacity
