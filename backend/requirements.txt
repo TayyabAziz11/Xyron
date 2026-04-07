@@ -1,0 +1,11 @@
+# Personal AI Employee - Python Dependencies
+# Silver Tier (MCP + HITL)
+
+# Gmail API (M3 - Silver Tier)
+google-auth>=2.16.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.80.0
+
+# Standard library only for Bronze Tier
+# (No additional dependencies needed for filesystem watcher)

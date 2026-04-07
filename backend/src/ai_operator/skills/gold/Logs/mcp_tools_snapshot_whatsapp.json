@@ -1,0 +1,36 @@
+{
+  "server_name": "whatsapp",
+  "status": "reachable",
+  "snapshot_timestamp": "2026-02-27T12:21:53.734869+00:00",
+  "version": "1.0",
+  "tool_count": 2,
+  "tools": [
+    {
+      "name": "whatsapp.send_message",
+      "description": "Send a WhatsApp message",
+      "parameters": {
+        "to": {
+          "type": "string",
+          "required": true
+        },
+        "message": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "returns": "message_id"
+    },
+    {
+      "name": "whatsapp.list_messages",
+      "description": "List recent WhatsApp messages",
+      "parameters": {
+        "limit": {
+          "type": "integer",
+          "required": false,
+          "default": 10
+        }
+      },
+      "returns": "message_list"
+    }
+  ]
+}

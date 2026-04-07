@@ -1,0 +1,33 @@
+{
+  "server_name": "odoo",
+  "status": "reachable",
+  "snapshot_timestamp": "2026-02-27T12:21:53.854171+00:00",
+  "version": "1.0",
+  "tool_count": 2,
+  "tools": [
+    {
+      "name": "odoo.list_unpaid_invoices",
+      "description": "List unpaid invoices",
+      "parameters": {
+        "limit": {
+          "type": "integer",
+          "required": false,
+          "default": 50
+        }
+      },
+      "returns": "invoice_list"
+    },
+    {
+      "name": "odoo.revenue_summary",
+      "description": "Get revenue summary",
+      "parameters": {
+        "period": {
+          "type": "string",
+          "required": false,
+          "default": "month"
+        }
+      },
+      "returns": "revenue_data"
+    }
+  ]
+}
