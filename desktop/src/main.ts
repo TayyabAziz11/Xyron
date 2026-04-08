@@ -132,16 +132,20 @@ function createTray(): Tray {
 }
 
 // ── IPC Handlers ──────────────────────────────────────────────────────────────
+// All handlers catch network errors silently — the renderer shows "offline" state.
 ipcMain.handle('submit-command', async (_event, text: string) => {
-  return await apiPost('/api/v1/commands', { text, source: 'desktop' })
+  try { return await apiPost('/api/v1/commands', { text, source: 'desktop' }) }
+  catch { return null }
 })
 
 ipcMain.handle('get-commands', async () => {
-  return await apiGet('/api/v1/commands')
+  try { return await apiGet('/api/v1/commands') }
+  catch { return null }
 })
 
 ipcMain.handle('get-health', async () => {
-  return await apiGet('/api/v1/health')
+  try { return await apiGet('/api/v1/health') }
+  catch { return null }
 })
 
 ipcMain.handle('hide-window', () => {

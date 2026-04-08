@@ -4,9 +4,9 @@
   "description": "AI Operator Desktop Companion",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "tsc && electron dist/main.js",
+    "dev": "tsc && DBUS_SESSION_BUS_ADDRESS=autolaunch: electron --no-sandbox dist/main.js",
     "build": "tsc",
-    "start": "electron dist/main.js"
+    "start": "DBUS_SESSION_BUS_ADDRESS=autolaunch: electron --no-sandbox dist/main.js"
   },
   "devDependencies": {
     "electron": "^36.0.0",
