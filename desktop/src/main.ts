@@ -63,11 +63,13 @@ function apiPost(endpoint: string, body: object): Promise<unknown> {
 // ── Assistant Window ───────────────────────────────────────────────────────────
 function createAssistantWindow(): BrowserWindow {
   const win = new BrowserWindow({
-    width: 420,
-    height: 560,
+    width: 520,
+    height: 680,
+    minWidth: 380,
+    minHeight: 500,
     // On WSL2/Linux without tray, show the window directly
     show: process.platform === 'linux',
-    frame: process.platform === 'linux', // frameless only works reliably on macOS/Windows
+    frame: process.platform === 'linux',
     resizable: true,
     alwaysOnTop: false,
     skipTaskbar: false,
