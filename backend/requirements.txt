@@ -8,6 +8,12 @@ pydantic-settings>=2.6.0
 python-multipart>=0.0.12
 python-dotenv>=1.0.0
 
+# Voice pipeline
+faster-whisper>=1.1.0
+sounddevice>=0.5.1
+numpy>=1.26.0
+scipy>=1.13.0
+
 # Gmail API
 google-auth>=2.16.0
 google-auth-oauthlib>=1.0.0

@@ -7,6 +7,7 @@ import type {
   Workflow,
   HealthStatus,
   SystemStatus,
+  VoiceTranscriptionResult,
 } from './types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
@@ -82,6 +83,19 @@ export const api = {
   workflows: {
     list: (status = 'all') => apiGet<Workflow[]>(`/api/v1/workflows?status=${status}`),
     get: (id: string) => apiGet<Workflow>(`/api/v1/workflows/${id}`),
+  },
+
+  voice: {
+    transcribe: (blob: Blob): Promise<VoiceTranscriptionResult> => {
+      const form = new FormData()
+      form.append('audio', blob, 'recording.webm')
+      return fetch(`${API_BASE}/api/v1/voice/transcribe`, {
+        method: 'POST',
+        body: form,
+      })
+        .then((r) => r.json())
+        .then((body: ApiResponse<VoiceTranscriptionResult>) => body.data)
+    },
   },
 }
 

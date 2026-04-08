@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+  <title>AI Operator</title>
+  <style>
+    :root {
+      --bg: #08080f;
+      --surface: #0f0f1a;
+      --card: #161625;
+      --border: #1e1e30;
+      --brand: #7c3aed;
+      --brand-light: #8b5cf6;
+      --text: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #475569;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --error: #ef4444;
+      --radius: 12px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, 'Inter', system-ui, sans-serif;
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    .titlebar {
+      -webkit-app-region: drag;
+      height: 28px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+    }
+    .titlebar-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .titlebar-close {
+      -webkit-app-region: no-drag;
+      width: 20px; height: 20px;
+      border: none; background: none;
+      cursor: pointer;
+      color: var(--text-muted);
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 4px;
+      font-size: 14px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .titlebar-close:hover { background: rgba(239,68,68,0.15); color: var(--error); }
+
+    .main { padding: 16px; display: flex; flex-direction: column; gap: 12px; height: calc(100vh - 28px); }
+
+    .status-bar {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: var(--text-muted);
+    }
+    .status-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--text-muted);
+      transition: background 0.3s;
+      flex-shrink: 0;
+    }
+    .status-dot.online { background: var(--success); box-shadow: 0 0 4px var(--success); animation: pulse 2s infinite; }
+    .status-dot.offline { background: var(--error); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+    .input-area {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border-color 0.2s;
+    }
+    .input-area:focus-within { border-color: var(--brand); }
+
+    textarea {
+      background: none; border: none; outline: none;
+      color: var(--text);
+      font-size: 14px; font-family: inherit;
+      resize: none; width: 100%;
+      line-height: 1.5;
+      min-height: 60px;
+    }
+    textarea::placeholder { color: var(--text-muted); }
+
+    .input-actions { display: flex; align-items: center; justify-content: space-between; }
+    .char-count { font-size: 11px; color: var(--text-muted); }
+
+    .btn {
+      border: none; cursor: pointer; font-family: inherit;
+      border-radius: 8px; font-size: 13px; font-weight: 500;
+      display: flex; align-items: center; gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn-primary { background: var(--brand); color: white; padding: 7px 16px; }
+    .btn-primary:hover { background: var(--brand-light); }
+    .btn-primary:active { transform: scale(0.97); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-ghost {
+      background: none; color: var(--text-secondary);
+      padding: 6px 10px; border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { background: var(--surface); color: var(--text); }
+
+    .result-area {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+      overflow-y: auto;
+      min-height: 0;
+    }
+    .result-empty {
+      height: 100%;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 8px; color: var(--text-muted);
+    }
+    .result-empty-icon { font-size: 28px; opacity: 0.4; }
+    .result-empty-text { font-size: 12px; }
+
+    .result-item { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .result-item:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+    .result-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .result-badge {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      padding: 2px 7px; border-radius: 4px; letter-spacing: 0.04em;
+    }
+    .badge-queued  { background: rgba(71,85,105,0.3); color: #94a3b8; }
+    .badge-running { background: rgba(124,58,237,0.2); color: #a78bfa; }
+    .badge-completed { background: rgba(16,185,129,0.15); color: #34d399; }
+    .badge-failed  { background: rgba(239,68,68,0.15); color: #f87171; }
+
+    .result-intent { font-size: 11px; color: var(--text-muted); }
+    .result-text {
+      font-size: 12px; color: var(--text-secondary);
+      line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+      margin-top: 4px;
+    }
+    .result-command-text { font-size: 13px; font-weight: 500; color: var(--text); }
+    .result-timestamp { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+
+    .quick-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .quick-chip {
+      background: var(--card); border: 1px solid var(--border);
+      color: var(--text-secondary); font-size: 11px;
+      padding: 5px 10px; border-radius: 20px;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .quick-chip:hover { border-color: var(--brand); color: var(--text); background: rgba(124,58,237,0.1); }
+
+    .footer { display: flex; align-items: center; justify-content: space-between; padding-top: 4px; }
+    .footer-hint { font-size: 11px; color: var(--text-muted); }
+    .footer-link { font-size: 11px; color: var(--brand-light); background: none; border: none; cursor: pointer; font-family: inherit; }
+    .footer-link:hover { text-decoration: underline; }
+
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; }
+
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div class="titlebar">
+    <span class="titlebar-title">AI Operator</span>
+    <button class="titlebar-close" onclick="window.aiOperator.hideWindow()" title="Close (Esc)">&#x2715;</button>
+  </div>
+
+  <div class="main">
+    <div class="status-bar">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Checking connection...</span>
+    </div>
+
+    <div class="input-area">
+      <textarea
+        id="commandInput"
+        placeholder="Tell AI Operator what to do..."
+        maxlength="500"
+        rows="3"
+        onkeydown="handleKeyDown(event)"
+        oninput="updateCharCount()"
+      ></textarea>
+      <div class="input-actions">
+        <span class="char-count" id="charCount">0 / 500</span>
+        <button class="btn btn-primary" id="submitBtn" onclick="submitCommand()">
+          <span id="btnText">Run</span>
+          <div class="spinner" id="btnSpinner" style="display:none"></div>
+        </button>
+      </div>
+    </div>
+
+    <div class="quick-actions">
+      <span class="quick-chip" onclick="fillCommand('Summarize unread emails')">Emails</span>
+      <span class="quick-chip" onclick="fillCommand('Show pending approvals')">Approvals</span>
+      <span class="quick-chip" onclick="fillCommand('Draft a LinkedIn post')">LinkedIn</span>
+      <span class="quick-chip" onclick="fillCommand('Show workflow status')">Workflows</span>
+    </div>
+
+    <div class="result-area" id="resultArea">
+      <div class="result-empty" id="emptyState">
+        <div class="result-empty-icon">&#11043;</div>
+        <div class="result-empty-text">Ready for commands</div>
+      </div>
+      <div id="resultList" style="display:none"></div>
+    </div>
+
+    <div class="footer">
+      <span class="footer-hint">Ctrl+Enter to submit &nbsp;&bull;&nbsp; Esc to close</span>
+      <button class="footer-link" onclick="window.aiOperator.openDashboard()">Open Dashboard &rarr;</button>
+    </div>
+  </div>
+
+  <script>
+    // Extend window type for TypeScript — runtime only, no imports needed
+    const commands = []
+    let isSubmitting = false
+
+    async function checkHealth() {
+      try {
+        const data = await window.aiOperator.getHealth()
+        const online = !!(data && (data.data || data.status))
+        document.getElementById('statusDot').className = 'status-dot ' + (online ? 'online' : 'offline')
+        document.getElementById('statusText').textContent = online
+          ? 'Connected to AI Operator'
+          : 'Backend offline'
+      } catch {
+        document.getElementById('statusDot').className = 'status-dot offline'
+        document.getElementById('statusText').textContent = 'Backend offline — start the server'
+      }
+    }
+    checkHealth()
+    setInterval(checkHealth, 10000)
+
+    function updateCharCount() {
+      const val = document.getElementById('commandInput').value
+      document.getElementById('charCount').textContent = val.length + ' / 500'
+    }
+
+    function handleKeyDown(e) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault()
+        submitCommand()
+      }
+      if (e.key === 'Escape') {
+        window.aiOperator.hideWindow()
+      }
+    }
+
+    function fillCommand(text) {
+      document.getElementById('commandInput').value = text
+      updateCharCount()
+      document.getElementById('commandInput').focus()
+    }
+
+    async function submitCommand() {
+      if (isSubmitting) return
+      const input = document.getElementById('commandInput')
+      const text = input.value.trim()
+      if (!text) return
+
+      isSubmitting = true
+      setSubmitLoading(true)
+
+      try {
+        const response = await window.aiOperator.submitCommand(text)
+        const data = response && response.data ? response.data : response
+
+        const cmd = {
+          id: (data && data.id) ? data.id : String(Date.now()),
+          text: text,
+          status: (data && data.status) ? data.status : 'queued',
+          intent: (data && data.intent) ? data.intent : null,
+          result: (data && data.result) ? data.result : null,
+          timestamp: new Date().toLocaleTimeString(),
+        }
+
+        commands.unshift(cmd)
+        input.value = ''
+        updateCharCount()
+        renderResults()
+
+        if (cmd.id) pollCommand(cmd.id)
+
+      } catch (err) {
+        console.error('Submit error:', err)
+      } finally {
+        isSubmitting = false
+        setSubmitLoading(false)
+      }
+    }
+
+    function setSubmitLoading(loading) {
+      document.getElementById('btnText').style.display = loading ? 'none' : 'inline'
+      document.getElementById('btnSpinner').style.display = loading ? 'block' : 'none'
+      document.getElementById('submitBtn').disabled = loading
+    }
+
+    async function pollCommand(cmdId) {
+      let attempts = 0
+      while (attempts < 30) {
+        await sleep(1000)
+        try {
+          const resp = await window.aiOperator.getCommands()
+          const all = (resp && resp.data) ? resp.data : []
+          const found = all.find(function(c) { return c.id === cmdId })
+          if (found) {
+            const idx = commands.findIndex(function(c) { return c.id === cmdId })
+            if (idx !== -1) {
+              commands[idx] = Object.assign({}, commands[idx], found)
+              renderResults()
+            }
+            if (found.status === 'completed' || found.status === 'failed') break
+          }
+        } catch {}
+        attempts++
+      }
+    }
+
+    function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms) }) }
+
+    function renderResults() {
+      const list = document.getElementById('resultList')
+      const empty = document.getElementById('emptyState')
+
+      if (commands.length === 0) {
+        list.style.display = 'none'
+        empty.style.display = 'flex'
+        return
+      }
+
+      empty.style.display = 'none'
+      list.style.display = 'block'
+
+      list.innerHTML = commands.slice(0, 5).map(function(cmd) {
+        const intentStr = cmd.intent
+          ? (cmd.intent.agent + ' &middot; ' + cmd.intent.skill)
+          : ''
+        const resultStr = cmd.result
+          ? ('<div class="result-text">' + escHtml(cmd.result.slice(0, 200)) + (cmd.result.length > 200 ? '...' : '') + '</div>')
+          : ''
+        return (
+          '<div class="result-item">' +
+            '<div class="result-meta">' +
+              '<span class="result-badge badge-' + cmd.status + '">' + cmd.status + '</span>' +
+              (intentStr ? '<span class="result-intent">' + intentStr + '</span>' : '') +
+              '<span class="result-timestamp">' + cmd.timestamp + '</span>' +
+            '</div>' +
+            '<div class="result-command-text">' + escHtml(cmd.text) + '</div>' +
+            resultStr +
+          '</div>'
+        )
+      }).join('')
+    }
+
+    function escHtml(str) {
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+    }
+
+    setTimeout(function() { document.getElementById('commandInput').focus() }, 100)
+  </script>
+</body>
+</html>

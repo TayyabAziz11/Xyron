@@ -89,6 +89,13 @@ export interface Workflow {
   error?: string
 }
 
+// Voice
+export interface VoiceTranscriptionResult {
+  text: string
+  language: string
+  note?: string
+}
+
 // Health
 export interface HealthStatus {
   status: string
