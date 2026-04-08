@@ -967,10 +967,36 @@ async function checkHealth() {
 }
 
 /* ── Microphone ──────────────────────── */
+const GREETINGS = [
+  "Hi, I'm AI Operator. Go ahead and speak.",
+  "Hey, I'm here to help. What would you like to do?",
+  "AI Operator ready. Go ahead.",
+]
+let greetingIndex = 0
+
+function playWakeGreeting() {
+  return new Promise(resolve => {
+    if (!window.speechSynthesis) { resolve(); return }
+    window.speechSynthesis.cancel()
+    const line = GREETINGS[greetingIndex % GREETINGS.length]
+    greetingIndex++
+    const u = new SpeechSynthesisUtterance(line)
+    u.rate = 1.05; u.volume = 0.85
+    u.onend = resolve; u.onerror = resolve
+    window.speechSynthesis.speak(u)
+  })
+}
+
 async function toggleMic() {
   if (isRec) { stopMic(); return }
+
+  // Play greeting first so mic doesn't capture it
+  await playWakeGreeting()
+
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio:true })
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true }
+    })
     chunks = []
     mediaRec = new MediaRecorder(stream)
     mediaRec.ondataavailable = e => { if (e.data.size) chunks.push(e.data) }
@@ -979,7 +1005,14 @@ async function toggleMic() {
     isRec = true
     $('micBtn').classList.add('recording')
     $('micOverlay').classList.add('on')
-  } catch { showToast('Microphone access denied', 'err') }
+  } catch(err) {
+    let msg = 'Microphone access denied'
+    if (err instanceof DOMException) {
+      if (err.name === 'NotFoundError') msg = 'No microphone detected'
+      else if (err.name === 'NotReadableError') msg = 'Mic is busy — close other apps'
+    }
+    showToast(msg, 'err')
+  }
 }
 
 function stopMic() {
@@ -1002,17 +1035,24 @@ async function transcribe() {
     const data = await resp.json()
     const text = data?.data?.text?.trim() || ''
     $('micBtn').classList.remove('thinking')
+    const engine = data?.data?.engine || 'unknown'
     if (text) {
       $('cmd').value = text; onInput()
       $('trTxt').textContent = `"${text}"`
       $('trBar').classList.add('on')
-      showToast('Voice captured — review and run', 'ok')
+      showToast('Got it — review and run', 'ok')
     } else {
-      showToast('No speech detected', 'err')
+      // Play a helpful "didn't catch that" response
+      if (window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance("Sorry, I didn't catch that. Please try again.")
+        u.rate = 1.05; u.volume = 0.85
+        window.speechSynthesis.speak(u)
+      }
+      showToast('No speech detected — please try again', 'err')
     }
   } catch {
     $('micBtn').classList.remove('thinking')
-    showToast('Transcription failed', 'err')
+    showToast('Transcription failed — is backend running?', 'err')
   }
 }
 

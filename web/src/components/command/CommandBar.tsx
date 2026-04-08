@@ -49,6 +49,28 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
     }
   }
 
+  const playGreeting = useCallback((): Promise<void> => {
+    return new Promise((resolve) => {
+      if (typeof window === 'undefined' || !window.speechSynthesis) {
+        resolve()
+        return
+      }
+      window.speechSynthesis.cancel()
+      const greetings = [
+        "Hi, I'm AI Operator. Go ahead and speak your command.",
+        "Hey, I'm listening. What would you like me to do?",
+        "AI Operator here. I'm ready — go ahead.",
+      ]
+      const line = greetings[Math.floor(Math.random() * greetings.length)]
+      const utter = new SpeechSynthesisUtterance(line)
+      utter.rate   = 1.05
+      utter.volume = 0.85
+      utter.onend   = () => resolve()
+      utter.onerror = () => resolve()
+      window.speechSynthesis.speak(utter)
+    })
+  }, [])
+
   const startRecording = useCallback(async () => {
     setMicError(null)
 
@@ -58,9 +80,12 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
       return
     }
 
+    // Play greeting first, then open mic (prevents greeting being transcribed)
+    await playGreeting()
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
+        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
       })
       chunksRef.current = []
 
@@ -76,7 +101,7 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
       console.error('[CommandBar] Mic error:', err)
       setMicError(micErrorMessage(err))
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [playGreeting]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const stopRecording = useCallback(() => {
     const recorder = mediaRecorderRef.current
@@ -104,6 +129,14 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
       if (transcript) {
         setText(transcript)
         onTranscript?.(transcript)
+      } else {
+        // Speak "didn't catch that" and show a dismissable hint
+        if (window.speechSynthesis) {
+          const u = new SpeechSynthesisUtterance("Sorry, I didn't catch that. Please try again.")
+          u.rate = 1.05
+          window.speechSynthesis.speak(u)
+        }
+        setMicError("Didn't catch that — try speaking clearly after the greeting, then click Stop.")
       }
     } catch (err) {
       console.error('Transcription request failed:', err)

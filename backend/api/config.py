@@ -21,9 +21,13 @@ def _find_repo_root() -> Path:
     return Path(__file__).parent.parent.parent
 
 
+# Absolute path to backend/.env — works regardless of launch directory
+_BACKEND_ENV = Path(__file__).parent.parent / ".env"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_BACKEND_ENV),   # absolute path so CWD doesn't matter
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
