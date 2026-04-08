@@ -1,9 +1,11 @@
-"""Voice transcription endpoint — accepts audio blob, returns transcript."""
+"""Voice transcription and synthesis endpoints."""
 from __future__ import annotations
 import logging
+import sys
 import tempfile
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi.responses import Response
 
 router = APIRouter(prefix="/api/v1/voice", tags=["voice"])
 logger = logging.getLogger(__name__)
@@ -56,3 +58,63 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     except Exception as exc:
         logger.error("Transcription error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/synthesize")
+async def synthesize_text(request: Request):
+    """
+    Convert text to speech audio (WAV).
+
+    Body: {"text": "...", "rate": 165, "volume": 0.9}
+    Returns: audio/wav binary stream
+
+    Requires pyttsx3 + espeak-ng installed.
+    Returns 503 if TTS is not available.
+    """
+    # Ensure the voice package is importable
+    _voice_root = Path(__file__).parent.parent.parent
+    if str(_voice_root) not in sys.path:
+        sys.path.insert(0, str(_voice_root))
+
+    try:
+        from voice.tts_service import synthesize_speech, is_tts_available
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"TTS module not found: {exc}")
+
+    body = await request.json()
+    text = body.get("text", "").strip()
+    rate = body.get("rate", 165)
+    volume = body.get("volume", 0.9)
+
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    if not is_tts_available():
+        raise HTTPException(
+            status_code=503,
+            detail="TTS not available. Install: sudo apt-get install espeak-ng && pip install pyttsx3",
+        )
+
+    audio_bytes = synthesize_speech(text, rate=int(rate), volume=float(volume))
+    if not audio_bytes:
+        raise HTTPException(status_code=500, detail="TTS synthesis failed")
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@router.get("/tts-info")
+async def tts_info():
+    """Return TTS engine availability and metadata."""
+    _voice_root = Path(__file__).parent.parent.parent
+    if str(_voice_root) not in sys.path:
+        sys.path.insert(0, str(_voice_root))
+
+    try:
+        from voice.tts_service import get_tts_info
+        return {"success": True, "data": get_tts_info()}
+    except ImportError:
+        return {"success": True, "data": {"available": False, "engine": None}}

@@ -41,6 +41,8 @@ class Command(BaseModel):
     error: Optional[str] = None
     agent: Optional[str] = None  # which agent handled it
     intent: Optional[CommandIntent] = None  # classified intent
+    assistant_response: Optional[str] = None  # spoken-friendly response for TTS
+    draft_id: Optional[str] = None  # associated draft (if command produced one)
 
 
 class CommandResult(BaseModel):

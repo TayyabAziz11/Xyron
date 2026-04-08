@@ -25,6 +25,26 @@ export interface Command {
   error?: string
   agent?: string
   intent?: CommandIntent
+  assistant_response?: string
+  draft_id?: string  // present when command produced a reviewable draft
+}
+
+// Drafts
+export type DraftStatus = 'draft' | 'confirmed' | 'executing' | 'executed' | 'rejected' | 'failed'
+
+export interface Draft {
+  id: string
+  command_id: string
+  draft_type: 'linkedin_post' | 'email' | 'instagram' | 'whatsapp' | string
+  title: string
+  content: string
+  metadata: Record<string, string>
+  status: DraftStatus
+  created_at: string
+  updated_at?: string
+  executed_at?: string
+  error?: string
+  execution_url?: string
 }
 
 // Approvals

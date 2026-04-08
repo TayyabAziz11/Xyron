@@ -21,9 +21,16 @@ This is not a smart-home assistant. This is an AI that handles real business wor
 - Always-accessible popup assistant
 - Wake word support (openWakeWord)
 
+**Phase 2 — Desktop Companion + Voice Responses (current)**
+- Electron tray app with push-to-talk
+- Always-accessible popup assistant
+- Wake word support (openWakeWord)
+- **Text-to-speech voice responses** — assistant speaks results after every command (pyttsx3/espeak)
+- Voice settings panel: enable/disable, speed, volume, auto-play
+- Web dashboard + desktop app both support audio playback
+
 **Phase 3 — Expansion**
 - WhatsApp, Instagram, calendar, booking workflows
-- Text-to-speech responses
 - Multi-user / team support
 
 ---
@@ -36,6 +43,7 @@ This is not a smart-home assistant. This is an AI that handles real business wor
 | Desktop App | Electron + TypeScript |
 | Backend / Agents | Python 3.13 |
 | Voice (STT) | OpenAI Whisper (local) |
+| Voice (TTS) | pyttsx3 / espeak-ng (local, no model download) |
 | Wake Word | openWakeWord (Phase 2) |
 | Agent Orchestration | Custom Python orchestrator |
 | Approval Workflow | File-based HITL (human-in-the-loop) |
@@ -92,6 +100,7 @@ ai-operator/
 - [ ] Web dashboard (new frontend)
 - [ ] Desktop Electron app
 - [ ] Voice command pipeline (Whisper STT → text → agent router)
+- [x] Voice response pipeline (command result → generate_assistant_response → pyttsx3 TTS → WAV → browser Audio playback)
 - [ ] Push-to-talk UI
 - [ ] Command history and approval UI
 - [ ] Settings and integrations management UI

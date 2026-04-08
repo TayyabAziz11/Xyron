@@ -500,6 +500,41 @@
 
     /* ── Divider ─────────────────────────────────────────── */
     hr.div { border:none; border-top:1px solid var(--border); }
+
+    /* ── Draft panel ─────────────────────────────────────── */
+    .draft-card { background:var(--card); border:1px solid var(--brand); border-radius:var(--r); overflow:hidden; }
+    .draft-type { font-size:var(--sz-xs); font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--brand-lt); padding:var(--sp-1) var(--sp-2) 0; }
+    .draft-content { padding:var(--sp-2); font-size:var(--sz-sm); color:var(--text-s); line-height:1.65; white-space:pre-wrap; max-height:120px; overflow-y:auto; }
+    .draft-hint { padding:0 var(--sp-2) var(--sp-1); font-size:var(--sz-xs); color:var(--text-m); }
+    .draft-hint code { background:var(--surface); border:1px solid var(--border-hi); border-radius:3px; padding:0 5px; color:var(--brand-lt); }
+    .draft-actions { display:flex; gap:var(--sp-1); padding:var(--sp-1) var(--sp-2) var(--sp-2); }
+    .draft-actions .btn-pri { flex:1; justify-content:center; }
+    .draft-executed { background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.3); border-radius:var(--r); padding:var(--sp-2); font-size:var(--sz-sm); color:var(--ok); }
+
+    /* ── Voice wave indicator ────────────────────────────── */
+    .wave-indicator {
+      display: none;
+      align-items: flex-end;
+      gap: 2px;
+      height: 14px;
+    }
+    .wave-indicator.on { display: flex; }
+    .wave-bar {
+      width: 2px;
+      border-radius: 1px;
+      background: var(--brand-lt);
+      animation: wave 0.8s ease-in-out infinite;
+    }
+    .wave-bar:nth-child(1) { animation-delay: 0s;    height: 4px; }
+    .wave-bar:nth-child(2) { animation-delay: 0.12s; height: 4px; }
+    .wave-bar:nth-child(3) { animation-delay: 0.24s; height: 4px; }
+    .wave-bar:nth-child(4) { animation-delay: 0.36s; height: 4px; }
+    @keyframes wave {
+      0%, 100% { height: 4px; }
+      50%       { height: 13px; }
+    }
+    .win-btn.voice-on { color: var(--brand-lt); }
+    .win-btn.voice-on:hover { background: var(--brand-dim); }
   </style>
 </head>
 <body>
@@ -513,6 +548,19 @@
       <span class="tb-badge">v0.1.0</span>
     </div>
     <div class="tb-right">
+      <!-- Wave indicator — shown while TTS is playing -->
+      <div class="wave-indicator" id="waveIndicator">
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+        <div class="wave-bar"></div>
+      </div>
+      <!-- Voice toggle button -->
+      <button class="win-btn voice-on" id="voiceToggle" title="Toggle voice responses" onclick="toggleVoice()">
+        <svg class="win-ico" id="voiceIco" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M10.5 8a2.5 2.5 0 01-5 0M8 1a3 3 0 013 3v4a3 3 0 01-6 0V4a3 3 0 013-3zM4 8a4 4 0 008 0M8 12v3M5 15h6"/>
+        </svg>
+      </button>
       <button class="win-btn" title="Open Dashboard" onclick="op('openDashboard')">
         <svg class="win-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
           <path d="M6 3H3a1 1 0 00-1 1v9a1 1 0 001 1h9a1 1 0 001-1v-3M10 2h4m0 0v4m0-4L7 9"/>
@@ -654,6 +702,22 @@
           </div>
         </div>
 
+        <!-- Draft preview (appears when command creates a draft) -->
+        <div id="draftPanel" style="display:none">
+          <div class="sec-lbl">Draft Ready — Review &amp; Confirm</div>
+          <div class="draft-card" id="draftCard">
+            <div class="draft-type" id="draftType"></div>
+            <div class="draft-content" id="draftContent"></div>
+            <div class="draft-hint" id="draftHint"></div>
+            <div class="draft-actions">
+              <button class="btn btn-pri" id="draftConfirmBtn" onclick="confirmDraft()">
+                ✓ Confirm &amp; Publish
+              </button>
+              <button class="btn btn-ghost" onclick="rejectDraft()">✕ Cancel</button>
+            </div>
+          </div>
+        </div>
+
         <!-- Recent commands -->
         <div>
           <div class="sec-lbl">Recent commands</div>
@@ -711,6 +775,14 @@ let lastText = ''
 let mediaRec = null
 let chunks   = []
 let isRec    = false
+
+/* ── Voice TTS state ────────────────── */
+let voiceEnabled = (() => {
+  try { return localStorage.getItem('desktop-voice-enabled') !== 'false' } catch { return true }
+})()
+let voiceRate   = 165
+let voiceVolume = 0.9
+let voiceAudio  = null
 
 /* ── Intent patterns ──────────────── */
 const PATTERNS = [
@@ -827,6 +899,17 @@ function pollStart(id, lbl) {
       resetBtn()
       showToast(d.status === 'completed' ? 'Done ✓' : 'Failed', d.status === 'completed' ? 'ok' : 'err')
       loadCmds()
+      // Speak the assistant response
+      if (d.status === 'completed' && d.assistant_response) {
+        speakResponse(d.assistant_response)
+      }
+      // Show draft panel if command produced a draft
+      if (d.status === 'completed' && d.draft_id) {
+        try {
+          const dr = await fetch(`${API}/api/v1/drafts/${d.draft_id}`).then(r => r.json())
+          if (dr?.data?.status === 'draft') showDraft(dr.data)
+        } catch { /* non-fatal */ }
+      }
     }
   }, 700)
 }
@@ -935,6 +1018,122 @@ async function transcribe() {
 
 function clearTr() { $('trBar').classList.remove('on') }
 
+/* ── Voice TTS ───────────────────────── */
+function setVoiceActive(on) {
+  $('waveIndicator').classList.toggle('on', on)
+}
+
+function toggleVoice() {
+  voiceEnabled = !voiceEnabled
+  try { localStorage.setItem('desktop-voice-enabled', voiceEnabled ? 'true' : 'false') } catch {}
+  const btn = $('voiceToggle')
+  if (voiceEnabled) {
+    btn.classList.add('voice-on')
+    btn.title = 'Mute voice responses'
+    // Restore speaker icon
+    $('voiceIco').innerHTML = '<path d="M10.5 8a2.5 2.5 0 01-5 0M8 1a3 3 0 013 3v4a3 3 0 01-6 0V4a3 3 0 013-3zM4 8a4 4 0 008 0M8 12v3M5 15h6"/>'
+  } else {
+    btn.classList.remove('voice-on')
+    btn.title = 'Enable voice responses'
+    // Muted icon (speaker with X line)
+    $('voiceIco').innerHTML = '<path d="M8 1a3 3 0 013 3v4a3 3 0 01-6 0V4a3 3 0 013-3zM4 8a4 4 0 008 0M8 12v3M5 15h6"/><line x1="2" y1="2" x2="14" y2="14"/>'
+    // Stop any playing audio
+    if (voiceAudio) { voiceAudio.pause(); voiceAudio = null }
+    setVoiceActive(false)
+  }
+  showToast(voiceEnabled ? 'Voice enabled' : 'Voice muted', 'ok')
+}
+
+async function speakResponse(text) {
+  if (!voiceEnabled || !text) return
+  // Stop previous
+  if (voiceAudio) { voiceAudio.pause(); voiceAudio = null }
+  setVoiceActive(false)
+  try {
+    const resp = await fetch(`${API}/api/v1/voice/synthesize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, rate: voiceRate, volume: voiceVolume }),
+    })
+    if (!resp.ok) return  // TTS not available — fail silently
+    const blob = await resp.blob()
+    const url = URL.createObjectURL(blob)
+    const audio = new Audio(url)
+    audio.volume = voiceVolume
+    voiceAudio = audio
+    setVoiceActive(true)
+    audio.onended = () => { URL.revokeObjectURL(url); setVoiceActive(false); voiceAudio = null }
+    audio.onerror = () => { URL.revokeObjectURL(url); setVoiceActive(false); voiceAudio = null }
+    audio.play()
+  } catch {
+    setVoiceActive(false)
+  }
+}
+
+/* ── Draft panel ─────────────────────── */
+let pendingDraftId = null
+
+const DRAFT_TYPE_LABELS = {
+  linkedin_post: 'LinkedIn Post',
+  email: 'Email Draft',
+  instagram: 'Instagram Post',
+  whatsapp: 'WhatsApp Message',
+}
+const DRAFT_HINTS = {
+  linkedin_post: "post it",
+  email: "send it",
+  instagram: "post it",
+  whatsapp: "send it",
+}
+
+function showDraft(draft) {
+  pendingDraftId = draft.id
+  $('draftType').textContent = DRAFT_TYPE_LABELS[draft.draft_type] || draft.draft_type
+  $('draftContent').textContent = draft.content
+  const hint = DRAFT_HINTS[draft.draft_type] || 'confirm it'
+  $('draftHint').innerHTML = `🎙 Say <code>${hint}</code> to confirm by voice`
+  $('draftConfirmBtn').disabled = false
+  $('draftConfirmBtn').textContent = '✓ Confirm & Publish'
+  $('draftCard').style.border = '1px solid var(--brand)'
+  $('draftPanel').style.display = 'block'
+}
+
+function hideDraft() {
+  pendingDraftId = null
+  $('draftPanel').style.display = 'none'
+}
+
+async function confirmDraft() {
+  if (!pendingDraftId) return
+  $('draftConfirmBtn').disabled = true
+  $('draftConfirmBtn').textContent = 'Publishing…'
+  try {
+    const r = await fetch(`${API}/api/v1/drafts/${pendingDraftId}/confirm`, { method: 'POST' })
+    const data = await r.json()
+    const spoken = data?.data?.spoken_response || 'Done!'
+    speakResponse(spoken)
+    showToast('Published successfully!', 'ok')
+    // Show executed state briefly before hiding
+    $('draftCard').innerHTML = `<div class="draft-executed">✓ Published successfully!</div>`
+    $('draftCard').style.border = '1px solid rgba(16,185,129,0.3)'
+    setTimeout(hideDraft, 2500)
+    loadCmds()
+  } catch {
+    showToast('Publish failed', 'err')
+    $('draftConfirmBtn').disabled = false
+    $('draftConfirmBtn').textContent = '✓ Confirm & Publish'
+  }
+}
+
+async function rejectDraft() {
+  if (!pendingDraftId) return
+  try {
+    await fetch(`${API}/api/v1/drafts/${pendingDraftId}/reject`, { method: 'POST' })
+  } catch { /* non-fatal */ }
+  hideDraft()
+  showToast('Draft cancelled', '')
+}
+
 /* ── Global keyboard ─────────────────── */
 window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !isRec) op('hideWindow')
@@ -942,6 +1141,12 @@ window.addEventListener('keydown', e => {
 
 /* ── Boot ────────────────────────────── */
 ;(async function init() {
+  // Apply persisted voice state to button
+  if (!voiceEnabled) {
+    $('voiceToggle').classList.remove('voice-on')
+    $('voiceToggle').title = 'Enable voice responses'
+    $('voiceIco').innerHTML = '<path d="M8 1a3 3 0 013 3v4a3 3 0 01-6 0V4a3 3 0 013-3zM4 8a4 4 0 008 0M8 12v3M5 15h6"/><line x1="2" y1="2" x2="14" y2="14"/>'
+  }
   await checkHealth()
   await loadCmds()
   await loadInts()

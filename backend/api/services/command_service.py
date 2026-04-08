@@ -23,13 +23,16 @@ logger = logging.getLogger(__name__)
 
 # ── Intent classification ────────────────────────────────────────────────────
 INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
-    # Specific platforms first — prevents generic words like "draft"/"post" matching wrong agent
+    # ── Confirmation / cancellation (must be first) ──────────────────────────
+    (["post it", "publish it", "go ahead", "yes confirm", "confirm it", "do it", "send it"], "confirm", "confirm_draft"),
+    (["cancel it", "reject it", "don't send", "no cancel", "discard it", "never mind"], "cancel", "reject_draft"),
+    # ── Specific platforms ────────────────────────────────────────────────────
     (["linkedin", "li post", "li article"], "linkedin", "linkedin_draft"),
     (["whatsapp", "wa message", "wa chat"], "whatsapp", "whatsapp_send"),
     (["instagram", "ig post", "ig story"], "instagram", "instagram_draft"),
     (["odoo", "invoice", "accounting", "erp"], "odoo", "odoo_query"),
     # Email — generic action words after specific platforms
-    (["email", "mail", "inbox", "gmail", "send email", "reply email"], "email", "email_draft"),
+    (["email", "mail", "inbox", "gmail", "reply email"], "email", "email_draft"),
     # Workflow actions
     (["approval", "approve", "pending", "review"], "approval", "list_approvals"),
     (["summary", "summarize", "report", "briefing"], "reporting", "daily_summary"),
@@ -57,45 +60,87 @@ def _ensure_src_path() -> None:
         sys.path.insert(0, str(src_path))
 
 
-def _run_email_skill(text: str, skill: str) -> str:
+def _run_email_skill(text: str, skill: str, command_id: str) -> dict:
+    """Generate email draft and store it."""
+    import re
+
+    recipient = ""
+    subject = f"Follow-up: {text[:40]}"
+
+    # Try to extract "to [Name]" from command
+    m = re.search(r'\bto\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', text)
+    if m:
+        recipient = m.group(1)
+        subject = f"Message for {recipient}"
+
+    content: Optional[str] = None
     try:
         _ensure_src_path()
         from ai_operator.core.content_generator import ContentGenerator
         gen = ContentGenerator()
-        # generate_linkedin_post is the generic OpenAI text generator available
-        if "summarize" in skill or "summary" in text.lower():
-            return f"Email summary requested: {text}\n[Connect Gmail to fetch real emails]"
-        else:
-            # Use generate_linkedin_post with an email prompt as the generic text generator
-            result = gen.generate_linkedin_post(
-                topic=f"Draft a professional email: {text}",
-                tone="professional",
-            )
-            return result if isinstance(result, str) else str(result)
-    except Exception as exc:
-        return (
-            f"Email agent received: {text}\n"
-            f"[Skill: {skill} — set OPENAI_API_KEY in backend/.env to enable AI drafting]\n"
-            f"Detail: {exc}"
-        )
-
-
-def _run_linkedin_skill(text: str, skill: str) -> str:
-    try:
-        _ensure_src_path()
-        from ai_operator.core.content_generator import ContentGenerator
-        gen = ContentGenerator()
-        result = gen.generate_linkedin_post(
-            topic=text,
+        content = gen.generate_linkedin_post(
+            topic=f"Professional email: {text}",
             tone="professional",
         )
-        return result if isinstance(result, str) else str(result)
-    except Exception as exc:
-        return (
-            f"LinkedIn post draft requested: {text}\n"
-            f"[Skill: {skill} — set OPENAI_API_KEY in backend/.env to enable AI drafting]\n"
-            f"Detail: {exc}"
+        if not isinstance(content, str):
+            content = str(content)
+    except Exception:
+        content = (
+            f"Subject: {subject}\n\n"
+            f"Dear {recipient or 'Team'},\n\n"
+            f"I wanted to reach out regarding: {text}\n\n"
+            f"[Add OPENAI_API_KEY to generate AI-written emails]\n\n"
+            f"Best regards"
         )
+
+    from .draft_service import draft_service
+    draft = draft_service.create(
+        command_id=command_id,
+        draft_type="email",
+        title=subject,
+        content=content,
+        metadata={"to": recipient, "subject": subject},
+    )
+
+    return {
+        "result": f"Email draft created:\n\n{content}",
+        "draft_id": draft.id,
+        "draft_type": "email",
+        "action_hint": "send it",
+    }
+
+
+def _run_linkedin_skill(text: str, skill: str, command_id: str) -> dict:
+    """Generate LinkedIn post draft and store it."""
+    content: Optional[str] = None
+    try:
+        _ensure_src_path()
+        from ai_operator.core.content_generator import ContentGenerator
+        gen = ContentGenerator()
+        content = gen.generate_linkedin_post(topic=text, tone="professional")
+        if not isinstance(content, str):
+            content = str(content)
+    except Exception:
+        content = (
+            f"🚀 Exciting update about: {text}\n\n"
+            f"[AI-generated content — add OPENAI_API_KEY to backend/.env for real drafts]\n\n"
+            f"#AI #Innovation #AIOperator"
+        )
+
+    from .draft_service import draft_service
+    draft = draft_service.create(
+        command_id=command_id,
+        draft_type="linkedin_post",
+        title=f"LinkedIn Post: {text[:50]}",
+        content=content,
+    )
+
+    return {
+        "result": f"LinkedIn draft created:\n\n{content}",
+        "draft_id": draft.id,
+        "draft_type": "linkedin_post",
+        "action_hint": "post it",
+    }
 
 
 def _run_reporting_skill(text: str, skill: str) -> str:
@@ -124,15 +169,52 @@ def _run_approval_skill(text: str, skill: str) -> str:
     )
 
 
-def _dispatch_to_skill(text: str, intent: CommandIntent) -> str:
+def _run_confirm_draft(command_id: str) -> dict:
+    """Confirm and execute the most recent pending draft."""
+    from .draft_service import draft_service
+    from .draft_executor import execute_draft
+
+    pending = draft_service.list_pending()
+    if not pending:
+        return {"result": "No pending drafts to confirm.", "draft_id": None}
+
+    # Execute the most recent one (list_pending returns all; pick first created_at desc)
+    latest = sorted(pending, key=lambda d: d.created_at, reverse=True)[0]
+    result = execute_draft(latest.id)
+
+    return {
+        "result": result.get("message", "Action executed."),
+        "draft_id": latest.id,
+        "execution_result": result,
+        "spoken": result.get("spoken", "Done!"),
+    }
+
+
+def _run_reject_draft(command_id: str) -> dict:
+    """Cancel the most recent pending draft."""
+    from .draft_service import draft_service
+
+    pending = draft_service.list_pending()
+    if not pending:
+        return {"result": "No pending drafts to cancel."}
+    latest = sorted(pending, key=lambda d: d.created_at, reverse=True)[0]
+    draft_service.reject(latest.id)
+    return {"result": "Draft cancelled.", "draft_id": latest.id}
+
+
+def _dispatch_to_skill(text: str, intent: CommandIntent, command_id: str) -> dict | str:
     """Route to real skill implementation or return structured placeholder."""
     agent = intent.agent
     skill = intent.skill
 
-    if agent == "email":
-        return _run_email_skill(text, skill)
+    if agent == "confirm":
+        return _run_confirm_draft(command_id)
+    elif agent == "cancel":
+        return _run_reject_draft(command_id)
+    elif agent == "email":
+        return _run_email_skill(text, skill, command_id)
     elif agent == "linkedin":
-        return _run_linkedin_skill(text, skill)
+        return _run_linkedin_skill(text, skill, command_id)
     elif agent == "reporting":
         return _run_reporting_skill(text, skill)
     elif agent == "integration":
@@ -183,8 +265,50 @@ class CommandService:
         """Run in thread pool — updates command store with result."""
         try:
             self.update_status(command_id, CommandStatus.running)
-            result = _dispatch_to_skill(text, intent)
-            self.update_status(command_id, CommandStatus.completed, result=result)
+            result_data = _dispatch_to_skill(text, intent, command_id)
+
+            # Handle both string and dict returns
+            if isinstance(result_data, dict):
+                result_text = result_data.get("result", "")
+                draft_id    = result_data.get("draft_id")
+                action_hint = result_data.get("action_hint", "")
+                # Use execution spoken override if present (for confirm flows)
+                spoken_override = result_data.get("spoken")
+            else:
+                result_text     = result_data
+                draft_id        = None
+                action_hint     = ""
+                spoken_override = None
+
+            # Generate spoken assistant response
+            assistant_resp: Optional[str] = None
+            try:
+                _voice_root = Path(__file__).parent.parent.parent
+                if str(_voice_root) not in sys.path:
+                    sys.path.insert(0, str(_voice_root))
+                from voice.response_generator import generate_assistant_response
+                assistant_resp = generate_assistant_response(
+                    command_text=text,
+                    result=result_text,
+                    agent=intent.agent,
+                    skill=intent.skill,
+                    draft_id=draft_id,
+                    action_hint=action_hint,
+                )
+            except Exception as rg_exc:
+                logger.debug("Response generator failed (non-fatal): %s", rg_exc)
+
+            # Allow executor to override the spoken response (e.g. on confirm)
+            if spoken_override:
+                assistant_resp = spoken_override
+
+            self.update_status(
+                command_id,
+                CommandStatus.completed,
+                result=result_text,
+                assistant_response=assistant_resp,
+                draft_id=draft_id,
+            )
         except Exception as exc:
             logger.exception("Command %s execution failed", command_id)
             self.update_status(command_id, CommandStatus.failed, error=str(exc))
@@ -205,6 +329,8 @@ class CommandService:
         status: CommandStatus,
         result: Optional[str] = None,
         error: Optional[str] = None,
+        assistant_response: Optional[str] = None,
+        draft_id: Optional[str] = None,
     ) -> Optional[Command]:
         """Update command status — called by agent execution layer."""
         with self._lock:
@@ -217,6 +343,10 @@ class CommandService:
                 cmd.result = result
             if error is not None:
                 cmd.error = error
+            if assistant_response is not None:
+                cmd.assistant_response = assistant_response
+            if draft_id is not None:
+                cmd.draft_id = draft_id
         return cmd
 
 

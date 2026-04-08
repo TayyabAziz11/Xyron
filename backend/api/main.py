@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import health, commands, approvals, activity, integrations, workflows, events, voice
+from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, drafts
 
 logger = logging.getLogger(__name__)
 
@@ -67,3 +67,4 @@ app.include_router(integrations.router)
 app.include_router(workflows.router)
 app.include_router(events.router)
 app.include_router(voice.router)
+app.include_router(drafts.router)

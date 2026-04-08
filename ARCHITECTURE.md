@@ -96,7 +96,7 @@ CLI entry points — each script runs a single skill or daemon:
 ### Approval Gates (HITL)
 Every risky action (send email, post to LinkedIn, create invoice) goes through an approval gate. The agent creates a plan file, moves it to `Pending_Approval/`, and waits. Nothing executes without explicit human approval. This cannot be bypassed.
 
-### Voice Pipeline (V1)
+### Voice Pipeline (V1) — Speech-to-Text (STT)
 ```
 Push-to-talk button
   → record audio (PyAudio / sounddevice)
@@ -106,6 +106,23 @@ Push-to-talk button
   → Agent picks up the task
 ```
 Wake word (openWakeWord) is a Phase 2 addition.
+
+### Voice Response Pipeline — Text-to-Speech (TTS)
+```
+Command completes (status: completed)
+  → generate_assistant_response()        backend/voice/response_generator.py
+      Maps agent/skill → short spoken sentence (no markdown, ≤150 chars)
+  → assistant_response stored on Command  (backend/api/schemas/command.py)
+  → POST /api/v1/voice/synthesize         backend/api/routers/voice.py
+      pyttsx3 → saves WAV to temp file → returns audio/wav bytes
+      Falls back to HTTP 503 if espeak-ng not installed (never crashes)
+  → Frontend receives WAV blob
+      Web:     new Audio(objectURL).play()   hooks/useVoice.ts
+      Desktop: HTMLAudioElement               desktop/src/renderer/index.html
+  → Visual wave indicator shown while playing
+  → Voice settings (enable/disable, rate, volume, auto-play) persisted in localStorage
+```
+Install requirements: `sudo apt-get install espeak-ng && pip install pyttsx3`
 
 ### Audit Trail
 All agent activity is logged to:

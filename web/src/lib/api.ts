@@ -8,6 +8,7 @@ import type {
   HealthStatus,
   SystemStatus,
   VoiceTranscriptionResult,
+  Draft,
 } from './types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
@@ -43,6 +44,20 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   })
   if (!res.ok) {
     throw new ApiError(res.status, `POST ${path} failed: ${res.statusText}`)
+  }
+  const data = (await res.json()) as ApiResponse<T>
+  return data.data
+}
+
+async function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    throw new ApiError(res.status, `PATCH ${path} failed: ${res.statusText}`)
   }
   const data = (await res.json()) as ApiResponse<T>
   return data.data
@@ -96,6 +111,15 @@ export const api = {
         .then((r) => r.json())
         .then((body: ApiResponse<VoiceTranscriptionResult>) => body.data)
     },
+  },
+
+  drafts: {
+    list:    (status?: string) => apiGet<Draft[]>(`/api/v1/drafts${status ? `?status=${status}` : ''}`),
+    pending: () => apiGet<Draft[]>('/api/v1/drafts/pending'),
+    get:     (id: string) => apiGet<Draft>(`/api/v1/drafts/${id}`),
+    confirm: (id: string) => apiPost<{ draft: Draft; execution: Record<string, unknown>; spoken_response: string }>(`/api/v1/drafts/${id}/confirm`, {}),
+    reject:  (id: string) => apiPost<Draft>(`/api/v1/drafts/${id}/reject`, {}),
+    edit:    (id: string, content: string) => apiPatch<Draft>(`/api/v1/drafts/${id}`, { content }),
   },
 }
 

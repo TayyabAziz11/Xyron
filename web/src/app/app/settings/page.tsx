@@ -1,12 +1,14 @@
 'use client'
 
-import { Mic, CheckCircle, XCircle } from 'lucide-react'
+import { Mic } from 'lucide-react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/Card'
 import { StatusDot } from '@/components/ui/StatusDot'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { PageTransition } from '@/components/layout/PageTransition'
 import { useApi } from '@/hooks/useApi'
+import { useVoice } from '@/hooks/useVoice'
 import { api } from '@/lib/api'
+import { CheckCircle, XCircle, Volume2, VolumeX } from 'lucide-react'
 
 const ENV_VARS = [
   'OPENAI_API_KEY',
@@ -18,6 +20,7 @@ const ENV_VARS = [
 export default function SettingsPage() {
   const { data: health, loading: healthLoading } = useApi(() => api.health.ping())
   const { data: status, loading: statusLoading } = useApi(() => api.health.status())
+  const { settings, saveSettings, speak, isSpeaking } = useVoice()
 
   return (
     <PageTransition>
@@ -85,6 +88,121 @@ export default function SettingsPage() {
             </CardContent>
           </Card>
         )}
+
+        {/* Voice Settings */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Voice Settings</CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0 space-y-4">
+            {/* Enable toggle */}
+            <div className="flex items-center justify-between py-1.5 border-b border-surface-border">
+              <div>
+                <p className="text-sm text-text-secondary">Voice responses</p>
+                <p className="text-xs text-text-muted">Speak results aloud when commands complete</p>
+              </div>
+              <button
+                onClick={() => saveSettings({ enabled: !settings.enabled })}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  settings.enabled ? 'bg-brand' : 'bg-surface-border'
+                }`}
+                role="switch"
+                aria-checked={settings.enabled}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                    settings.enabled ? 'translate-x-4' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Auto-play toggle */}
+            <div className="flex items-center justify-between py-1.5 border-b border-surface-border">
+              <div>
+                <p className="text-sm text-text-secondary">Auto-play responses</p>
+                <p className="text-xs text-text-muted">Automatically speak when a command completes</p>
+              </div>
+              <button
+                onClick={() => saveSettings({ autoPlay: !settings.autoPlay })}
+                disabled={!settings.enabled}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  settings.autoPlay && settings.enabled ? 'bg-brand' : 'bg-surface-border'
+                } disabled:opacity-40`}
+                role="switch"
+                aria-checked={settings.autoPlay}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                    settings.autoPlay && settings.enabled ? 'translate-x-4' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Speech rate slider */}
+            <div className="py-1.5 border-b border-surface-border space-y-2">
+              <div className="flex justify-between">
+                <p className="text-sm text-text-secondary">Speech speed</p>
+                <span className="text-xs text-text-muted font-mono">{settings.rate} WPM</span>
+              </div>
+              <input
+                type="range"
+                min={80}
+                max={250}
+                step={5}
+                value={settings.rate}
+                disabled={!settings.enabled}
+                onChange={e => saveSettings({ rate: Number(e.target.value) })}
+                className="w-full h-1.5 rounded-full accent-brand disabled:opacity-40 cursor-pointer"
+              />
+              <div className="flex justify-between text-xs text-text-muted">
+                <span>Slow</span>
+                <span>Fast</span>
+              </div>
+            </div>
+
+            {/* Volume slider */}
+            <div className="py-1.5 border-b border-surface-border space-y-2">
+              <div className="flex justify-between">
+                <p className="text-sm text-text-secondary">Volume</p>
+                <span className="text-xs text-text-muted font-mono">{Math.round(settings.volume * 100)}%</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <VolumeX className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={settings.volume}
+                  disabled={!settings.enabled}
+                  onChange={e => saveSettings({ volume: Number(e.target.value) })}
+                  className="flex-1 h-1.5 rounded-full accent-brand disabled:opacity-40 cursor-pointer"
+                />
+                <Volume2 className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+              </div>
+            </div>
+
+            {/* Test button */}
+            <div className="flex items-center justify-between pt-1">
+              <div>
+                <p className="text-sm text-text-secondary">Test voice</p>
+                <p className="text-xs text-text-muted">
+                  Engine: pyttsx3 / espeak-ng
+                </p>
+              </div>
+              <button
+                onClick={() => speak('Hello, I am AI Operator. Your voice assistant is ready.')}
+                disabled={!settings.enabled || isSpeaking}
+                className="px-3 py-1.5 rounded-lg bg-brand/10 border border-brand/25 text-xs text-brand-light
+                  hover:bg-brand/15 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {isSpeaking ? 'Speaking…' : 'Play sample'}
+              </button>
+            </div>
+          </CardContent>
+        </Card>
 
         <Card>
           <CardHeader>
