@@ -3,388 +3,783 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src http://localhost:8000">
   <title>AI Operator</title>
   <style>
+    /* ── Design Tokens ─────────────────────────────────── */
     :root {
-      --bg: #08080f;
-      --surface: #0f0f1a;
-      --card: #161625;
-      --border: #1e1e30;
-      --brand: #7c3aed;
-      --brand-light: #8b5cf6;
-      --text: #f1f5f9;
-      --text-secondary: #94a3b8;
-      --text-muted: #475569;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --error: #ef4444;
-      --radius: 12px;
+      --bg:            #08080f;
+      --surface:       #0f0f1a;
+      --card:          #13131f;
+      --card-hover:    #181828;
+      --border:        #1e1e30;
+      --border-hi:     #2a2a42;
+      --brand:         #7c3aed;
+      --brand-light:   #8b5cf6;
+      --brand-dim:     rgba(124,58,237,0.14);
+      --brand-glow:    rgba(124,58,237,0.07);
+      --text:          #f1f5f9;
+      --text-sec:      #94a3b8;
+      --text-muted:    #475569;
+      --success:       #10b981;
+      --warning:       #f59e0b;
+      --error:         #ef4444;
+      --r-sm:  6px;
+      --r:    10px;
+      --r-lg: 14px;
     }
 
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-
-    html, body {
-      width: 100%; height: 100%;
+    /* ── Reset ─────────────────────────────────────────── */
+    *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+    html, body { width:100%; height:100%; overflow:hidden; }
+    body {
       background: var(--bg);
       color: var(--text);
-      font-family: -apple-system, 'Inter', system-ui, sans-serif;
-      font-size: 14px;
+      font-family: -apple-system,'Inter','Segoe UI',system-ui,sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
       -webkit-font-smoothing: antialiased;
       user-select: none;
-      overflow: hidden;
     }
+    textarea, input { user-select: text; }
 
+    /* ── Scrollbar ─────────────────────────────────────── */
+    ::-webkit-scrollbar { width:3px; }
+    ::-webkit-scrollbar-track { background:transparent; }
+    ::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+    ::-webkit-scrollbar-thumb:hover { background:var(--border-hi); }
+
+    /* ── Titlebar ──────────────────────────────────────── */
     .titlebar {
       -webkit-app-region: drag;
-      height: 28px;
-      background: var(--bg);
-      border-bottom: 1px solid var(--border);
+      height: 38px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 12px;
-    }
-    .titlebar-title {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--text-muted);
-    }
-    .titlebar-close {
-      -webkit-app-region: no-drag;
-      width: 20px; height: 20px;
-      border: none; background: none;
-      cursor: pointer;
-      color: var(--text-muted);
-      display: flex; align-items: center; justify-content: center;
-      border-radius: 4px;
-      font-size: 14px;
-      transition: background 0.15s, color 0.15s;
-    }
-    .titlebar-close:hover { background: rgba(239,68,68,0.15); color: var(--error); }
-
-    .main { padding: 16px; display: flex; flex-direction: column; gap: 12px; height: calc(100vh - 28px); }
-
-    .status-bar {
-      display: flex; align-items: center; gap: 8px;
-      font-size: 12px; color: var(--text-muted);
-    }
-    .status-dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: var(--text-muted);
-      transition: background 0.3s;
+      padding: 0 14px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
       flex-shrink: 0;
     }
-    .status-dot.online { background: var(--success); box-shadow: 0 0 4px var(--success); animation: pulse 2s infinite; }
-    .status-dot.offline { background: var(--error); }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-
-    .input-area {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      transition: border-color 0.2s;
+    .tb-left  { display:flex; align-items:center; gap:8px; }
+    .logo-dot {
+      width:8px; height:8px; border-radius:50%;
+      background:var(--brand);
+      box-shadow: 0 0 8px rgba(124,58,237,0.7);
     }
-    .input-area:focus-within { border-color: var(--brand); }
-
-    textarea {
-      background: none; border: none; outline: none;
-      color: var(--text);
-      font-size: 14px; font-family: inherit;
-      resize: none; width: 100%;
-      line-height: 1.5;
-      min-height: 60px;
+    .logo-txt {
+      font-size:11.5px; font-weight:700;
+      letter-spacing:0.07em; text-transform:uppercase;
+      color:var(--text-sec);
     }
-    textarea::placeholder { color: var(--text-muted); }
+    .tb-right { -webkit-app-region:no-drag; display:flex; gap:3px; }
+    .win-btn {
+      width:24px; height:24px; border:none; background:none;
+      cursor:pointer; border-radius:5px;
+      display:flex; align-items:center; justify-content:center;
+      color:var(--text-muted); transition:all 0.15s;
+    }
+    .win-btn:hover { background:var(--surface); color:var(--text); }
+    .win-btn.close:hover { background:rgba(239,68,68,0.15); color:var(--error); }
 
-    .input-actions { display: flex; align-items: center; justify-content: space-between; }
-    .char-count { font-size: 11px; color: var(--text-muted); }
+    /* ── Status Bar ────────────────────────────────────── */
+    .status-bar {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:6px 14px;
+      background:var(--surface); border-bottom:1px solid var(--border);
+      flex-shrink:0;
+    }
+    .sb-left  { display:flex; align-items:center; gap:6px; }
+    .s-dot {
+      width:6px; height:6px; border-radius:50%;
+      background:var(--text-muted); flex-shrink:0;
+      transition: background 0.3s;
+    }
+    .s-dot.on  { background:var(--success); box-shadow:0 0 5px var(--success); animation:blink 2.5s ease-in-out infinite; }
+    .s-dot.off { background:var(--error); }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .s-label { font-size:11px; color:var(--text-muted); }
+    .int-row { display:flex; gap:10px; }
+    .int-pip { display:flex; align-items:center; gap:4px; font-size:10px; color:var(--text-muted); }
+    .int-pip .d { width:5px; height:5px; border-radius:50%; background:var(--border-hi); }
+    .int-pip .d.on { background:var(--success); }
 
+    /* ── Layout ────────────────────────────────────────── */
+    .app { display:flex; flex-direction:column; height:100vh; }
+    .body {
+      flex:1; overflow-y:auto; padding:13px 14px;
+      display:flex; flex-direction:column; gap:11px; min-height:0;
+    }
+
+    /* ── Input ─────────────────────────────────────────── */
+    .sec-title {
+      font-size:10px; font-weight:600;
+      letter-spacing:0.08em; text-transform:uppercase;
+      color:var(--text-muted); margin-bottom:6px;
+    }
+    .input-wrap {
+      background:var(--surface); border:1px solid var(--border);
+      border-radius:var(--r); overflow:hidden; transition:border-color 0.2s;
+    }
+    .input-wrap:focus-within {
+      border-color:var(--brand);
+      box-shadow:0 0 0 3px var(--brand-glow);
+    }
+    textarea#cmd {
+      display:block; width:100%; background:none; border:none; outline:none;
+      color:var(--text); font-size:13px; font-family:inherit;
+      resize:none; padding:11px 12px 7px; min-height:56px; max-height:96px;
+      overflow-y:auto; line-height:1.55;
+    }
+    textarea#cmd::placeholder { color:var(--text-muted); }
+    .input-foot {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:6px 10px 8px; border-top:1px solid var(--border);
+    }
+    .imeta { display:flex; align-items:center; gap:8px; }
+    .char-cnt { font-size:10px; color:var(--text-muted); }
+    .kbd {
+      display:inline-flex; align-items:center;
+      padding:1px 5px; background:var(--card);
+      border:1px solid var(--border-hi); border-radius:3px;
+      font-size:10px; color:var(--text-muted);
+    }
+    .iact { display:flex; align-items:center; gap:5px; }
+
+    /* ── Buttons ───────────────────────────────────────── */
     .btn {
-      border: none; cursor: pointer; font-family: inherit;
-      border-radius: 8px; font-size: 13px; font-weight: 500;
-      display: flex; align-items: center; gap: 6px;
-      transition: all 0.15s;
+      border:none; cursor:pointer; font-family:inherit;
+      font-size:12px; font-weight:500; border-radius:var(--r-sm);
+      display:inline-flex; align-items:center; gap:5px; transition:all 0.15s;
     }
-    .btn-primary { background: var(--brand); color: white; padding: 7px 16px; }
-    .btn-primary:hover { background: var(--brand-light); }
-    .btn-primary:active { transform: scale(0.97); }
-    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-ghost {
-      background: none; color: var(--text-secondary);
-      padding: 6px 10px; border: 1px solid var(--border);
+    .btn:active { transform:scale(0.96); }
+    .btn-pri  { background:var(--brand); color:#fff; padding:6px 14px; }
+    .btn-pri:hover { background:var(--brand-light); }
+    .btn-pri:disabled { opacity:0.4; cursor:not-allowed; transform:none; }
+    .btn-ghost { background:none; color:var(--text-muted); padding:5px 8px; border:1px solid var(--border); }
+    .btn-ghost:hover { background:var(--surface); color:var(--text); border-color:var(--border-hi); }
+    .btn-ico { background:none; color:var(--text-muted); padding:4px; border:1px solid var(--border); border-radius:var(--r-sm); }
+    .btn-ico:hover { background:var(--surface); color:var(--text); }
+
+    /* ── Mic ───────────────────────────────────────────── */
+    .mic-btn {
+      width:30px; height:30px; border-radius:50%;
+      background:var(--card); border:1px solid var(--border);
+      color:var(--text-muted); display:flex; align-items:center;
+      justify-content:center; cursor:pointer; transition:all 0.2s;
     }
-    .btn-ghost:hover { background: var(--surface); color: var(--text); }
-
-    .result-area {
-      flex: 1;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 12px;
-      overflow-y: auto;
-      min-height: 0;
+    .mic-btn:hover { border-color:var(--brand); color:var(--brand-light); background:var(--brand-dim); }
+    .mic-btn.recording {
+      background:rgba(239,68,68,0.12); border-color:var(--error); color:var(--error);
+      animation:mic-pulse 1s ease-in-out infinite;
     }
-    .result-empty {
-      height: 100%;
-      display: flex; flex-direction: column;
-      align-items: center; justify-content: center;
-      gap: 8px; color: var(--text-muted);
+    .mic-btn.thinking { background:var(--brand-dim); border-color:var(--brand); color:var(--brand-light); }
+    @keyframes mic-pulse {
+      0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.35)}
+      50%{box-shadow:0 0 0 7px rgba(239,68,68,0)}
     }
-    .result-empty-icon { font-size: 28px; opacity: 0.4; }
-    .result-empty-text { font-size: 12px; }
 
-    .result-item { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
-    .result-item:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
-    .result-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-    .result-badge {
-      font-size: 10px; font-weight: 600; text-transform: uppercase;
-      padding: 2px 7px; border-radius: 4px; letter-spacing: 0.04em;
+    /* ── Spinner ───────────────────────────────────────── */
+    @keyframes spin { to{transform:rotate(360deg)} }
+    .spin { width:12px; height:12px; border:2px solid rgba(255,255,255,0.2); border-top-color:#fff; border-radius:50%; animation:spin 0.7s linear infinite; }
+
+    /* ── Intent bar ────────────────────────────────────── */
+    .intent-bar {
+      display:none; align-items:center; gap:6px;
+      padding:6px 10px;
+      background:var(--brand-dim); border:1px solid rgba(124,58,237,0.22);
+      border-radius:var(--r-sm); font-size:11px; color:var(--brand-light);
+      animation:fadeSlide 0.2s ease;
     }
-    .badge-queued  { background: rgba(71,85,105,0.3); color: #94a3b8; }
-    .badge-running { background: rgba(124,58,237,0.2); color: #a78bfa; }
-    .badge-completed { background: rgba(16,185,129,0.15); color: #34d399; }
-    .badge-failed  { background: rgba(239,68,68,0.15); color: #f87171; }
+    .intent-bar.show { display:flex; }
 
-    .result-intent { font-size: 11px; color: var(--text-muted); }
-    .result-text {
-      font-size: 12px; color: var(--text-secondary);
-      line-height: 1.6; white-space: pre-wrap; word-break: break-word;
-      margin-top: 4px;
+    /* ── Transcript bar ────────────────────────────────── */
+    .transcript-bar {
+      display:none; align-items:center; gap:8px;
+      padding:7px 10px;
+      background:rgba(16,185,129,0.07); border:1px solid rgba(16,185,129,0.22);
+      border-radius:var(--r-sm); font-size:11px;
+      animation:fadeSlide 0.2s ease;
     }
-    .result-command-text { font-size: 13px; font-weight: 500; color: var(--text); }
-    .result-timestamp { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+    .transcript-bar.show { display:flex; }
+    .tr-text { flex:1; color:var(--text-sec); font-style:italic; }
+    .tr-icon { color:var(--success); }
 
-    .quick-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-    .quick-chip {
-      background: var(--card); border: 1px solid var(--border);
-      color: var(--text-secondary); font-size: 11px;
-      padding: 5px 10px; border-radius: 20px;
-      cursor: pointer; transition: all 0.15s;
+    /* ── Result card ───────────────────────────────────── */
+    .result-card {
+      display:none; background:var(--card);
+      border:1px solid var(--border); border-radius:var(--r); overflow:hidden;
+      animation:fadeSlide 0.2s ease;
     }
-    .quick-chip:hover { border-color: var(--brand); color: var(--text); background: rgba(124,58,237,0.1); }
+    .result-card.show { display:block; }
+    .result-head {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:8px 11px; border-bottom:1px solid var(--border);
+    }
+    .rmeta { display:flex; align-items:center; gap:8px; }
+    .chip {
+      font-size:10px; font-weight:600; text-transform:uppercase;
+      letter-spacing:0.05em; padding:2px 8px; border-radius:20px;
+    }
+    .c-queued    { background:rgba(71,85,105,0.22);  color:#94a3b8; }
+    .c-running   { background:var(--brand-dim);       color:var(--brand-light); }
+    .c-completed { background:rgba(16,185,129,0.12);  color:var(--success); }
+    .c-failed    { background:rgba(239,68,68,0.12);   color:var(--error); }
+    .ragent { font-size:11px; color:var(--text-muted); }
+    .racts  { display:flex; gap:4px; }
+    .result-body {
+      padding:10px 12px; font-size:12px; color:var(--text-sec);
+      line-height:1.65; white-space:pre-wrap; word-break:break-word;
+      max-height:110px; overflow-y:auto;
+    }
+    .result-body.muted { color:var(--text-muted); font-style:italic; }
 
-    .footer { display: flex; align-items: center; justify-content: space-between; padding-top: 4px; }
-    .footer-hint { font-size: 11px; color: var(--text-muted); }
-    .footer-link { font-size: 11px; color: var(--brand-light); background: none; border: none; cursor: pointer; font-family: inherit; }
-    .footer-link:hover { text-decoration: underline; }
+    /* ── Quick grid ────────────────────────────────────── */
+    .quick-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+    .qc {
+      background:var(--card); border:1px solid var(--border);
+      border-radius:var(--r-sm); padding:9px 6px; cursor:pointer;
+      text-align:center; transition:all 0.15s;
+    }
+    .qc:hover { background:var(--card-hover); border-color:var(--brand); transform:translateY(-1px); }
+    .qc:active { transform:translateY(0); }
+    .qc-ico  { font-size:16px; margin-bottom:3px; }
+    .qc-lbl  { font-size:10px; color:var(--text-sec); font-weight:500; }
 
-    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-    .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; }
+    /* ── Command list ──────────────────────────────────── */
+    .cmd-list { display:flex; flex-direction:column; gap:4px; }
+    .cmd-item {
+      display:flex; align-items:center; gap:7px;
+      padding:7px 10px; background:var(--card);
+      border:1px solid var(--border); border-radius:var(--r-sm);
+      cursor:pointer; transition:all 0.15s; animation:fadeSlide 0.2s ease;
+    }
+    .cmd-item:hover { background:var(--card-hover); border-color:var(--border-hi); }
+    .ci-ico  { font-size:11px; flex-shrink:0; }
+    .ci-txt  { flex:1; font-size:11px; color:var(--text-sec); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .ci-bdg  { font-size:9px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; padding:1px 6px; border-radius:20px; flex-shrink:0; }
+    .b-completed { background:rgba(16,185,129,0.12); color:var(--success); }
+    .b-running   { background:var(--brand-dim);       color:var(--brand-light); }
+    .b-queued    { background:rgba(71,85,105,0.2);    color:#94a3b8; }
+    .b-failed    { background:rgba(239,68,68,0.12);   color:var(--error); }
+    .ci-time { font-size:10px; color:var(--text-muted); flex-shrink:0; }
 
-    ::-webkit-scrollbar { width: 3px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    /* ── Empty ─────────────────────────────────────────── */
+    .empty { text-align:center; padding:16px; color:var(--text-muted); font-size:11px; }
+    .empty-ico { font-size:22px; margin-bottom:5px; opacity:0.35; }
+
+    /* ── Footer ────────────────────────────────────────── */
+    .footer {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:8px 14px; border-top:1px solid var(--border);
+      background:var(--surface); flex-shrink:0;
+    }
+    .f-version { font-size:10px; color:var(--text-muted); }
+    .f-link {
+      font-size:11px; color:var(--brand-light);
+      background:none; border:none; cursor:pointer; font-family:inherit;
+      display:flex; align-items:center; gap:4px; padding:4px 8px;
+      border-radius:var(--r-sm); transition:all 0.15s;
+    }
+    .f-link:hover { background:var(--brand-dim); }
+
+    /* ── Mic overlay ───────────────────────────────────── */
+    .mic-overlay {
+      display:none; position:fixed; inset:0;
+      background:rgba(8,8,15,0.88); z-index:100;
+      flex-direction:column; align-items:center; justify-content:center;
+      gap:18px; backdrop-filter:blur(5px);
+    }
+    .mic-overlay.on { display:flex; animation:fadeIn 0.2s ease; }
+    .mic-ring {
+      width:88px; height:88px; border-radius:50%;
+      background:rgba(239,68,68,0.1); border:2px solid var(--error);
+      display:flex; align-items:center; justify-content:center;
+      animation:ring 1s ease-in-out infinite;
+    }
+    @keyframes ring {
+      0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.35)}
+      50%{box-shadow:0 0 0 18px rgba(239,68,68,0)}
+    }
+    .mic-ring-ico { font-size:34px; }
+    .mic-lbl { font-size:15px; font-weight:600; color:var(--text); }
+    .mic-sub { font-size:11px; color:var(--text-muted); }
+    .mic-stop {
+      padding:8px 22px;
+      background:rgba(239,68,68,0.12); border:1px solid var(--error);
+      color:var(--error); border-radius:20px;
+      cursor:pointer; font-family:inherit; font-size:12px; font-weight:500;
+      transition:all 0.15s;
+    }
+    .mic-stop:hover { background:rgba(239,68,68,0.22); }
+
+    /* ── Toast ─────────────────────────────────────────── */
+    .toast {
+      position:fixed; bottom:52px; left:50%;
+      transform:translateX(-50%) translateY(8px);
+      background:var(--card); border:1px solid var(--border-hi);
+      border-radius:var(--r-sm); padding:6px 14px;
+      font-size:11px; color:var(--text-sec);
+      opacity:0; transition:all 0.2s;
+      pointer-events:none; white-space:nowrap; z-index:999;
+    }
+    .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+    .toast.ok  { border-color:rgba(16,185,129,0.4); color:var(--success); }
+    .toast.err { border-color:rgba(239,68,68,0.4);  color:var(--error); }
+
+    /* ── Animations ────────────────────────────────────── */
+    @keyframes fadeIn    { from{opacity:0} to{opacity:1} }
+    @keyframes fadeSlide { from{opacity:0;transform:translateY(-5px)} to{opacity:1;transform:translateY(0)} }
+
+    /* ── SVG icon helper ───────────────────────────────── */
+    .ico { width:13px; height:13px; flex-shrink:0; }
   </style>
 </head>
 <body>
+<div class="app">
+
+  <!-- Titlebar -->
   <div class="titlebar">
-    <span class="titlebar-title">AI Operator</span>
-    <button class="titlebar-close" onclick="window.aiOperator.hideWindow()" title="Close (Esc)">&#x2715;</button>
-  </div>
-
-  <div class="main">
-    <div class="status-bar">
-      <div class="status-dot" id="statusDot"></div>
-      <span id="statusText">Checking connection...</span>
+    <div class="tb-left">
+      <div class="logo-dot"></div>
+      <span class="logo-txt">AI Operator</span>
     </div>
-
-    <div class="input-area">
-      <textarea
-        id="commandInput"
-        placeholder="Tell AI Operator what to do..."
-        maxlength="500"
-        rows="3"
-        onkeydown="handleKeyDown(event)"
-        oninput="updateCharCount()"
-      ></textarea>
-      <div class="input-actions">
-        <span class="char-count" id="charCount">0 / 500</span>
-        <button class="btn btn-primary" id="submitBtn" onclick="submitCommand()">
-          <span id="btnText">Run</span>
-          <div class="spinner" id="btnSpinner" style="display:none"></div>
-        </button>
-      </div>
-    </div>
-
-    <div class="quick-actions">
-      <span class="quick-chip" onclick="fillCommand('Summarize unread emails')">Emails</span>
-      <span class="quick-chip" onclick="fillCommand('Show pending approvals')">Approvals</span>
-      <span class="quick-chip" onclick="fillCommand('Draft a LinkedIn post')">LinkedIn</span>
-      <span class="quick-chip" onclick="fillCommand('Show workflow status')">Workflows</span>
-    </div>
-
-    <div class="result-area" id="resultArea">
-      <div class="result-empty" id="emptyState">
-        <div class="result-empty-icon">&#11043;</div>
-        <div class="result-empty-text">Ready for commands</div>
-      </div>
-      <div id="resultList" style="display:none"></div>
-    </div>
-
-    <div class="footer">
-      <span class="footer-hint">Ctrl+Enter to submit &nbsp;&bull;&nbsp; Esc to close</span>
-      <button class="footer-link" onclick="window.aiOperator.openDashboard()">Open Dashboard &rarr;</button>
+    <div class="tb-right">
+      <button class="win-btn" title="Open Dashboard" onclick="op('openDashboard')">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M6 3H3a1 1 0 00-1 1v9a1 1 0 001 1h9a1 1 0 001-1v-3M10 2h4m0 0v4m0-4L7 9"/>
+        </svg>
+      </button>
+      <button class="win-btn close" title="Hide (Esc)" onclick="op('hideWindow')">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M3 3l10 10M13 3L3 13"/>
+        </svg>
+      </button>
     </div>
   </div>
 
-  <script>
-    // Extend window type for TypeScript — runtime only, no imports needed
-    const commands = []
-    let isSubmitting = false
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="sb-left">
+      <div class="s-dot" id="sDot"></div>
+      <span class="s-label" id="sLabel">Connecting…</span>
+    </div>
+    <div class="int-row" id="intRow"></div>
+  </div>
 
-    async function checkHealth() {
-      try {
-        const data = await window.aiOperator.getHealth()
-        const online = !!(data && (data.data || data.status))
-        document.getElementById('statusDot').className = 'status-dot ' + (online ? 'online' : 'offline')
-        document.getElementById('statusText').textContent = online
-          ? 'Connected to AI Operator'
-          : 'Backend offline'
-      } catch {
-        document.getElementById('statusDot').className = 'status-dot offline'
-        document.getElementById('statusText').textContent = 'Backend offline — start the server'
-      }
+  <!-- Body -->
+  <div class="body">
+
+    <!-- Command input -->
+    <div>
+      <div class="sec-title">Command</div>
+      <div class="input-wrap">
+        <textarea id="cmd"
+          placeholder="Tell AI Operator what to do…"
+          maxlength="500"
+          onkeydown="handleKey(event)"
+          oninput="onInput()"></textarea>
+        <div class="input-foot">
+          <div class="imeta">
+            <span class="char-cnt" id="cnt">0/500</span>
+            <span style="font-size:10px;color:var(--text-muted)"><kbd class="kbd">Ctrl+↵</kbd> to run &nbsp;·&nbsp; <kbd class="kbd">Esc</kbd> to hide</span>
+          </div>
+          <div class="iact">
+            <button class="mic-btn" id="micBtn" title="Voice input" onclick="toggleMic()">
+              <svg class="ico" id="micIco" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="5" y="1" width="6" height="9" rx="3"/>
+                <path d="M2 8a6 6 0 0012 0M8 14v2M5 16h6"/>
+              </svg>
+            </button>
+            <button class="btn btn-pri" id="runBtn" onclick="submit()" disabled>
+              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+                <path d="M3 8h10M9 4l4 4-4 4"/>
+              </svg>
+              <span id="runLbl">Run</span>
+              <div class="spin" id="runSpin" style="display:none"></div>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Intent preview -->
+    <div class="intent-bar" id="intentBar">
+      <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 2"/></svg>
+      <span id="intentTxt">Detecting…</span>
+    </div>
+
+    <!-- Transcript bar -->
+    <div class="transcript-bar" id="trBar">
+      <span class="tr-icon">🎙</span>
+      <span class="tr-text" id="trTxt"></span>
+      <button class="btn-ico btn" style="padding:2px 5px;font-size:10px;" onclick="clearTr()">✕</button>
+    </div>
+
+    <!-- Result card -->
+    <div class="result-card" id="resCard">
+      <div class="result-head">
+        <div class="rmeta">
+          <span class="chip" id="resChip">—</span>
+          <span class="ragent" id="resAgent"></span>
+        </div>
+        <div class="racts">
+          <button class="btn btn-ico" title="Copy" onclick="copyRes()">
+            <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          </button>
+          <button class="btn btn-ico" title="Re-run" onclick="rerunLast()">
+            <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 8a6 6 0 116 6"/><path d="M2 12V8h4"/></svg>
+          </button>
+          <button class="btn btn-ico" title="Dismiss" onclick="dismissRes()">
+            <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3l10 10M13 3L3 13"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="result-body muted" id="resBody">Processing…</div>
+    </div>
+
+    <!-- Quick actions -->
+    <div>
+      <div class="sec-title">Quick actions</div>
+      <div class="quick-grid">
+        <div class="qc" onclick="fill('Summarize my unread emails')">
+          <div class="qc-ico">📧</div><div class="qc-lbl">Emails</div>
+        </div>
+        <div class="qc" onclick="fill('Draft a LinkedIn post about AI productivity')">
+          <div class="qc-ico">💼</div><div class="qc-lbl">LinkedIn</div>
+        </div>
+        <div class="qc" onclick="fill('Show pending approvals')">
+          <div class="qc-ico">✅</div><div class="qc-lbl">Approvals</div>
+        </div>
+        <div class="qc" onclick="fill('Generate a daily summary report')">
+          <div class="qc-ico">📊</div><div class="qc-lbl">Report</div>
+        </div>
+        <div class="qc" onclick="fill('List active workflows and status')">
+          <div class="qc-ico">⚡</div><div class="qc-lbl">Workflows</div>
+        </div>
+        <div class="qc" onclick="fill('Check integration status')">
+          <div class="qc-ico">🔌</div><div class="qc-lbl">Status</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent commands -->
+    <div>
+      <div class="sec-title">Recent commands</div>
+      <div id="cmdList">
+        <div class="empty"><div class="empty-ico">⬡</div>No commands yet</div>
+      </div>
+    </div>
+
+  </div><!-- /body -->
+
+  <!-- Footer -->
+  <div class="footer">
+    <span class="f-version">AI Operator · v0.1.0</span>
+    <button class="f-link" onclick="op('openDashboard')">
+      Open Dashboard
+      <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+        <path d="M3 8h10M9 4l4 4-4 4"/>
+      </svg>
+    </button>
+  </div>
+
+</div><!-- /app -->
+
+<!-- Mic overlay -->
+<div class="mic-overlay" id="micOverlay">
+  <div class="mic-ring"><span class="mic-ring-ico">🎙</span></div>
+  <div class="mic-lbl" id="micLbl">Listening…</div>
+  <div class="mic-sub">Speak clearly, then click stop</div>
+  <button class="mic-stop" onclick="stopMic()">■ Stop Recording</button>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict'
+
+/* ── Bridge ───────────────────────────── */
+const op  = (fn, ...args) => window.aiOperator?.[fn]?.(...args)
+const API = 'http://localhost:8000'
+
+/* ── State ────────────────────────────── */
+let curId      = null   // current command id being polled
+let pollTimer  = null
+let isRunning  = false
+let lastText   = ''     // for re-run
+let mediaRec   = null
+let audioChunks= []
+let isRec      = false
+
+/* ── Intent patterns (mirrors backend) ── */
+const PATTERNS = [
+  { keys:['linkedin'],                      label:'LinkedIn Agent',    agent:'linkedin'    },
+  { keys:['whatsapp','wa '],                label:'WhatsApp Agent',    agent:'whatsapp'    },
+  { keys:['instagram','ig '],               label:'Instagram Agent',   agent:'instagram'   },
+  { keys:['odoo','invoice','accounting'],   label:'Odoo Agent',        agent:'odoo'        },
+  { keys:['email','mail','inbox','gmail'],  label:'Email Agent',       agent:'email'       },
+  { keys:['approval','approve','pending'],  label:'Approval Agent',    agent:'approval'    },
+  { keys:['summary','report','briefing'],   label:'Reporting Agent',   agent:'reporting'   },
+  { keys:['workflow','task'],               label:'Workflow Agent',    agent:'workflow'    },
+  { keys:['integration','status','health'], label:'Integration Agent', agent:'integration' },
+  { keys:['activity','log','history'],      label:'Activity Agent',    agent:'activity'    },
+]
+function localIntent(text) {
+  const t = text.toLowerCase()
+  return PATTERNS.find(p => p.keys.some(k => t.includes(k))) || { label:'General Agent', agent:'general' }
+}
+
+/* ── DOM ──────────────────────────────── */
+const $ = id => document.getElementById(id)
+const esc = s => s?.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') ?? ''
+
+function showToast(msg, type='', ms=2200) {
+  const t = $('toast')
+  t.textContent = msg
+  t.className = `toast ${type} show`
+  clearTimeout(t._tid)
+  t._tid = setTimeout(() => t.className = 'toast', ms)
+}
+
+/* ── Input handling ──────────────────── */
+function onInput() {
+  const v = $('cmd').value
+  $('cnt').textContent = `${v.length}/500`
+  $('runBtn').disabled = !v.trim() || isRunning
+
+  const ib = $('intentBar')
+  if (v.trim().length > 3) {
+    const p = localIntent(v)
+    $('intentTxt').textContent = `→ ${p.label}`
+    ib.classList.add('show')
+  } else {
+    ib.classList.remove('show')
+  }
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit() }
+  if (e.key === 'Escape') op('hideWindow')
+}
+
+function fill(text) {
+  $('cmd').value = text
+  onInput()
+  $('cmd').focus()
+}
+
+/* ── Submit command ──────────────────── */
+async function submit() {
+  const text = $('cmd').value.trim()
+  if (!text || isRunning) return
+
+  lastText = text
+  isRunning = true
+  $('runBtn').disabled = true
+  $('runLbl').style.display = 'none'
+  $('runSpin').style.display = 'block'
+  $('intentBar').classList.remove('show')
+
+  showResult('queued', 'Routing command…', '')
+
+  try {
+    const r = await op('submitCommand', text, 'desktop')
+    if (!r?.data) throw new Error('No API response')
+    const d = r.data
+    curId = d.id
+
+    const intent = d.intent
+    const agentLabel = intent
+      ? `${intent.agent} · ${intent.skill.replace(/_/g,' ')}`
+      : 'general'
+
+    showResult(d.status, agentLabel, d.result || '')
+    $('cmd').value = ''
+    onInput()
+    pollStart(d.id, agentLabel)
+
+  } catch (err) {
+    showResult('failed', 'Error', `Could not reach API.\n${err.message}`)
+    resetRunBtn()
+  }
+}
+
+function rerunLast() {
+  if (!lastText) return
+  fill(lastText)
+  $('cmd').focus()
+}
+
+/* ── Result card ─────────────────────── */
+const chipCls = { queued:'c-queued', running:'c-running', completed:'c-completed', failed:'c-failed' }
+
+function showResult(status, agent, body) {
+  const chip = $('resChip')
+  chip.className = `chip ${chipCls[status] || 'c-queued'}`
+  chip.textContent = status
+  $('resAgent').textContent = agent
+
+  const rb = $('resBody')
+  rb.className = `result-body ${body ? '' : 'muted'}`
+  rb.textContent = body || 'Processing…'
+  $('resCard').classList.add('show')
+}
+
+function dismissRes() { $('resCard').classList.remove('show') }
+
+function copyRes() {
+  const t = $('resBody').textContent
+  if (!t || t === 'Processing…') return
+  op('copyText', t)
+  showToast('Copied', 'ok')
+}
+
+/* ── Polling ─────────────────────────── */
+function pollStart(id, agentLabel) {
+  clearInterval(pollTimer)
+  let n = 0
+  pollTimer = setInterval(async () => {
+    n++
+    const r = await op('getCommand', id)
+    if (!r?.data) { if (n > 25) clearInterval(pollTimer); return }
+    const d = r.data
+    showResult(d.status, agentLabel, d.result || '')
+    if (d.status === 'completed' || d.status === 'failed') {
+      clearInterval(pollTimer)
+      resetRunBtn()
+      if (d.status === 'completed') showToast('Done ✓', 'ok')
+      else showToast('Failed', 'err')
+      loadCmds()
     }
-    checkHealth()
-    setInterval(checkHealth, 10000)
+  }, 700)
+}
 
-    function updateCharCount() {
-      const val = document.getElementById('commandInput').value
-      document.getElementById('charCount').textContent = val.length + ' / 500'
+function resetRunBtn() {
+  isRunning = false
+  $('runBtn').disabled = false
+  $('runLbl').style.display = 'block'
+  $('runSpin').style.display = 'none'
+}
+
+/* ── Recent commands ─────────────────── */
+function relTime(iso) {
+  const s = Math.floor((Date.now() - new Date(iso)) / 1000)
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s/60)}m`
+  return `${Math.floor(s/3600)}h`
+}
+const siIco = { completed:'✓', running:'◌', queued:'○', failed:'✗' }
+
+async function loadCmds() {
+  const r = await op('getCommands')
+  const list = r?.data || []
+  const el = $('cmdList')
+  if (!list.length) {
+    el.innerHTML = `<div class="empty"><div class="empty-ico">⬡</div>No commands yet</div>`
+    return
+  }
+  el.innerHTML = list.slice(0,5).map(c => `
+    <div class="cmd-item" onclick="fill(${JSON.stringify(c.text)})">
+      <span class="ci-ico">${siIco[c.status] || '○'}</span>
+      <span class="ci-txt">${esc(c.text)}</span>
+      <span class="ci-bdg b-${c.status}">${c.status}</span>
+      <span class="ci-time">${relTime(c.created_at)}</span>
+    </div>
+  `).join('')
+}
+
+/* ── Integrations strip ──────────────── */
+async function loadInts() {
+  const r = await op('getIntegrations')
+  const list = r?.data || []
+  $('intRow').innerHTML = list.slice(0,5).map(i => `
+    <div class="int-pip" title="${i.name}: ${i.status}">
+      <div class="d ${i.status==='connected'?'on':''}"></div>
+      <span>${i.name.split(' ')[0]}</span>
+    </div>`).join('')
+}
+
+/* ── Health ──────────────────────────── */
+async function checkHealth() {
+  const r = await op('getHealth')
+  const ok = r?.data?.status === 'ok'
+  $('sDot').className  = `s-dot ${ok ? 'on' : 'off'}`
+  $('sLabel').textContent = ok ? 'Backend connected' : 'Backend offline'
+}
+
+/* ── Microphone ──────────────────────── */
+async function toggleMic() {
+  if (isRec) { stopMic(); return }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:true })
+    audioChunks = []
+    mediaRec = new MediaRecorder(stream)
+    mediaRec.ondataavailable = e => { if (e.data.size) audioChunks.push(e.data) }
+    mediaRec.onstop = transcribeAudio
+    mediaRec.start(100)
+    isRec = true
+    $('micBtn').classList.add('recording')
+    $('micOverlay').classList.add('on')
+  } catch {
+    showToast('Microphone access denied', 'err')
+  }
+}
+
+function stopMic() {
+  if (!mediaRec || !isRec) return
+  isRec = false
+  mediaRec.stop()
+  mediaRec.stream.getTracks().forEach(t => t.stop())
+  $('micBtn').classList.remove('recording')
+  $('micBtn').classList.add('thinking')
+  $('micOverlay').classList.remove('on')
+}
+
+async function transcribeAudio() {
+  if (!audioChunks.length) { $('micBtn').classList.remove('thinking'); return }
+  const blob = new Blob(audioChunks, { type:'audio/webm' })
+  const form = new FormData()
+  form.append('audio', blob, 'recording.webm')
+  try {
+    const resp = await fetch(`${API}/api/v1/voice/transcribe`, { method:'POST', body:form })
+    const data = await resp.json()
+    const text = data?.data?.text?.trim() || ''
+    $('micBtn').classList.remove('thinking')
+    if (text) {
+      $('cmd').value = text
+      onInput()
+      $('trTxt').textContent = `"${text}"`
+      $('trBar').classList.add('show')
+      showToast('Voice captured — review and run', 'ok')
+    } else {
+      showToast('No speech detected', 'err')
     }
+  } catch {
+    $('micBtn').classList.remove('thinking')
+    showToast('Transcription failed', 'err')
+  }
+}
 
-    function handleKeyDown(e) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault()
-        submitCommand()
-      }
-      if (e.key === 'Escape') {
-        window.aiOperator.hideWindow()
-      }
-    }
+function clearTr() { $('trBar').classList.remove('show') }
 
-    function fillCommand(text) {
-      document.getElementById('commandInput').value = text
-      updateCharCount()
-      document.getElementById('commandInput').focus()
-    }
+/* ── Global keys ─────────────────────── */
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !isRec) op('hideWindow')
+})
 
-    async function submitCommand() {
-      if (isSubmitting) return
-      const input = document.getElementById('commandInput')
-      const text = input.value.trim()
-      if (!text) return
-
-      isSubmitting = true
-      setSubmitLoading(true)
-
-      try {
-        const response = await window.aiOperator.submitCommand(text)
-        const data = response && response.data ? response.data : response
-
-        const cmd = {
-          id: (data && data.id) ? data.id : String(Date.now()),
-          text: text,
-          status: (data && data.status) ? data.status : 'queued',
-          intent: (data && data.intent) ? data.intent : null,
-          result: (data && data.result) ? data.result : null,
-          timestamp: new Date().toLocaleTimeString(),
-        }
-
-        commands.unshift(cmd)
-        input.value = ''
-        updateCharCount()
-        renderResults()
-
-        if (cmd.id) pollCommand(cmd.id)
-
-      } catch (err) {
-        console.error('Submit error:', err)
-      } finally {
-        isSubmitting = false
-        setSubmitLoading(false)
-      }
-    }
-
-    function setSubmitLoading(loading) {
-      document.getElementById('btnText').style.display = loading ? 'none' : 'inline'
-      document.getElementById('btnSpinner').style.display = loading ? 'block' : 'none'
-      document.getElementById('submitBtn').disabled = loading
-    }
-
-    async function pollCommand(cmdId) {
-      let attempts = 0
-      while (attempts < 30) {
-        await sleep(1000)
-        try {
-          const resp = await window.aiOperator.getCommands()
-          const all = (resp && resp.data) ? resp.data : []
-          const found = all.find(function(c) { return c.id === cmdId })
-          if (found) {
-            const idx = commands.findIndex(function(c) { return c.id === cmdId })
-            if (idx !== -1) {
-              commands[idx] = Object.assign({}, commands[idx], found)
-              renderResults()
-            }
-            if (found.status === 'completed' || found.status === 'failed') break
-          }
-        } catch {}
-        attempts++
-      }
-    }
-
-    function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms) }) }
-
-    function renderResults() {
-      const list = document.getElementById('resultList')
-      const empty = document.getElementById('emptyState')
-
-      if (commands.length === 0) {
-        list.style.display = 'none'
-        empty.style.display = 'flex'
-        return
-      }
-
-      empty.style.display = 'none'
-      list.style.display = 'block'
-
-      list.innerHTML = commands.slice(0, 5).map(function(cmd) {
-        const intentStr = cmd.intent
-          ? (cmd.intent.agent + ' &middot; ' + cmd.intent.skill)
-          : ''
-        const resultStr = cmd.result
-          ? ('<div class="result-text">' + escHtml(cmd.result.slice(0, 200)) + (cmd.result.length > 200 ? '...' : '') + '</div>')
-          : ''
-        return (
-          '<div class="result-item">' +
-            '<div class="result-meta">' +
-              '<span class="result-badge badge-' + cmd.status + '">' + cmd.status + '</span>' +
-              (intentStr ? '<span class="result-intent">' + intentStr + '</span>' : '') +
-              '<span class="result-timestamp">' + cmd.timestamp + '</span>' +
-            '</div>' +
-            '<div class="result-command-text">' + escHtml(cmd.text) + '</div>' +
-            resultStr +
-          '</div>'
-        )
-      }).join('')
-    }
-
-    function escHtml(str) {
-      return str
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-    }
-
-    setTimeout(function() { document.getElementById('commandInput').focus() }, 100)
-  </script>
+/* ── Init ────────────────────────────── */
+;(async function init() {
+  await checkHealth()
+  await loadCmds()
+  await loadInts()
+  setInterval(checkHealth, 12000)
+  setInterval(loadCmds,    8000)
+  setInterval(loadInts,    30000)
+  setTimeout(() => $('cmd')?.focus(), 150)
+})()
+</script>
 </body>
 </html>

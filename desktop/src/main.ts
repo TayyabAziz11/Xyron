@@ -1,11 +1,29 @@
 import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, shell } from 'electron'
 import * as path from 'path'
 import * as http from 'http'
+import { exec } from 'child_process'
+
+// WSL2: use explorer.exe to open URLs in the Windows default browser
+function openUrl(url: string): void {
+  if (process.platform === 'linux') {
+    // wslview (from wslu) is preferred; fall back to explorer.exe
+    exec(`wslview "${url}" 2>/dev/null || explorer.exe "${url}" 2>/dev/null`, (err) => {
+      if (err) console.warn('[AI Operator] Could not open URL in browser:', url)
+    })
+  } else {
+    shell.openExternal(url).catch(console.warn)
+  }
+}
 
 const API_BASE = 'http://localhost:8000'
 let tray: Tray | null = null
 let assistantWindow: BrowserWindow | null = null
 let isWindowVisible = false
+
+// Prevent silent crashes from killing the process
+process.on('uncaughtException', (err) => {
+  console.error('[AI Operator] Uncaught exception:', err.message)
+})
 
 // ── API helpers ────────────────────────────────────────────────────────────────
 function apiGet(endpoint: string): Promise<unknown> {
@@ -47,13 +65,14 @@ function createAssistantWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 420,
     height: 560,
-    show: false,
-    frame: false,
-    resizable: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    transparent: false,
+    // On WSL2/Linux without tray, show the window directly
+    show: process.platform === 'linux',
+    frame: process.platform === 'linux', // frameless only works reliably on macOS/Windows
+    resizable: true,
+    alwaysOnTop: false,
+    skipTaskbar: false,
     backgroundColor: '#08080f',
+    title: 'AI Operator',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -61,80 +80,93 @@ function createAssistantWindow(): BrowserWindow {
     },
   })
 
-  win.loadFile(path.join(__dirname, '..', 'src', 'renderer', 'index.html'))
+  const htmlPath = path.join(__dirname, '..', 'src', 'renderer', 'index.html')
+  win.loadFile(htmlPath).catch(err => {
+    console.error('[AI Operator] Failed to load renderer:', err.message)
+  })
 
-  win.on('blur', () => {
-    if (!win.webContents.isDevToolsOpened()) {
-      win.hide()
-      isWindowVisible = false
-    }
+  win.on('ready-to-show', () => {
+    console.log('[AI Operator] Window ready')
+    win.show()
+    win.focus()
+    isWindowVisible = true
+  })
+
+  win.on('closed', () => {
+    assistantWindow = null
+    isWindowVisible = false
   })
 
   return win
 }
 
 function toggleAssistant(): void {
-  if (!assistantWindow) return
+  if (!assistantWindow) {
+    assistantWindow = createAssistantWindow()
+    return
+  }
 
   if (isWindowVisible) {
     assistantWindow.hide()
     isWindowVisible = false
-    return
+  } else {
+    const { screen } = require('electron') as typeof import('electron')
+    const display = screen.getPrimaryDisplay()
+    const { width, height } = display.workAreaSize
+    const winBounds = assistantWindow.getBounds()
+
+    assistantWindow.setPosition(
+      Math.round(width / 2 - winBounds.width / 2),
+      Math.round(height - winBounds.height - 80),
+      false,
+    )
+    assistantWindow.show()
+    assistantWindow.focus()
+    isWindowVisible = true
   }
-
-  // Position near bottom center of primary display
-  const { screen } = require('electron') as typeof import('electron')
-  const display = screen.getPrimaryDisplay()
-  const { width, height } = display.workAreaSize
-  const winBounds = assistantWindow.getBounds()
-
-  assistantWindow.setPosition(
-    Math.round(width / 2 - winBounds.width / 2),
-    Math.round(height - winBounds.height - 80),
-    false,
-  )
-
-  assistantWindow.show()
-  assistantWindow.focus()
-  isWindowVisible = true
 }
 
-// ── Tray ───────────────────────────────────────────────────────────────────────
-function createTray(): Tray {
-  const iconPath = path.join(__dirname, '..', 'assets', 'tray-icon.png')
-  let icon: Electron.NativeImage
+// ── Tray (optional — not supported on all Linux/WSL2 setups) ──────────────────
+function tryCreateTray(): Tray | null {
   try {
-    icon = nativeImage.createFromPath(iconPath)
-    if (icon.isEmpty()) throw new Error('empty icon')
-  } catch {
-    icon = nativeImage.createEmpty()
+    // Minimal 1x1 purple PNG (base64) — fallback when no icon file
+    const FALLBACK_ICON_B64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+    const iconPath = path.join(__dirname, '..', 'assets', 'tray-icon.png')
+    let icon: Electron.NativeImage
+
+    try {
+      icon = nativeImage.createFromPath(iconPath)
+      if (icon.isEmpty()) throw new Error('empty')
+    } catch {
+      icon = nativeImage.createFromBuffer(Buffer.from(FALLBACK_ICON_B64, 'base64'))
+    }
+
+    const t = new Tray(icon)
+    t.setToolTip('AI Operator')
+
+    const menu = Menu.buildFromTemplate([
+      { label: 'AI Operator', enabled: false },
+      { type: 'separator' },
+      { label: 'Open Assistant', click: toggleAssistant },
+      { label: 'Open Dashboard', click: () => openUrl('http://localhost:3001/app/dashboard') },
+      { type: 'separator' },
+      { label: 'Quit', click: () => app.quit() },
+    ])
+    t.setContextMenu(menu)
+    t.on('click', toggleAssistant)
+    console.log('[AI Operator] System tray created')
+    return t
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn('[AI Operator] Tray not available (WSL2/headless):', msg)
+    return null
   }
-
-  const t = new Tray(icon)
-  t.setToolTip('AI Operator')
-
-  const menu = Menu.buildFromTemplate([
-    { label: 'AI Operator', enabled: false },
-    { type: 'separator' },
-    { label: 'Open Assistant  (Alt+Space)', click: toggleAssistant },
-    {
-      label: 'Open Dashboard',
-      click: () => shell.openExternal('http://localhost:3001/app/dashboard'),
-    },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() },
-  ])
-
-  t.setContextMenu(menu)
-  t.on('click', toggleAssistant)
-
-  return t
 }
 
 // ── IPC Handlers ──────────────────────────────────────────────────────────────
-// All handlers catch network errors silently — the renderer shows "offline" state.
-ipcMain.handle('submit-command', async (_event, text: string) => {
-  try { return await apiPost('/api/v1/commands', { text, source: 'desktop' }) }
+ipcMain.handle('submit-command', async (_event, text: string, source = 'desktop') => {
+  try { return await apiPost('/api/v1/commands', { text, source }) }
   catch { return null }
 })
 
@@ -143,8 +175,23 @@ ipcMain.handle('get-commands', async () => {
   catch { return null }
 })
 
+ipcMain.handle('get-command', async (_event, id: string) => {
+  try { return await apiGet(`/api/v1/commands/${id}`) }
+  catch { return null }
+})
+
 ipcMain.handle('get-health', async () => {
   try { return await apiGet('/api/v1/health') }
+  catch { return null }
+})
+
+ipcMain.handle('get-integrations', async () => {
+  try { return await apiGet('/api/v1/integrations') }
+  catch { return null }
+})
+
+ipcMain.handle('get-activity', async () => {
+  try { return await apiGet('/api/v1/activity?limit=5') }
   catch { return null }
 })
 
@@ -154,32 +201,58 @@ ipcMain.handle('hide-window', () => {
 })
 
 ipcMain.handle('open-dashboard', () => {
-  shell.openExternal('http://localhost:3001/app/dashboard')
+  openUrl('http://localhost:3001/app/dashboard')
+})
+
+ipcMain.handle('open-url', (_event, url: string) => {
+  openUrl(url)
+})
+
+ipcMain.handle('copy-text', async (_event, text: string) => {
+  const { clipboard } = require('electron') as typeof import('electron')
+  clipboard.writeText(text)
+  return true
 })
 
 // ── App lifecycle ──────────────────────────────────────────────────────────────
 app.whenReady().then(() => {
-  tray = createTray()
+  console.log('[AI Operator] App ready, platform:', process.platform)
+
+  // Create window first — always works
   assistantWindow = createAssistantWindow()
 
-  // Global hotkey: Alt+Space (fallback to Ctrl+Shift+Space)
-  const registered = globalShortcut.register('Alt+Space', toggleAssistant)
-  if (!registered) {
-    console.warn('Failed to register Alt+Space — trying Ctrl+Shift+Space fallback')
-    globalShortcut.register('CommandOrControl+Shift+Space', toggleAssistant)
-  }
+  // Tray is best-effort — fails silently on WSL2
+  tray = tryCreateTray()
 
-  // Hide dock icon on macOS — lives in tray only
-  if (process.platform === 'darwin' && app.dock) {
-    app.dock.hide()
+  // Register global hotkey
+  const hotkeys = ['Alt+Space', 'CommandOrControl+Shift+Space', 'F12']
+  let registered = false
+  for (const key of hotkeys) {
+    try {
+      if (globalShortcut.register(key, toggleAssistant)) {
+        console.log(`[AI Operator] Hotkey registered: ${key}`)
+        registered = true
+        break
+      }
+    } catch { /* try next */ }
   }
+  if (!registered) console.warn('[AI Operator] No hotkey could be registered — use the window directly')
+
+  if (process.platform === 'darwin' && app.dock) app.dock.hide()
 })
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
 })
 
-// Keep running in tray when all windows closed
 app.on('window-all-closed', () => {
-  // Do not quit — keep alive in system tray
+  // On macOS/Linux keep running; on Windows quit if no tray
+  if (process.platform !== 'darwin' && !tray) {
+    app.quit()
+  }
+})
+
+app.on('activate', () => {
+  // macOS: re-open window when dock icon clicked
+  if (!assistantWindow) assistantWindow = createAssistantWindow()
 })
