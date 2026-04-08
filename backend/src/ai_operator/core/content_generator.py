@@ -56,23 +56,43 @@ class ContentGenerator:
     # ------------------------------------------------------------------
 
     def _load_credentials(self) -> dict:
-        """Load AI API keys from .secrets/ai_credentials.json."""
+        """Load AI API keys — env var first, then .secrets/ai_credentials.json."""
         if self._creds is not None:
             return self._creds
 
+        # 1. Try OPENAI_API_KEY environment variable (preferred)
+        import os
+        env_key = (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("openai_api_key")
+        )
+        if env_key and env_key.startswith("sk-"):
+            self._creds = {"openai_api_key": env_key}
+            return self._creds
+
+        # 2. Try backend/.env file
+        for env_file in [
+            Path(__file__).parent.parent.parent.parent.parent / "backend" / ".env",
+            Path(__file__).parent.parent.parent.parent / ".env",
+        ]:
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("OPENAI_API_KEY="):
+                        key = line.split("=", 1)[1].strip()
+                        if key and key.startswith("sk-"):
+                            self._creds = {"openai_api_key": key}
+                            return self._creds
+
+        # 3. Fall back to .secrets/ai_credentials.json
         secrets_path = self.SECRETS_FILE
         if not secrets_path.is_absolute():
-            # Resolve relative to repo root (two dirs up from this file)
             repo_root = Path(__file__).parent.parent.parent.parent
             secrets_path = repo_root / secrets_path
 
         if not secrets_path.exists():
             raise ContentGeneratorError(
-                f"AI credentials file not found: {secrets_path}\n"
-                "Create .secrets/ai_credentials.json with:\n"
-                '{\n'
-                '  "openai_api_key": "sk-..."\n'
-                '}'
+                f"No OpenAI key found. Set OPENAI_API_KEY env var or create {secrets_path}\n"
+                'with: {"openai_api_key": "sk-..."}'
             )
 
         try:
@@ -176,6 +196,42 @@ class ContentGenerator:
             raise ContentGeneratorError(
                 f"OpenAI text generation failed: {exc}"
             ) from exc
+
+    def chat(
+        self,
+        user_message: str,
+        system_prompt: str = "You are a concise, helpful AI assistant.",
+        max_tokens: int = 300,
+        temperature: float = 0.5,
+    ) -> str:
+        """
+        General-purpose GPT-4o completion for any task.
+
+        Returns:
+            Response text string
+
+        Raises:
+            ContentGeneratorError on failure
+        """
+        client = self._get_openai_client()
+        try:
+            resp = client.chat.completions.create(
+                model=self.OPENAI_TEXT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            text = resp.choices[0].message.content.strip()
+            if not text:
+                raise ContentGeneratorError("OpenAI returned empty response")
+            return text
+        except ContentGeneratorError:
+            raise
+        except Exception as exc:
+            raise ContentGeneratorError(f"OpenAI chat failed: {exc}") from exc
 
     def generate_image(self, concept: str = "Agentic AI futuristic") -> bytes:
         """

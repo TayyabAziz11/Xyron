@@ -1,13 +1,45 @@
 """
 Generates natural-language assistant responses for spoken TTS output.
 
-Each skill result is mapped to a short, speakable response that sounds
-natural when read aloud — no markdown, no long technical text.
+Priority:
+1. OpenAI generates a concise spoken response (when key is available)
+2. Template fallback per-agent (always works)
+
+Each response is ≤ 2 sentences, no markdown, natural spoken English.
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _openai_spoken_response(command: str, result: str, agent: str) -> Optional[str]:
+    """Use OpenAI to produce a natural 1-sentence spoken response."""
+    try:
+        import sys
+        from pathlib import Path
+        src = Path(__file__).parent.parent / "src"
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        from ai_operator.core.content_generator import ContentGenerator
+        gen = ContentGenerator()
+        # Strip markdown/noise from result before sending
+        clean_result = re.sub(r'[\n\r]+', ' ', result or '')[:300]
+        prompt = (
+            f"User said: '{command}'\n"
+            f"Result: {clean_result}\n\n"
+            "Write a single natural spoken sentence (max 20 words) that an AI assistant "
+            "would say to summarise this result. No markdown. Sound friendly and concise."
+        )
+        reply = gen.chat(prompt, system_prompt="You write ultra-concise spoken AI assistant replies.", max_tokens=60)
+        if reply and len(reply) < 200:
+            return reply.strip().strip('"')
+    except Exception as exc:
+        logger.debug("OpenAI spoken response failed: %s", exc)
+    return None
 
 
 def generate_assistant_response(
@@ -21,18 +53,32 @@ def generate_assistant_response(
     """
     Produce a short, spoken-friendly response for the command result.
 
-    Args:
-        command_text: Original user command
-        result: Raw skill result text
-        agent: Agent name (email, linkedin, approval, etc.)
-        skill: Skill name
-        draft_id: If a draft was created, its ID (triggers action hint)
-        action_hint: Phrase the user should say to confirm (e.g. "post it")
-
-    Returns:
-        A 1-2 sentence response suitable for TTS playback.
+    Tries OpenAI for a natural reply first; falls back to per-agent templates.
+    When a draft was created, appends the voice confirmation hint.
     """
-    # Strip markdown, code blocks, and long technical output
+    # When a draft was created, use a fixed template — cleaner than AI-generating
+    if draft_id and action_hint:
+        type_label = {"email": "email draft", "linkedin_post": "LinkedIn post",
+                      "instagram": "Instagram post", "whatsapp": "WhatsApp message"}
+        label = type_label.get(agent if agent != "confirm" else "", "draft")
+        # Determine label from action_hint context
+        if action_hint == "send it":
+            label = "email draft"
+        elif action_hint == "post it":
+            label = "LinkedIn post"
+        return f"Your {label} is ready. Say '{action_hint}' to confirm, or open the dashboard to review."
+
+    # For confirm/cancel agents, use the result directly
+    if agent in ("confirm", "cancel"):
+        clean = _clean_for_speech(result)
+        return clean[:120] if clean else "Done."
+
+    # Try OpenAI for a natural spoken reply
+    ai_reply = _openai_spoken_response(command_text, result, agent)
+    if ai_reply:
+        return ai_reply
+
+    # Fallback: template-based response
     clean = _clean_for_speech(result)
 
     # Route to per-agent response template
