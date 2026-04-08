@@ -4,9 +4,9 @@
   "description": "AI Operator Desktop Companion",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "tsc && DBUS_SESSION_BUS_ADDRESS=autolaunch: electron --no-sandbox dist/main.js",
+    "dev": "tsc && NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator electron --no-sandbox --disable-gpu --disable-dev-shm-usage dist/main.js",
     "build": "tsc",
-    "start": "DBUS_SESSION_BUS_ADDRESS=autolaunch: electron --no-sandbox dist/main.js"
+    "start": "NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator electron --no-sandbox --disable-gpu --disable-dev-shm-usage dist/main.js"
   },
   "devDependencies": {
     "electron": "^36.0.0",
