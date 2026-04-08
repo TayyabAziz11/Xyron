@@ -4,9 +4,9 @@
   "description": "AI Operator Desktop Companion",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "tsc && NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator electron --no-sandbox --disable-gpu --disable-dev-shm-usage dist/main.js",
+    "dev": "tsc && NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator electron --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-features=MediaSessionService,GlobalMediaControls dist/main.js 2>&1 | grep -Ev 'ERROR:dbus|ERROR:content.*network_service|object_proxy|Connection refused' || true",
     "build": "tsc",
-    "start": "NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator electron --no-sandbox --disable-gpu --disable-dev-shm-usage dist/main.js"
+    "start": "NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator electron --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-features=MediaSessionService,GlobalMediaControls dist/main.js 2>&1 | grep -Ev 'ERROR:dbus|ERROR:content.*network_service|object_proxy|Connection refused' || true"
   },
   "devDependencies": {
     "electron": "^36.0.0",

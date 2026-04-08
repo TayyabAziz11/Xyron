@@ -23,11 +23,17 @@ logger = logging.getLogger(__name__)
 
 # ── Intent classification ────────────────────────────────────────────────────
 INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
-    (["email", "mail", "inbox", "message", "send", "draft", "reply"], "email", "email_draft"),
-    (["linkedin", "post", "publish", "content", "article"], "linkedin", "linkedin_draft"),
+    # Specific platforms first — prevents generic words like "draft"/"post" matching wrong agent
+    (["linkedin", "li post", "li article"], "linkedin", "linkedin_draft"),
+    (["whatsapp", "wa message", "wa chat"], "whatsapp", "whatsapp_send"),
+    (["instagram", "ig post", "ig story"], "instagram", "instagram_draft"),
+    (["odoo", "invoice", "accounting", "erp"], "odoo", "odoo_query"),
+    # Email — generic action words after specific platforms
+    (["email", "mail", "inbox", "gmail", "send email", "reply email"], "email", "email_draft"),
+    # Workflow actions
     (["approval", "approve", "pending", "review"], "approval", "list_approvals"),
     (["summary", "summarize", "report", "briefing"], "reporting", "daily_summary"),
-    (["workflow", "task", "process", "run"], "workflow", "list_workflows"),
+    (["workflow", "task", "process"], "workflow", "list_workflows"),
     (["integration", "status", "health", "check"], "integration", "integration_status"),
     (["activity", "log", "history", "audit"], "activity", "activity_summary"),
 ]
@@ -56,17 +62,20 @@ def _run_email_skill(text: str, skill: str) -> str:
         _ensure_src_path()
         from ai_operator.core.content_generator import ContentGenerator
         gen = ContentGenerator()
-        if "draft" in skill or "draft" in text.lower():
-            prompt = f"Draft a professional email based on this request: {text}"
-            return gen.generate_text(prompt)
-        elif "summarize" in skill or "summary" in text.lower():
+        # generate_linkedin_post is the generic OpenAI text generator available
+        if "summarize" in skill or "summary" in text.lower():
             return f"Email summary requested: {text}\n[Connect Gmail to fetch real emails]"
         else:
-            return f"Email skill: {skill}\nRequest: {text}\n[Gmail integration required for execution]"
+            # Use generate_linkedin_post with an email prompt as the generic text generator
+            result = gen.generate_linkedin_post(
+                topic=f"Draft a professional email: {text}",
+                tone="professional",
+            )
+            return result if isinstance(result, str) else str(result)
     except Exception as exc:
         return (
             f"Email agent received: {text}\n"
-            f"[Skill: {skill} — OpenAI key required for AI drafting]\n"
+            f"[Skill: {skill} — set OPENAI_API_KEY in backend/.env to enable AI drafting]\n"
             f"Detail: {exc}"
         )
 
@@ -76,12 +85,15 @@ def _run_linkedin_skill(text: str, skill: str) -> str:
         _ensure_src_path()
         from ai_operator.core.content_generator import ContentGenerator
         gen = ContentGenerator()
-        prompt = f"Write a professional LinkedIn post based on: {text}"
-        return gen.generate_text(prompt)
+        result = gen.generate_linkedin_post(
+            topic=text,
+            tone="professional",
+        )
+        return result if isinstance(result, str) else str(result)
     except Exception as exc:
         return (
             f"LinkedIn post draft requested: {text}\n"
-            f"[Skill: {skill} — OpenAI key required]\n"
+            f"[Skill: {skill} — set OPENAI_API_KEY in backend/.env to enable AI drafting]\n"
             f"Detail: {exc}"
         )
 
