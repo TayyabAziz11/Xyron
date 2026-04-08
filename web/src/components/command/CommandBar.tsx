@@ -4,6 +4,22 @@ import { useState, useRef, useCallback } from 'react'
 import { ArrowRight, Mic, MicOff, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 
+function micErrorMessage(err: unknown): string {
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
+    return 'Voice input requires Chrome or Firefox on localhost.'
+  }
+  if (err instanceof DOMException) {
+    if (err.name === 'NotAllowedError')
+      return 'Microphone blocked. Click the 🔒 icon in the address bar → allow microphone → try again.'
+    if (err.name === 'NotFoundError')
+      return 'No microphone found. Connect a mic and try again.'
+    if (err.name === 'NotReadableError')
+      return 'Microphone is busy. Close other apps using the mic and retry.'
+    return `Mic error: ${err.name}`
+  }
+  return 'Could not access microphone. Check browser permissions.'
+}
+
 interface CommandBarProps {
   onSubmit: (text: string) => Promise<void>
   loading?: boolean
@@ -15,6 +31,7 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
   const [text, setText] = useState('')
   const [isRecording, setIsRecording] = useState(false)
   const [isTranscribing, setIsTranscribing] = useState(false)
+  const [micError, setMicError] = useState<string | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
 
@@ -33,8 +50,18 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
   }
 
   const startRecording = useCallback(async () => {
+    setMicError(null)
+
+    // Guard: mediaDevices only available in secure context (localhost counts)
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      setMicError('Voice input is not supported in this browser or context.')
+      return
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      })
       chunksRef.current = []
 
       const recorder = new MediaRecorder(stream)
@@ -46,7 +73,8 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
       mediaRecorderRef.current = recorder
       setIsRecording(true)
     } catch (err) {
-      console.error('Microphone access denied or unavailable:', err)
+      console.error('[CommandBar] Mic error:', err)
+      setMicError(micErrorMessage(err))
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -79,12 +107,14 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
       }
     } catch (err) {
       console.error('Transcription request failed:', err)
+      setMicError('Transcription failed — is the backend running on port 8000?')
     } finally {
       setIsTranscribing(false)
     }
   }, [onTranscript])
 
   const toggleRecording = () => {
+    setMicError(null)
     if (isRecording) {
       stopRecording()
     } else {
@@ -156,6 +186,21 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
           </Button>
         </div>
       </div>
+
+      {/* Mic error banner — shown below the input when mic fails */}
+      {micError && (
+        <div className="mt-2 flex items-start gap-2.5 rounded-lg border border-status-error/30 bg-status-error/5 px-3.5 py-2.5 text-xs text-status-error">
+          <span className="mt-0.5 shrink-0">⚠</span>
+          <span>{micError}</span>
+          <button
+            type="button"
+            onClick={() => setMicError(null)}
+            className="ml-auto shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+          >
+            ✕
+          </button>
+        </div>
+      )}
     </form>
   )
 }

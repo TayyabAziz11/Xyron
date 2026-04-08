@@ -220,6 +220,17 @@ ipcMain.handle('copy-text', async (_event, text: string) => {
 app.whenReady().then(() => {
   console.log('[AI Operator] App ready, platform:', process.platform)
 
+  // Grant microphone + camera permissions automatically (no browser prompt)
+  const { session } = require('electron') as typeof import('electron')
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    // Allow media (mic/camera), clipboard, notifications
+    const allowed = ['media', 'mediaKeySystem', 'clipboard-read', 'notifications']
+    callback(allowed.includes(permission))
+  })
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => {
+    return ['media', 'mediaKeySystem', 'clipboard-read', 'notifications'].includes(permission)
+  })
+
   // Create window first — always works
   assistantWindow = createAssistantWindow()
 
