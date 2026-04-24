@@ -57,9 +57,9 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
       }
       window.speechSynthesis.cancel()
       const greetings = [
-        "Hi, I'm AI Operator. Go ahead and speak your command.",
+        "Hi, I'm Xyron. Go ahead and speak your command.",
         "Hey, I'm listening. What would you like me to do?",
-        "AI Operator here. I'm ready — go ahead.",
+        "Xyron here. I'm ready — go ahead.",
       ]
       const line = greetings[Math.floor(Math.random() * greetings.length)]
       const utter = new SpeechSynthesisUtterance(line)

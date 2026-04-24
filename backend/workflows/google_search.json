@@ -1,0 +1,16 @@
+{
+  "name": "google_search",
+  "display_name": "Google Search in Browser",
+  "triggers": [
+    "open google and search {query}",
+    "google search {query} in browser",
+    "search in browser for {query}",
+    "browser search {query}",
+    "open browser and search {query}"
+  ],
+  "completion_message": "Done, showing Google results.",
+  "steps": [
+    { "action": "browser.goto", "url": "https://www.google.com/search?q={query}", "delay": 1.5 },
+    { "action": "browser.wait", "selector": "#search", "timeout": 8000, "delay": 0.3 }
+  ]
+}

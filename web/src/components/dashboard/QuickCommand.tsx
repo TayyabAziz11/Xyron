@@ -28,7 +28,7 @@ export function QuickCommand() {
             type="text"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder="Tell AI Operator what to do…"
+            placeholder="Tell Xyron what to do…"
             className="w-full rounded-lg bg-surface-overlay border border-surface-border px-4 py-3 text-sm text-text-primary placeholder:text-text-muted focus:border-brand/50 focus:outline-none focus:ring-1 focus:ring-brand/30 transition-colors"
           />
           <div className="flex items-center justify-between">

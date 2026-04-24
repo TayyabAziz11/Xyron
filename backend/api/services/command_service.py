@@ -26,6 +26,15 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
     # ── Confirmation / cancellation (must be first) ──────────────────────────
     (["post it", "publish it", "go ahead", "yes confirm", "confirm it", "do it", "send it"], "confirm", "confirm_draft"),
     (["cancel it", "reject it", "don't send", "no cancel", "discard it", "never mind"], "cancel", "reject_draft"),
+    # ── System / web actions ──────────────────────────────────────────────────
+    (["search youtube", "youtube search", "find on youtube", "look up on youtube"], "system", "youtube_search"),
+    (["play video", "play on youtube", "watch video", "watch on youtube"], "system", "youtube_play"),
+    (["search google", "google search", "search the web", "search web", "look up", "google for"], "system", "google_search"),
+    (["open app", "launch app", "start app", "open vscode", "open vs code", "open chrome",
+      "open spotify", "open terminal", "open calculator", "launch chrome", "launch spotify",
+      "launch vscode", "launch vs code", "open notepad", "open firefox"], "system", "open_app"),
+    (["open youtube", "go to youtube", "open github", "go to github", "open gmail", "go to gmail",
+      "open netflix", "go to netflix", "open twitter", "open linkedin"], "system", "open_url"),
     # ── Specific platforms ────────────────────────────────────────────────────
     (["linkedin", "li post", "li article"], "linkedin", "linkedin_draft"),
     (["whatsapp", "wa message", "wa chat"], "whatsapp", "whatsapp_send"),
@@ -43,12 +52,73 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
 
 
 def classify_intent(text: str) -> CommandIntent:
-    """Simple keyword-based intent classifier."""
+    """Keyword-based intent classifier (fast fallback)."""
     text_lower = text.lower()
     for keywords, agent, skill in INTENT_PATTERNS:
         if any(kw in text_lower for kw in keywords):
             return CommandIntent(agent=agent, skill=skill, confidence="keyword_match")
     return CommandIntent(agent="general", skill="general_query", confidence="fallback")
+
+
+def classify_intent_ai(text: str, openai_key: str) -> tuple[str, dict]:
+    """Use OpenAI tool calling to classify intent and extract structured params.
+
+    Returns (tool_name, params_dict).  Falls back to ('general_query', {query: text}).
+    All tool definitions come from the central registry.
+    """
+    try:
+        import json as _json
+        from openai import OpenAI
+        from api.tools import registry
+
+        definitions = registry.get_definitions()
+        client      = OpenAI(api_key=openai_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Xyron intent router. "
+                        "Decide which tool best fulfils the user's request and extract its parameters. "
+                        "For system commands like 'open E drive', use open_directory. "
+                        "For launching apps, use open_application. "
+                        "Do not answer the request — only call the right tool."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            tools=definitions,
+            tool_choice="auto",
+            max_tokens=200,
+            temperature=0.0,
+        )
+        msg = resp.choices[0].message
+        if msg.tool_calls:
+            tc = msg.tool_calls[0]
+            return tc.function.name, _json.loads(tc.function.arguments or "{}")
+    except Exception as exc:
+        logger.debug("AI classify failed, using keyword fallback: %s", exc)
+
+    # ── Keyword fallback ──────────────────────────────────────────────────────
+    kw_intent = classify_intent(text)
+    _KW_TO_TOOL: dict[str, tuple[str, dict]] = {
+        "youtube_search": ("search_youtube",   {"query": text}),
+        "youtube_play":   ("search_youtube",   {"query": text}),
+        "google_search":  ("search_web",       {"query": text}),
+        "open_app":       ("open_application", {"app_name": text}),
+        "open_url":       ("open_url",         {"site": text}),
+        "email_draft":    ("compose_email",    {"to": "", "body_hint": text}),
+        "linkedin_draft": ("create_post",      {"platform": "linkedin", "topic": text}),
+        "instagram_draft":("create_post",      {"platform": "instagram", "topic": text}),
+        "daily_summary":  ("get_summary",      {"period": "daily"}),
+        "list_approvals": ("list_approvals",   {}),
+        "confirm_draft":  ("general_query",    {"query": text}),
+        "reject_draft":   ("general_query",    {"query": text}),
+    }
+    if kw_intent.skill in _KW_TO_TOOL:
+        return _KW_TO_TOOL[kw_intent.skill]
+    return "general_query", {"query": text}
 
 
 # ── Skill dispatch ───────────────────────────────────────────────────────────
@@ -155,7 +225,7 @@ def _run_linkedin_skill(text: str, skill: str, command_id: str) -> dict:
 def _run_reporting_skill(text: str, skill: str) -> str:
     now = dt.now().strftime("%A, %B %d at %I:%M %p")
     ai = _openai_chat(
-        prompt=f"The user asked: '{text}'. Generate a brief AI Operator activity summary for {now}. "
+        prompt=f"The user asked: '{text}'. Generate a brief Xyron activity summary for {now}. "
                "Keep it to 3-4 bullet points covering: commands processed, integrations checked, "
                "drafts created, approvals pending. Make it sound real but note data isn't live yet.",
         system="You are an AI assistant generating brief productivity summaries. Be concise and professional.",
@@ -163,7 +233,7 @@ def _run_reporting_skill(text: str, skill: str) -> str:
     )
     return ai or (
         f"Daily summary — {now}\n\n"
-        "• AI Operator is active and processing commands\n"
+        "• Xyron is active and processing commands\n"
         "• Voice pipeline: operational\n"
         "• Pending approvals: check the approvals panel\n"
         "• Integrations: Gmail and LinkedIn configured\n\n"
@@ -197,7 +267,7 @@ def _run_general_skill(text: str) -> str:
     ai = _openai_chat(
         prompt=text,
         system=(
-            "You are AI Operator — a professional AI voice assistant for business productivity. "
+            "You are Xyron — a professional AI voice assistant for business productivity. "
             "Answer the user's request concisely and helpfully. "
             "If you can't do something, say so clearly and suggest an alternative. "
             "Keep responses under 100 words. Speak naturally, no markdown."
@@ -240,6 +310,56 @@ def _run_reject_draft(command_id: str) -> dict:
     return {"result": "Draft cancelled.", "draft_id": latest.id}
 
 
+def _run_system_skill(text: str, skill: str) -> dict:
+    """Handle system/web actions — returns action_url for frontend to open."""
+    import re, urllib.parse
+    text_lower = text.lower()
+
+    if skill == "youtube_search":
+        m = re.search(r'(?:for|about)\s+(.+?)(?:\s*$|\?)', text_lower)
+        query = m.group(1).strip() if m else text_lower.replace("search youtube", "").replace("youtube search", "").strip()
+        url = f"https://youtube.com/search?q={urllib.parse.quote(query)}"
+        return {"result": f"Opening YouTube search for '{query}'", "action_url": url}
+
+    elif skill == "youtube_play":
+        m = re.search(r'(?:play|watch)\s+(.+?)(?:\s+(?:video|on youtube)|$)', text_lower)
+        query = m.group(1).strip() if m else text_lower
+        url = f"https://youtube.com/search?q={urllib.parse.quote(query)}"
+        return {"result": f"Opening YouTube for '{query}'", "action_url": url}
+
+    elif skill == "google_search":
+        m = re.search(r'(?:for|about)\s+(.+?)(?:\s*$|\?)', text_lower)
+        if not m:
+            m = re.search(r'(?:search|google)\s+(?:for\s+)?(.+)', text_lower)
+        query = m.group(1).strip() if m else text_lower
+        url = f"https://google.com/search?q={urllib.parse.quote(query)}"
+        return {"result": f"Searching Google for '{query}'", "action_url": url}
+
+    elif skill == "open_url":
+        url_map = {
+            "youtube": "https://youtube.com", "github": "https://github.com",
+            "gmail": "https://mail.google.com", "google": "https://google.com",
+            "netflix": "https://netflix.com", "twitter": "https://twitter.com",
+            "linkedin": "https://linkedin.com", "reddit": "https://reddit.com",
+            "spotify": "https://open.spotify.com", "amazon": "https://amazon.com",
+        }
+        for name, url in url_map.items():
+            if name in text_lower:
+                return {"result": f"Opening {name.title()}", "action_url": url}
+        return {"result": "Opening requested page.", "action_url": "https://google.com"}
+
+    elif skill == "open_app":
+        # Let the system router handle actual launching — return instruction for frontend
+        app_names = ["vscode", "vs code", "chrome", "spotify", "firefox", "terminal",
+                     "calculator", "notepad", "explorer", "cmd", "powershell"]
+        for app in app_names:
+            if app in text_lower:
+                return {"result": f"Launching {app.title()}…", "action_app": app}
+        return {"result": "Which application would you like to open?"}
+
+    return _run_general_skill(text)
+
+
 def _dispatch_to_skill(text: str, intent: CommandIntent, command_id: str) -> dict | str:
     """Route to real skill implementation or return structured placeholder."""
     agent = intent.agent
@@ -249,6 +369,8 @@ def _dispatch_to_skill(text: str, intent: CommandIntent, command_id: str) -> dic
         return _run_confirm_draft(command_id)
     elif agent == "cancel":
         return _run_reject_draft(command_id)
+    elif agent == "system":
+        return _run_system_skill(text, skill)
     elif agent == "email":
         return _run_email_skill(text, skill, command_id)
     elif agent == "linkedin":
@@ -281,37 +403,96 @@ class CommandService:
 
     def submit(self, text: str) -> Command:
         """Create, classify intent, queue and kick off background execution."""
-        intent = classify_intent(text)
-        cmd = Command(text=text, status=CommandStatus.queued, intent=intent)
+        intent = classify_intent(text)   # fast keyword pre-classify for instant response
+        cmd    = Command(text=text, status=CommandStatus.queued, intent=intent)
 
         with self._lock:
             self._store[cmd.id] = cmd
-            # Evict oldest if over capacity
             while len(self._store) > self._MAX_SIZE:
                 self._store.popitem(last=False)
 
-        # Execute in background thread
         _executor.submit(self._execute, cmd.id, text, intent)
-
         return cmd
 
     def _execute(self, command_id: str, text: str, intent: CommandIntent) -> None:
-        """Run in thread pool — updates command store with result."""
+        """Run in thread pool — updates command store with result.
+
+        Priority:
+          1. OpenAI tool calling (via registry) — AI decides which tool + params
+          2. Legacy _dispatch_to_skill        — keyword-matched (confirm/cancel/etc.)
+        """
         try:
             self.update_status(command_id, CommandStatus.running)
+
+            # ── 1. AI tool calling via central registry ───────────────────────
+            tool_name: str | None  = None
+            tool_params: dict      = {}
+            used_registry          = False
+
+            try:
+                _ensure_src_path()
+                from api.config import settings as _cfg
+                from api.tools import registry
+
+                if _cfg.openai_api_key and _cfg.openai_api_key.startswith("sk-"):
+                    tool_name, tool_params = classify_intent_ai(text, _cfg.openai_api_key)
+
+                    # Special non-registry intents handled by legacy path
+                    if tool_name not in ("confirm_draft", "reject_draft") and tool_name in registry:
+                        ctx    = {"openai_key": _cfg.openai_api_key}
+                        result = registry.execute(tool_name, tool_params, ctx)
+
+                        action_url  = result.action_url
+                        action_app  = result.action_app
+                        action_path = result.action_path
+                        spoken      = result.spoken or result.text
+                        result_text = result.text
+
+                        # Update intent for audit trail
+                        intent = CommandIntent(
+                            agent=tool_name.split("_")[0],
+                            skill=tool_name,
+                            confidence="ai_tool_call",
+                        )
+                        self.update_status(
+                            command_id, CommandStatus.completed,
+                            result=result_text,
+                            assistant_response=spoken,
+                            action_url=action_url,
+                            action_app=action_app,
+                        )
+                        # Store in memory as last action
+                        try:
+                            from api.services.memory_service import memory_service
+                            memory_service.set_last_action(tool_name, tool_params, result_text)
+                        except Exception:
+                            pass
+                        used_registry = True
+
+            except Exception as ai_exc:
+                logger.debug("Registry execution skipped, falling back: %s", ai_exc)
+
+            if used_registry:
+                return
+
+            # ── 2. Legacy skill dispatch (keyword-based) ──────────────────────
             result_data = _dispatch_to_skill(text, intent, command_id)
 
             # Handle both string and dict returns
             if isinstance(result_data, dict):
-                result_text = result_data.get("result", "")
-                draft_id    = result_data.get("draft_id")
-                action_hint = result_data.get("action_hint", "")
+                result_text     = result_data.get("result", "")
+                draft_id        = result_data.get("draft_id")
+                action_hint     = result_data.get("action_hint", "")
+                action_url      = result_data.get("action_url")
+                action_app      = result_data.get("action_app")
                 # Use execution spoken override if present (for confirm flows)
                 spoken_override = result_data.get("spoken")
             else:
                 result_text     = result_data
                 draft_id        = None
                 action_hint     = ""
+                action_url      = None
+                action_app      = None
                 spoken_override = None
 
             # Generate spoken assistant response
@@ -342,6 +523,8 @@ class CommandService:
                 result=result_text,
                 assistant_response=assistant_resp,
                 draft_id=draft_id,
+                action_url=action_url,
+                action_app=action_app,
             )
         except Exception as exc:
             logger.exception("Command %s execution failed", command_id)
@@ -365,6 +548,8 @@ class CommandService:
         error: Optional[str] = None,
         assistant_response: Optional[str] = None,
         draft_id: Optional[str] = None,
+        action_url: Optional[str] = None,
+        action_app: Optional[str] = None,
     ) -> Optional[Command]:
         """Update command status — called by agent execution layer."""
         with self._lock:
@@ -381,6 +566,10 @@ class CommandService:
                 cmd.assistant_response = assistant_response
             if draft_id is not None:
                 cmd.draft_id = draft_id
+            if action_url is not None:
+                cmd.action_url = action_url
+            if action_app is not None:
+                cmd.action_app = action_app
         return cmd
 
 

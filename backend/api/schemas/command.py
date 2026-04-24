@@ -43,6 +43,8 @@ class Command(BaseModel):
     intent: Optional[CommandIntent] = None  # classified intent
     assistant_response: Optional[str] = None  # spoken-friendly response for TTS
     draft_id: Optional[str] = None  # associated draft (if command produced one)
+    action_url: Optional[str] = None  # URL for frontend to open (search/navigation)
+    action_app: Optional[str] = None  # app name for frontend to launch
 
 
 class CommandResult(BaseModel):

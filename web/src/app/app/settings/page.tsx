@@ -1,30 +1,100 @@
 'use client'
 
-import { Mic } from 'lucide-react'
+import { useState } from 'react'
+import { Mic, Volume2, VolumeX, CheckCircle, XCircle, Play } from 'lucide-react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/Card'
 import { StatusDot } from '@/components/ui/StatusDot'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { PageTransition } from '@/components/layout/PageTransition'
 import { useApi } from '@/hooks/useApi'
-import { useVoice } from '@/hooks/useVoice'
 import { api } from '@/lib/api'
-import { CheckCircle, XCircle, Volume2, VolumeX } from 'lucide-react'
+import {
+  useAssistantSettings,
+  VOICE_OPTIONS,
+  MODE_OPTIONS,
+  type OpenAIVoice,
+  type BehaviorMode,
+} from '@/hooks/useAssistantSettings'
 
-const ENV_VARS = [
-  'OPENAI_API_KEY',
-  'REPO_ROOT',
-  'API_PORT',
-  'CORS_ORIGINS',
-]
+const ENV_VARS = ['OPENAI_API_KEY', 'REPO_ROOT', 'API_PORT', 'CORS_ORIGINS']
+
+function Toggle({
+  checked,
+  onChange,
+  disabled,
+}: {
+  checked: boolean
+  onChange: () => void
+  disabled?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onChange}
+      disabled={disabled}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-40 ${
+        checked ? 'bg-brand' : 'bg-surface-border'
+      }`}
+      role="switch"
+      aria-checked={checked}
+    >
+      <span
+        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+          checked ? 'translate-x-4' : 'translate-x-1'
+        }`}
+      />
+    </button>
+  )
+}
 
 export default function SettingsPage() {
-  const { data: health, loading: healthLoading } = useApi(() => api.health.ping())
-  const { data: status, loading: statusLoading } = useApi(() => api.health.status())
-  const { settings, saveSettings, speak, isSpeaking } = useVoice()
+  const { data: health, loading: healthLoading }   = useApi(() => api.health.ping())
+  const { data: status, loading: statusLoading }   = useApi(() => api.health.status())
+  const { settings, saveSettings }                 = useAssistantSettings()
+
+  const [previewing, setPreviewing] = useState<OpenAIVoice | null>(null)
+  const [previewErr, setPreviewErr] = useState<string | null>(null)
+
+  const API_BASE =
+    typeof window !== 'undefined'
+      ? (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000')
+      : 'http://localhost:8000'
+
+  async function previewVoice(voice: OpenAIVoice) {
+    if (previewing) return
+    setPreviewing(voice)
+    setPreviewErr(null)
+    try {
+      const resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          text:  `Hi, I'm ${voice.charAt(0).toUpperCase() + voice.slice(1)}, your Xyron voice.`,
+          voice,
+          speed: settings.speed,
+        }),
+      })
+      if (!resp.ok) throw new Error('TTS failed')
+      const blob = await resp.blob()
+      const url  = URL.createObjectURL(blob)
+      await new Promise<void>((resolve) => {
+        const audio   = new Audio(url)
+        audio.onended = () => { URL.revokeObjectURL(url); resolve() }
+        audio.onerror = () => { URL.revokeObjectURL(url); resolve() }
+        audio.play().catch(() => resolve())
+      })
+    } catch {
+      setPreviewErr('Preview failed — make sure the backend is running and OPENAI_API_KEY is set.')
+    } finally {
+      setPreviewing(null)
+    }
+  }
 
   return (
     <PageTransition>
       <div className="max-w-2xl mx-auto space-y-6">
+
+        {/* System Status */}
         <Card>
           <CardHeader>
             <CardTitle>System Status</CardTitle>
@@ -34,16 +104,14 @@ export default function SettingsPage() {
           </CardHeader>
           <CardContent className="pt-0 space-y-3">
             {healthLoading || statusLoading ? (
-              <div className="flex justify-center py-8">
-                <LoadingSpinner />
-              </div>
+              <div className="flex justify-center py-8"><LoadingSpinner /></div>
             ) : status ? (
               <dl className="space-y-2">
                 {[
-                  ['Python', status.python_version],
-                  ['Repo root', status.repo_root],
-                  ['MCP servers', status.mcp_servers.join(', ') || 'none'],
-                  ['API healthy', status.healthy ? 'Yes' : 'No'],
+                  ['Python',       status.python_version],
+                  ['Repo root',    status.repo_root],
+                  ['MCP servers',  status.mcp_servers.join(', ') || 'none'],
+                  ['API healthy',  status.healthy ? 'Yes' : 'No'],
                 ].map(([label, value]) => (
                   <div key={label} className="flex items-center justify-between py-1.5 border-b border-surface-border last:border-0">
                     <dt className="text-xs text-text-muted">{label}</dt>
@@ -57,27 +125,24 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
+        {/* Directory Checks */}
         {status && (
           <Card>
-            <CardHeader>
-              <CardTitle>Directory Checks</CardTitle>
-            </CardHeader>
+            <CardHeader><CardTitle>Directory Checks</CardTitle></CardHeader>
             <CardContent className="pt-0">
               <dl className="space-y-2">
                 {[
-                  ['Logs dir', status.logs_dir_exists],
+                  ['Logs dir',              status.logs_dir_exists],
                   ['Pending approvals dir', status.pending_approval_dir_exists],
-                  ['Secrets dir', status.secrets_dir_exists],
-                  ['Skills dir', status.skills_dir_exists],
+                  ['Secrets dir',           status.secrets_dir_exists],
+                  ['Skills dir',            status.skills_dir_exists],
                 ].map(([label, ok]) => (
                   <div key={label as string} className="flex items-center justify-between py-1.5 border-b border-surface-border last:border-0">
                     <dt className="text-xs text-text-muted">{label}</dt>
                     <dd className="flex items-center gap-1">
-                      {ok ? (
-                        <CheckCircle className="h-3.5 w-3.5 text-status-success" />
-                      ) : (
-                        <XCircle className="h-3.5 w-3.5 text-status-error" />
-                      )}
+                      {ok
+                        ? <CheckCircle className="h-3.5 w-3.5 text-status-success" />
+                        : <XCircle    className="h-3.5 w-3.5 text-status-error" />}
                       <span className={`text-xs ${ok ? 'text-status-success' : 'text-status-error'}`}>
                         {ok ? 'Found' : 'Missing'}
                       </span>
@@ -89,143 +154,177 @@ export default function SettingsPage() {
           </Card>
         )}
 
-        {/* Voice Settings */}
+        {/* Voice Selection */}
         <Card>
           <CardHeader>
-            <CardTitle>Voice Settings</CardTitle>
+            <CardTitle>Voice</CardTitle>
           </CardHeader>
           <CardContent className="pt-0 space-y-4">
-            {/* Enable toggle */}
-            <div className="flex items-center justify-between py-1.5 border-b border-surface-border">
-              <div>
-                <p className="text-sm text-text-secondary">Voice responses</p>
-                <p className="text-xs text-text-muted">Speak results aloud when commands complete</p>
+            {/* Voice enabled toggle */}
+            <div className="flex items-center justify-between rounded-lg border border-surface-border bg-surface-overlay px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                {settings.voiceEnabled
+                  ? <Volume2 className="h-4 w-4 text-brand-light" />
+                  : <VolumeX className="h-4 w-4 text-text-muted" />}
+                <span className="text-sm text-text-secondary">Voice responses</span>
               </div>
-              <button
-                onClick={() => saveSettings({ enabled: !settings.enabled })}
-                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                  settings.enabled ? 'bg-brand' : 'bg-surface-border'
-                }`}
-                role="switch"
-                aria-checked={settings.enabled}
-              >
-                <span
-                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                    settings.enabled ? 'translate-x-4' : 'translate-x-1'
-                  }`}
-                />
-              </button>
-            </div>
-
-            {/* Auto-play toggle */}
-            <div className="flex items-center justify-between py-1.5 border-b border-surface-border">
-              <div>
-                <p className="text-sm text-text-secondary">Auto-play responses</p>
-                <p className="text-xs text-text-muted">Automatically speak when a command completes</p>
-              </div>
-              <button
-                onClick={() => saveSettings({ autoPlay: !settings.autoPlay })}
-                disabled={!settings.enabled}
-                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                  settings.autoPlay && settings.enabled ? 'bg-brand' : 'bg-surface-border'
-                } disabled:opacity-40`}
-                role="switch"
-                aria-checked={settings.autoPlay}
-              >
-                <span
-                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                    settings.autoPlay && settings.enabled ? 'translate-x-4' : 'translate-x-1'
-                  }`}
-                />
-              </button>
-            </div>
-
-            {/* Speech rate slider */}
-            <div className="py-1.5 border-b border-surface-border space-y-2">
-              <div className="flex justify-between">
-                <p className="text-sm text-text-secondary">Speech speed</p>
-                <span className="text-xs text-text-muted font-mono">{settings.rate} WPM</span>
-              </div>
-              <input
-                type="range"
-                min={80}
-                max={250}
-                step={5}
-                value={settings.rate}
-                disabled={!settings.enabled}
-                onChange={e => saveSettings({ rate: Number(e.target.value) })}
-                className="w-full h-1.5 rounded-full accent-brand disabled:opacity-40 cursor-pointer"
+              <Toggle
+                checked={settings.voiceEnabled}
+                onChange={() => saveSettings({ voiceEnabled: !settings.voiceEnabled })}
               />
-              <div className="flex justify-between text-xs text-text-muted">
-                <span>Slow</span>
-                <span>Fast</span>
-              </div>
             </div>
+
+            <p className="text-xs text-text-muted">
+              Powered by OpenAI TTS (tts-1). Select a voice for the Xyron.
+            </p>
+            <div className="grid grid-cols-1 gap-2">
+              {VOICE_OPTIONS.map((v) => {
+                const active = settings.voice === v.id
+                return (
+                  <div
+                    key={v.id}
+                    className={`flex items-center justify-between rounded-lg border px-3 py-2.5 cursor-pointer transition-all ${
+                      active
+                        ? 'border-brand/60 bg-brand/8'
+                        : 'border-surface-border bg-surface-overlay hover:border-brand/30'
+                    }`}
+                    onClick={() => saveSettings({ voice: v.id })}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div
+                        className={`h-3 w-3 rounded-full border-2 flex-shrink-0 ${
+                          active ? 'border-brand bg-brand' : 'border-surface-border'
+                        }`}
+                      />
+                      <div>
+                        <p className={`text-sm font-medium ${active ? 'text-brand-light' : 'text-text-secondary'}`}>
+                          {v.label}
+                        </p>
+                        <p className="text-xs text-text-muted">{v.desc}</p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); previewVoice(v.id) }}
+                      disabled={previewing !== null}
+                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-raised border border-surface-border text-xs text-text-muted
+                        hover:text-text-secondary hover:border-brand/30 transition-colors disabled:opacity-40"
+                    >
+                      {previewing === v.id
+                        ? <span className="animate-pulse">Playing…</span>
+                        : <><Play className="h-3 w-3" /> Preview</>}
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+            {previewErr && (
+              <p className="text-xs text-status-error">{previewErr}</p>
+            )}
 
             {/* Volume slider */}
-            <div className="py-1.5 border-b border-surface-border space-y-2">
+            <div className="space-y-2">
               <div className="flex justify-between">
                 <p className="text-sm text-text-secondary">Volume</p>
                 <span className="text-xs text-text-muted font-mono">{Math.round(settings.volume * 100)}%</span>
               </div>
-              <div className="flex items-center gap-2">
-                <VolumeX className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={settings.volume}
-                  disabled={!settings.enabled}
-                  onChange={e => saveSettings({ volume: Number(e.target.value) })}
-                  className="flex-1 h-1.5 rounded-full accent-brand disabled:opacity-40 cursor-pointer"
-                />
-                <Volume2 className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+              <input
+                type="range"
+                min={0.1}
+                max={1.0}
+                step={0.05}
+                value={settings.volume}
+                onChange={(e) => saveSettings({ volume: Number(e.target.value) })}
+                className="w-full h-1.5 rounded-full accent-brand cursor-pointer"
+              />
+              <div className="flex justify-between text-xs text-text-muted">
+                <span>Quiet</span>
+                <span>Max</span>
               </div>
             </div>
 
-            {/* Test button */}
-            <div className="flex items-center justify-between pt-1">
-              <div>
-                <p className="text-sm text-text-secondary">Test voice</p>
-                <p className="text-xs text-text-muted">
-                  Engine: pyttsx3 / espeak-ng
-                </p>
+            {/* Speed slider */}
+            <div className="pt-1 space-y-2">
+              <div className="flex justify-between">
+                <p className="text-sm text-text-secondary">Speech speed</p>
+                <span className="text-xs text-text-muted font-mono">{settings.speed.toFixed(2)}×</span>
               </div>
-              <button
-                onClick={() => speak('Hello, I am AI Operator. Your voice assistant is ready.')}
-                disabled={!settings.enabled || isSpeaking}
-                className="px-3 py-1.5 rounded-lg bg-brand/10 border border-brand/25 text-xs text-brand-light
-                  hover:bg-brand/15 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {isSpeaking ? 'Speaking…' : 'Play sample'}
-              </button>
+              <input
+                type="range"
+                min={0.75}
+                max={1.5}
+                step={0.05}
+                value={settings.speed}
+                onChange={(e) => saveSettings({ speed: Number(e.target.value) })}
+                className="w-full h-1.5 rounded-full accent-brand cursor-pointer"
+              />
+              <div className="flex justify-between text-xs text-text-muted">
+                <span>Slower</span>
+                <span>Normal</span>
+                <span>Faster</span>
+              </div>
             </div>
           </CardContent>
         </Card>
 
+        {/* Behavior Mode */}
         <Card>
           <CardHeader>
-            <CardTitle>Voice Commands</CardTitle>
+            <CardTitle>Behavior Mode</CardTitle>
           </CardHeader>
+          <CardContent className="pt-0 space-y-3">
+            <p className="text-xs text-text-muted">
+              Controls the greeting and tone of Xyron voice sessions.
+            </p>
+            <div className="grid grid-cols-3 gap-2">
+              {MODE_OPTIONS.map((m) => {
+                const active = settings.mode === m.id
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => saveSettings({ mode: m.id as BehaviorMode })}
+                    className={`flex flex-col items-center gap-1.5 rounded-lg border px-3 py-3 text-center transition-all ${
+                      active
+                        ? 'border-brand/60 bg-brand/8'
+                        : 'border-surface-border bg-surface-overlay hover:border-brand/30'
+                    }`}
+                  >
+                    <p className={`text-sm font-semibold ${active ? 'text-brand-light' : 'text-text-secondary'}`}>
+                      {m.label}
+                    </p>
+                    <p className="text-xs text-text-muted leading-tight">{m.desc}</p>
+                  </button>
+                )
+              })}
+            </div>
+            {/* Greeting preview */}
+            <div className="rounded-lg bg-surface-overlay border border-surface-border px-3 py-2.5">
+              <p className="text-xs text-text-muted mb-1">Greeting preview</p>
+              <p className="text-xs text-text-secondary italic">
+                &ldquo;{MODE_OPTIONS.find((m) => m.id === settings.mode)?.greeting}&rdquo;
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Voice Commands reference */}
+        <Card>
+          <CardHeader><CardTitle>Voice Commands</CardTitle></CardHeader>
           <CardContent className="pt-0">
             <div className="flex items-center gap-3 rounded-lg bg-surface-overlay border border-surface-border px-4 py-3">
-              <Mic className="h-4 w-4 text-text-muted" />
+              <Mic className="h-4 w-4 text-brand-light" />
               <div>
-                <p className="text-sm text-text-secondary font-medium">Push-to-talk</p>
-                <p className="text-xs text-text-muted">Coming in the next version</p>
+                <p className="text-sm text-text-secondary font-medium">Continuous voice session</p>
+                <p className="text-xs text-text-muted">Start from the Command Center. Say "stop", "bye", or "end session" to exit.</p>
               </div>
-              <span className="ml-auto text-xs text-text-muted bg-surface-border px-2 py-0.5 rounded-full">
-                Soon
-              </span>
             </div>
           </CardContent>
         </Card>
 
+        {/* Environment Variables */}
         <Card>
-          <CardHeader>
-            <CardTitle>Environment Variables</CardTitle>
-          </CardHeader>
+          <CardHeader><CardTitle>Environment Variables</CardTitle></CardHeader>
           <CardContent className="pt-0">
             <p className="text-xs text-text-muted mb-3">
               Showing which keys are expected (values are never displayed).
@@ -241,10 +340,9 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
+        {/* About */}
         <Card>
-          <CardHeader>
-            <CardTitle>About AI Operator</CardTitle>
-          </CardHeader>
+          <CardHeader><CardTitle>About Xyron</CardTitle></CardHeader>
           <CardContent className="pt-0 space-y-2">
             <div className="flex justify-between py-1.5 border-b border-surface-border">
               <span className="text-xs text-text-muted">Version</span>
@@ -267,6 +365,7 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+
       </div>
     </PageTransition>
   )

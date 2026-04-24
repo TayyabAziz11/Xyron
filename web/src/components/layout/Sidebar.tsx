@@ -1,6 +1,7 @@
 'use client'
 
 import Link from 'next/link'
+import Image from 'next/image'
 import { usePathname } from 'next/navigation'
 import {
   LayoutDashboard,
@@ -39,13 +40,18 @@ export function Sidebar() {
   return (
     <aside className="flex h-screen w-60 flex-col border-r border-surface-border bg-surface-raised">
       {/* Logo */}
-      <div className="flex items-center gap-3 px-5 py-5 border-b border-surface-border">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand">
-          <span className="text-sm font-bold text-white">AI</span>
-        </div>
+      <div className="flex items-center gap-3 px-4 py-4 border-b border-surface-border">
+        <Image
+          src="/icon-96.png"
+          alt="Xyron"
+          width={36}
+          height={36}
+          className="rounded-lg"
+          priority
+        />
         <div>
-          <p className="text-sm font-semibold text-text-primary">AI Operator</p>
-          <p className="text-xs text-text-muted">Control Panel</p>
+          <p className="text-sm font-bold text-text-primary tracking-wide">XYRON</p>
+          <p className="text-xs text-text-muted">Voice Driven AI OS</p>
         </div>
       </div>
 

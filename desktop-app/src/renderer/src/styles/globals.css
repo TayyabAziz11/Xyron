@@ -1,0 +1,158 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body, #root { @apply w-full h-full m-0 p-0; }
+  body {
+    @apply bg-bg text-slate-100 font-sans antialiased;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -20%, rgba(124,58,237,0.10), transparent),
+      radial-gradient(ellipse 60% 40% at 80% 120%, rgba(139,92,246,0.06), transparent);
+  }
+  ::-webkit-scrollbar { width: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-border rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-border-hi; }
+  input[type=range] { @apply appearance-none bg-transparent cursor-pointer; }
+  input[type=range]::-webkit-slider-runnable-track {
+    @apply h-1.5 rounded-full;
+    background: linear-gradient(to right, #7c3aed var(--range-progress, 50%), #1e1e30 var(--range-progress, 50%));
+  }
+  input[type=range]::-webkit-slider-thumb {
+    @apply appearance-none w-4 h-4 rounded-full bg-brand-light border-2 border-surface shadow-lg -mt-[3px];
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-surface/70 backdrop-blur-md border border-border rounded-xl;
+  }
+  .glass-card {
+    @apply bg-card/80 backdrop-blur-sm border border-border/60 rounded-xl
+           hover:border-border-hi transition-all duration-200;
+  }
+  .btn-brand {
+    @apply bg-brand text-white font-semibold px-4 py-2 rounded-lg
+           hover:bg-brand-light transition-all duration-200 shadow-lg shadow-brand/20
+           hover:shadow-brand/40 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply text-slate-400 px-3 py-1.5 rounded-lg text-sm
+           hover:text-slate-100 hover:bg-surface transition-all duration-200 active:scale-95;
+  }
+  .pill {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  .nav-item {
+    @apply relative flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium
+           text-slate-500 hover:text-slate-200 hover:bg-white/5 transition-all duration-200
+           cursor-pointer select-none;
+  }
+  .nav-item.active {
+    @apply text-slate-100 bg-brand/10;
+    box-shadow: inset 3px 0 0 #8b5cf6;
+  }
+  .gradient-text {
+    @apply bg-clip-text text-transparent;
+    background-image: linear-gradient(135deg, #a78bfa, #7c3aed);
+  }
+  .glow-brand { box-shadow: 0 0 20px rgba(124,58,237,0.35), 0 0 60px rgba(124,58,237,0.15); }
+  .glow-ok    { box-shadow: 0 0 20px rgba(16,185,129,0.35); }
+}
+
+/* ── Mic rings ─────────────────────────────────────────────────────────── */
+@keyframes mic-ring {
+  0%   { transform: scale(1);   opacity: 0.7; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.mic-ring { animation: mic-ring 2s ease-out infinite; }
+.mic-ring-2 { animation: mic-ring 2s ease-out infinite 0.5s; }
+.mic-ring-3 { animation: mic-ring 2s ease-out infinite 1s; }
+
+/* ── Orbit dots ────────────────────────────────────────────────────────── */
+@keyframes orbit {
+  from { transform: rotate(0deg) translateX(44px) rotate(0deg); }
+  to   { transform: rotate(360deg) translateX(44px) rotate(-360deg); }
+}
+.orbit-dot { animation: orbit 3s linear infinite; }
+.orbit-dot-2 { animation: orbit 3s linear infinite 1s; }
+.orbit-dot-3 { animation: orbit 3s linear infinite 2s; }
+
+/* ── Shimmer ────────────────────────────────────────────────────────────── */
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+.shimmer {
+  background: linear-gradient(90deg, transparent 25%, rgba(139,92,246,0.15) 50%, transparent 75%);
+  background-size: 200% auto;
+  animation: shimmer 2.5s linear infinite;
+}
+
+/* ── Floating ───────────────────────────────────────────────────────────── */
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-6px); }
+}
+.float { animation: float 4s ease-in-out infinite; }
+
+/* ── Gradient border ─────────────────────────────────────────────────────── */
+.gradient-border {
+  position: relative;
+  border-radius: 0.75rem;
+}
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, rgba(124,58,237,0.6), rgba(139,92,246,0.2), transparent 60%);
+  z-index: -1;
+}
+
+/* ── Page background grid ─────────────────────────────────────────────────── */
+.bg-grid {
+  background-image: linear-gradient(rgba(139,92,246,0.03) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(139,92,246,0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* ── Typing dots ────────────────────────────────────────────────────────────── */
+@keyframes blink {
+  0%, 80%, 100% { opacity: 0.2; transform: scale(0.85); }
+  40%            { opacity: 1;   transform: scale(1.2); }
+}
+.typing-dot { animation: blink 1.2s ease-in-out infinite; }
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* ── Soft pulse ring ────────────────────────────────────────────────────────── */
+@keyframes soft-ring {
+  0%   { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.0); opacity: 0; }
+}
+.soft-ring { animation: soft-ring 1.8s ease-out infinite; }
+
+/* ── Text gradient animation ────────────────────────────────────────────────── */
+@keyframes gradient-move {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+.gradient-text-animated {
+  background: linear-gradient(135deg, #a78bfa, #7c3aed, #8b5cf6, #c4b5fd);
+  background-size: 300% 300%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: gradient-move 4s ease infinite;
+}
+
+/* ── Smooth fade-slide ──────────────────────────────────────────────────────── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fade-up 0.3s cubic-bezier(0.22, 1, 0.36, 1) both; }

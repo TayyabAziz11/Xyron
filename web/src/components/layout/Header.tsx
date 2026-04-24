@@ -6,7 +6,7 @@ import { useApprovals } from '@/hooks/useApprovals'
 
 const pageTitles: Record<string, { title: string; subtitle: string }> = {
   '/app/dashboard': { title: 'Dashboard', subtitle: 'Your AI operations at a glance' },
-  '/app/command-center': { title: 'Command Center', subtitle: 'Tell AI Operator what to do' },
+  '/app/command-center': { title: 'Command Center', subtitle: 'Tell Xyron what to do' },
   '/app/approvals': { title: 'Approvals', subtitle: 'Review and act on pending requests' },
   '/app/activity': { title: 'Activity', subtitle: 'Audit trail of all agent actions' },
   '/app/integrations': { title: 'Integrations', subtitle: 'Connected services and their status' },
@@ -19,7 +19,7 @@ export function Header() {
   const { data: approvals } = useApprovals('pending')
   const pendingCount = approvals?.length ?? 0
 
-  const page = pageTitles[pathname] ?? { title: 'AI Operator', subtitle: '' }
+  const page = pageTitles[pathname] ?? { title: 'Xyron', subtitle: '' }
 
   return (
     <header className="flex h-14 items-center justify-between border-b border-surface-border bg-surface-raised px-6">

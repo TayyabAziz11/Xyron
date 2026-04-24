@@ -1,4 +1,4 @@
-// AI Operator — shared TypeScript types (mirrors Pydantic schemas)
+// Xyron — shared TypeScript types (mirrors Pydantic schemas)
 
 export interface ApiResponse<T> {
   success: boolean
@@ -26,7 +26,9 @@ export interface Command {
   agent?: string
   intent?: CommandIntent
   assistant_response?: string
-  draft_id?: string  // present when command produced a reviewable draft
+  draft_id?: string   // present when command produced a reviewable draft
+  action_url?: string // URL for frontend to open (search/navigation results)
+  action_app?: string // desktop app name for frontend to launch
 }
 
 // Drafts
@@ -114,6 +116,52 @@ export interface VoiceTranscriptionResult {
   text: string
   language: string
   note?: string
+}
+
+// System Actions (from tool registry)
+export interface SystemActionEvent {
+  id:         string
+  tool:       string
+  params:     Record<string, unknown>
+  spoken:     string
+  result:     string
+  success:    boolean
+  risk:       'low' | 'medium' | 'high'
+  timestamp:  string
+  action_url?: string
+  action_app?: string
+  action_path?: string
+}
+
+// Multi-step Tasks
+export type TaskStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
+export type TaskStatus     = 'planning' | 'running' | 'completed' | 'failed' | 'cancelled'
+export type RiskLevel2     = 'low' | 'medium' | 'high'
+
+export interface TaskStep {
+  id:           string
+  index:        number
+  description:  string
+  tool:         string
+  params:       Record<string, unknown>
+  status:       TaskStepStatus
+  result?:      string
+  error?:       string
+  started_at?:  string
+  completed_at?: string
+}
+
+export interface Task {
+  id:                    string
+  goal:                  string
+  steps:                 TaskStep[]
+  status:                TaskStatus
+  risk_level:            RiskLevel2
+  confirmation_required: boolean
+  created_at:            string
+  completed_at?:         string
+  result?:               string
+  error?:                string
 }
 
 // Health

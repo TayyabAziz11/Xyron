@@ -1,0 +1,1374 @@
+'use client'
+
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { readAssistantSettings, buildGreeting } from '@/hooks/useAssistantSettings'
+import {
+  type SessionState,
+  type ConvMessage,
+  type HistoryEntry,
+  type SystemAction,
+  VAD,
+  isStopPhrase,
+  checkIdentityResponse,
+  detectSystemAction,
+  stripMarkdown,
+  cleanForSpeech,
+  speakBrowser,
+  getApiBase,
+  AudioQueue,
+  streamAndSpeak,
+} from '@/lib/voice-core'
+// Interrupt monitor has been permanently removed — it caused race conditions.
+// Listening is triggered ONLY by explicit user action (mic click / wake word).
+
+export type { SessionState, ConvMessage }
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const STOP_RESPONSE = "Okay, stopping now. Talk to you later."
+
+// ── State machine ─────────────────────────────────────────────────────────────
+//
+// Canonical flow:
+//   idle → listening → transcribing → processing → speaking → idle → (wait)
+//
+// HARD RULES:
+//   1. 'listening' can ONLY be entered from 'idle' via startListening().
+//   2. 'speaking' NEVER jumps directly to 'listening'.
+//   3. After speaking finishes → idle → STOP. User must tap mic again.
+//   4. 'greeting' ends at 'idle', not 'listening' — no auto-start.
+
+const ALLOWED: Partial<Record<SessionState, SessionState[]>> = {
+  idle:         ['greeting', 'listening', 'stopped'],
+  greeting:     ['idle', 'stopped'],              // greeting → idle, then WAIT
+  listening:    ['transcribing', 'stopped'],
+  transcribing: ['processing', 'idle', 'stopped'],
+  processing:   ['speaking', 'idle', 'stopped'],
+  speaking:     ['idle', 'stopped'],              // speaking → idle → WAIT
+  stopped:      ['idle'],
+}
+
+function _failsafe(intent: string, result: { success?: boolean; spoken?: string } | null, fallback: string): string {
+  if (!result || !result.success) {
+    console.warn('[XYRON] Tool execution failed:', intent, result)
+    return result?.spoken || fallback
+  }
+  return result.spoken || fallback
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
+
+export function useVoiceSession() {
+  const [sessionState,   setSessionState]   = useState<SessionState>('idle')
+  const [sessionActive,  setSessionActive]  = useState(false)
+  const [messages,       setMessages]       = useState<ConvMessage[]>([])
+  const [error,          setError]          = useState<string | null>(null)
+  const [followUp,       setFollowUp]       = useState<string | null>(null)
+  const [offlineMode,    setOfflineMode]    = useState(false)   // true when ollama is source
+
+  // ── Core control refs ──────────────────────────────────────────────────────
+
+  /** True while session is running (startSession called, stopSession not yet called). */
+  const activeRef = useRef(false)
+
+  /**
+   * Single-instance guard for startListening.
+   * Prevents double-tap / concurrent listen cycles.
+   * Released when: speaking audio drains (onEmpty), or on error, or on stop.
+   */
+  const isRunningRef = useRef(false)
+
+  /** State mirror — always up-to-date in closures (avoids stale React state). */
+  const stateRef = useRef<SessionState>('idle')
+
+  /** True while the SSE stream is open. Prevents onEmpty firing before stream ends. */
+  const isStreamingRef = useRef(false)
+
+  // ── Recording + VAD refs ───────────────────────────────────────────────────
+
+  const mediaRecRef    = useRef<MediaRecorder | null>(null)
+  const chunksRef      = useRef<Blob[]>([])
+  const audioCtxRef    = useRef<AudioContext | null>(null)
+  const silenceTimRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const noSpeechTimRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const maxRecTimRef   = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const rafRef         = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // ── Voice confirmation flow ────────────────────────────────────────────────
+  // When a high-risk action (e.g. delete_file) needs user confirmation,
+  // we store the pending action here and intercept the next "yes"/"no".
+  const pendingConfirmRef = useRef<{
+    tool:    string
+    params:  Record<string, unknown>
+    prompt:  string   // the question already spoken to the user
+  } | null>(null)
+
+  // ── Streaming refs ────────────────────────────────────────────────────────
+
+  const taskCtrlRef = useRef<AbortController | null>(null)
+  const queueRef    = useRef<AudioQueue | null>(null)
+
+  // ── Universal context memory (intent + entities + last action) ───────────
+  const lastActionRef = useRef<{ intent: string; action: SystemAction; transcript: string } | null>(null)
+  // ── Folder creation context ───────────────────────────────────────────────
+  const lastCreatedFolderRef = useRef<{ name: string; path: string } | null>(null)
+  const pendingFolderRef = useRef<
+    { stage: 'name'; knownPath?: string } | { stage: 'path'; name: string } | null
+  >(null)
+
+  // ── Session + history ─────────────────────────────────────────────────────
+
+  const sessionIdRef   = useRef<string>('')
+  const historyRef     = useRef<HistoryEntry[]>([])
+  const currentModeRef = useRef<string | null>(null)
+  const mediaSessionRef = useRef<{
+    platform: 'youtube' | 'netflix' | 'spotify' | null
+    isOpen: boolean
+    tabRef: Window | null
+    lastQuery: string | null
+  }>({ platform: null, isOpen: false, tabRef: null, lastQuery: null })
+
+  // ── State transition (validated) ──────────────────────────────────────────
+
+  const transition = useCallback((next: SessionState) => {
+    const prev = stateRef.current
+    if (prev === next) return
+    const allowed = ALLOWED[prev]
+    if (!allowed?.includes(next)) {
+      console.warn(`[VOICE] BLOCKED transition: ${prev} → ${next}`)
+      return
+    }
+    console.log(`[VOICE] state: ${prev} → ${next}`)
+    stateRef.current = next
+    setSessionState(next)
+  }, [])
+
+  /** Emergency reset — bypasses state machine. Only for genuine deadlock recovery. */
+  const forceIdle = useCallback(() => {
+    console.warn('[VOICE] force reset → idle')
+    isRunningRef.current  = false
+    isStreamingRef.current = false
+    stateRef.current = 'idle'
+    setSessionState('idle')
+  }, [])
+
+  // ── Message helpers ───────────────────────────────────────────────────────
+
+  const addMsg = useCallback(
+    (role: ConvMessage['role'], text: string, status: ConvMessage['status'] = 'done'): string => {
+      const id = crypto.randomUUID()
+      setMessages((prev) => {
+        const next = [...prev, { id, role, text, status, timestamp: new Date() }]
+        historyRef.current = next
+          .filter((m) => m.role === 'user' || m.role === 'assistant')
+          .map((m) => ({ role: m.role as 'user' | 'assistant', text: m.text }))
+        return next
+      })
+      return id
+    },
+    [],
+  )
+
+  const updMsg = useCallback((id: string, patch: Partial<ConvMessage>) => {
+    setMessages((prev) => {
+      const next = prev.map((m) => (m.id === id ? { ...m, ...patch } : m))
+      historyRef.current = next
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({ role: m.role as 'user' | 'assistant', text: m.text }))
+      return next
+    })
+  }, [])
+
+  // ── Stop recording + VAD ──────────────────────────────────────────────────
+
+  const stopMedia = useCallback(() => {
+    if (rafRef.current)         { clearInterval(rafRef.current); rafRef.current = null }
+    if (silenceTimRef.current)  { clearTimeout(silenceTimRef.current);  silenceTimRef.current = null }
+    if (noSpeechTimRef.current) { clearTimeout(noSpeechTimRef.current); noSpeechTimRef.current = null }
+    if (maxRecTimRef.current)   { clearTimeout(maxRecTimRef.current);   maxRecTimRef.current = null }
+    const mr = mediaRecRef.current
+    if (mr && mr.state !== 'inactive') {
+      try { mr.stop(); mr.stream?.getTracks().forEach((t) => t.stop()) } catch { /* ok */ }
+    }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null }
+  }, [])
+
+  // ── Abort in-flight stream + audio ────────────────────────────────────────
+
+  const abortTask = useCallback(() => {
+    taskCtrlRef.current?.abort()
+    taskCtrlRef.current = null
+    queueRef.current?.abort()
+    queueRef.current = null
+    isStreamingRef.current = false
+  }, [])
+
+  // ── TTS for fast-paths (greeting, identity, system) ───────────────────────
+
+  const speakResponse = useCallback(async (raw: string): Promise<void> => {
+    const text = stripMarkdown(raw)
+    if (!text) return
+    const API_BASE = getApiBase()
+    const { voice, speed, voiceEnabled, volume } = readAssistantSettings()
+    if (!voiceEnabled) return
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const ctrl    = new AbortController()
+        const timeout = setTimeout(() => ctrl.abort(), 30_000)
+        let resp: Response
+        try {
+          resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, voice, speed }), signal: ctrl.signal,
+          })
+        } finally { clearTimeout(timeout) }
+        if (resp!.ok) {
+          const url = URL.createObjectURL(await resp!.blob())
+          await new Promise<void>((resolve) => {
+            const audio = new Audio(url)
+            audio.volume = volume
+            const done  = () => { URL.revokeObjectURL(url); resolve() }
+            const t = setTimeout(done, (Math.max(6, text.length / 8) / speed) * 1000 + 10_000)
+            audio.onended = () => { clearTimeout(t); done() }
+            audio.onerror = () => { clearTimeout(t); done() }
+            audio.play().catch(() => { clearTimeout(t); done() })
+          })
+          return
+        }
+      } catch { /* retry */ }
+    }
+    await speakBrowser(cleanForSpeech(raw))
+  }, [])
+
+  // ── Main listen function — ref-based so it's always fresh ────────────────
+  //
+  // Triggers: (1) maybeRestartListening after each response, (2) wake word, (3) user tap.
+  // Strict guards prevent any race condition — see _startListening guards below.
+
+  const _startListeningRef = useRef<() => Promise<void>>(async () => {})
+
+  // ── Safe auto-restart (continuous conversation) ───────────────────────────
+  //
+  // THIS IS THE ONLY PLACE WHERE LISTENING RESTARTS AUTOMATICALLY.
+  // Called after every response (GPT audio drain, identity, system action).
+  // Five guards make it impossible to overlap states or race conditions:
+  //   1. state must be 'idle'        — no mid-state restarts
+  //   2. not streaming               — SSE still open? wait
+  //   3. audio queue not playing     — audio still playing? wait
+  //   4. audio queue has no pending  — chunks queued but not yet played? wait
+  //   5. session must be active      — session ended? stop
+
+  const maybeRestartListening = useCallback(() => {
+    const reason =
+      stateRef.current !== 'idle'                   ? `state=${stateRef.current}` :
+      isStreamingRef.current                        ? 'streaming active' :
+      (queueRef.current?.isPlaying ?? false)        ? 'audio playing' :
+      (queueRef.current?.hasPendingAudio ?? false)  ? 'audio pending' :
+      !activeRef.current                            ? 'session inactive' :
+      null
+
+    if (reason) {
+      console.log(`[AUTO LISTEN] blocked (${reason})`)
+      return
+    }
+
+    console.log('[AUTO LISTEN] triggered — restarting listen cycle')
+    _startListeningRef.current()
+  }, [])
+
+  _startListeningRef.current = async function _startListening(): Promise<void> {
+    // ── Guard 1: session must be active ──────────────────────────────────────
+    if (!activeRef.current) {
+      console.log('[VOICE] startListening: blocked — session inactive')
+      return
+    }
+    // ── Guard 2: must be in idle state ────────────────────────────────────────
+    if (stateRef.current !== 'idle') {
+      console.log(`[VOICE] startListening: blocked — state=${stateRef.current} (must be idle)`)
+      return
+    }
+    // ── Guard 3: no concurrent listen cycle ───────────────────────────────────
+    if (isRunningRef.current) {
+      console.log('[VOICE] startListening: blocked — already running')
+      return
+    }
+    // ── Guard 4: no active audio / stream ─────────────────────────────────────
+    if (isStreamingRef.current || queueRef.current?.isPlaying || queueRef.current?.hasPendingAudio) {
+      console.log('[VOICE] startListening: blocked — audio still active')
+      return
+    }
+
+    isRunningRef.current = true
+    const API_BASE = getApiBase()
+    abortTask()
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 1 — LISTEN
+    // ══════════════════════════════════════════════════════════════════════
+
+    const t0 = performance.now()
+    console.log('[MIC START ATTEMPT] state:', stateRef.current, 'isStreaming:', isStreamingRef.current, 'isPlaying:', queueRef.current?.isPlaying ?? false, 'hasPending:', queueRef.current?.hasPendingAudio ?? false)
+
+    transition('listening')
+    chunksRef.current = []
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        navigator.mediaDevices
+          .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 } })
+          .then((stream) => {
+            const rec = new MediaRecorder(stream)
+            rec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data) }
+            rec.onstop = () => { stream.getTracks().forEach((t) => t.stop()); resolve() }
+            rec.start()
+            mediaRecRef.current = rec
+
+            maxRecTimRef.current = setTimeout(() => {
+              if (rec.state !== 'inactive') rec.stop()
+            }, VAD.maxTotalMs)
+
+            // Voice Activity Detection
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const AudioCtxCls = window.AudioContext ?? (window as any).webkitAudioContext
+              if (!AudioCtxCls) return
+              const ctx = new AudioCtxCls() as AudioContext
+              audioCtxRef.current = ctx
+              const analyser = ctx.createAnalyser()
+              analyser.fftSize = 1024
+              ctx.createMediaStreamSource(stream).connect(analyser)
+              const buf = new Uint8Array(analyser.frequencyBinCount)
+              const binWidth = ctx.sampleRate / analyser.fftSize
+              const lo = Math.max(1, Math.round(300 / binWidth))
+              const hi = Math.min(buf.length - 1, Math.round(3400 / binWidth))
+
+              let smoothRms = 0, noiseFloor = 0, calibFrames = 0
+              let threshold: number = VAD.minThreshold, speechCnt = 0
+              type Phase = 'calibrating' | 'waiting' | 'speaking' | 'paused'
+              let phase: Phase = 'calibrating'
+
+              const stopRec = () => {
+                if (rec.state !== 'inactive') rec.stop()
+                ctx.close().catch(() => {})
+              }
+
+              const tick = () => {
+                if (!activeRef.current || rec.state === 'inactive') return
+                analyser.getByteFrequencyData(buf)
+                let ss = 0
+                for (let i = lo; i < hi; i++) ss += buf[i] * buf[i]
+                const raw = Math.sqrt(ss / (hi - lo)) / 128
+                smoothRms = VAD.smoothingAlpha * raw + (1 - VAD.smoothingAlpha) * smoothRms
+
+                switch (phase) {
+                  case 'calibrating':
+                    noiseFloor = (noiseFloor * calibFrames + smoothRms) / (calibFrames + 1)
+                    if (++calibFrames >= VAD.calibrationFrames) {
+                      threshold = Math.max(VAD.minThreshold, Math.min(VAD.maxThreshold, noiseFloor * VAD.thresholdMultiplier))
+                      phase = 'waiting'
+                      noSpeechTimRef.current = setTimeout(stopRec, VAD.noSpeechTimeoutMs)
+                    }
+                    break
+                  case 'waiting':
+                    if (smoothRms > threshold) {
+                      if (++speechCnt >= VAD.speechMinFrames) {
+                        phase = 'speaking'; speechCnt = 0
+                        clearTimeout(noSpeechTimRef.current!); noSpeechTimRef.current = null
+                      }
+                    } else { speechCnt = 0 }
+                    break
+                  case 'speaking': {
+                    const exitLevel = Math.max(VAD.minThreshold * 0.5, noiseFloor * VAD.exitMultiplier)
+                    if (smoothRms < exitLevel) {
+                      phase = 'paused'
+                      silenceTimRef.current = setTimeout(stopRec, VAD.silenceAfterMs)
+                    }
+                    break
+                  }
+                  case 'paused':
+                    if (smoothRms > threshold * VAD.resumeHysteresis) {
+                      phase = 'speaking'
+                      clearTimeout(silenceTimRef.current!); silenceTimRef.current = null
+                    }
+                    break
+                }
+              }
+              rafRef.current = setInterval(tick, VAD.tickIntervalMs)
+            } catch { /* VAD unavailable — fall through to max-duration recording */ }
+          })
+          .catch(reject)
+      })
+    } catch (err) {
+      const denied = err instanceof DOMException && err.name === 'NotAllowedError'
+      setError(denied
+        ? 'Microphone access denied. Click the lock icon and allow microphone.'
+        : 'Could not access microphone.')
+      activeRef.current = false
+      isRunningRef.current = false
+      transition('stopped')
+      setTimeout(forceIdle, 2500)
+      return
+    }
+
+    // Clean up VAD
+    if (rafRef.current)         { clearInterval(rafRef.current); rafRef.current = null }
+    if (silenceTimRef.current)  { clearTimeout(silenceTimRef.current);  silenceTimRef.current = null }
+    if (noSpeechTimRef.current) { clearTimeout(noSpeechTimRef.current); noSpeechTimRef.current = null }
+    if (maxRecTimRef.current)   { clearTimeout(maxRecTimRef.current);   maxRecTimRef.current = null }
+    if (!activeRef.current) { isRunningRef.current = false; return }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 2 — TRANSCRIBE
+    // ══════════════════════════════════════════════════════════════════════
+
+    transition('transcribing')
+
+    // No audio at all → return to idle silently
+    if (!chunksRef.current.length) {
+      transition('idle')
+      isRunningRef.current = false
+      return
+    }
+
+    const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+
+    // Blob < 6 KB = breath / noise → return to idle silently
+    if (blob.size < 6_000) {
+      transition('idle')
+      isRunningRef.current = false
+      return
+    }
+
+    const t1 = performance.now()
+    console.log(`[PERF] t1-t0 (speech end → transcribe request): ${(t1 - t0).toFixed(0)}ms`)
+
+    let transcript = ''
+    try {
+      const form = new FormData()
+      form.append('audio', blob, 'recording.webm')
+      const r = await fetch(`${API_BASE}/api/v1/voice/transcribe`, { method: 'POST', body: form })
+      transcript = ((await r.json())?.data?.text ?? '').trim()
+    } catch { /* silent — fall through to idle */ }
+
+    const t1b = performance.now()
+    console.log(`[PERF] transcribe RTT: ${(t1b - t1).toFixed(0)}ms — result: ${transcript ? JSON.stringify(transcript.slice(0, 60)) : '(empty)'}`)
+
+    if (!transcript) {
+      transition('idle')
+      isRunningRef.current = false
+      return
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 3 — ROUTE
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── Voice confirmation intercept ──────────────────────────────────────
+    // If a high-risk action is waiting for yes/no, intercept before all other routing.
+    if (pendingConfirmRef.current) {
+      const pending = pendingConfirmRef.current
+      pendingConfirmRef.current = null   // clear immediately — one-shot
+      const lower = transcript.toLowerCase().trim().replace(/[.!?,;:]+$/, '')
+      const isYes = /^(yes|yeah|yep|confirm|do it|go ahead|sure|ok|okay|correct|affirmative)$/.test(lower)
+      const isNo  = /^(no|nope|cancel|stop|abort|never mind|nevermind|don't)$/.test(lower)
+      addMsg('user', transcript)
+      if (isYes) {
+        // Execute the confirmed action via backend tool endpoint
+        const aId = addMsg('assistant', 'Okay, doing it now…')
+        transition('processing')
+        try {
+          const resp = await fetch(`${API_BASE}/api/v1/system/execute-tool`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tool: pending.tool, params: { ...pending.params, confirmed: true } }),
+          })
+          const d = await resp.json().catch(() => null)
+          const spoken = d?.spoken || d?.message || 'Done.'
+          updMsg(aId, { text: spoken })
+          transition('speaking')
+          await speakResponse(spoken)
+        } catch {
+          const err = 'Sorry, I had trouble completing that action.'
+          updMsg(aId, { text: err })
+          transition('speaking')
+          await speakResponse(err)
+        }
+      } else if (isNo) {
+        const cancelled = 'Cancelled — no changes made.'
+        addMsg('assistant', cancelled)
+        transition('speaking')
+        await speakResponse(cancelled)
+      } else {
+        // Ambiguous — re-ask
+        const reAsk = `I didn't catch that. ${pending.prompt}`
+        pendingConfirmRef.current = pending   // restore
+        addMsg('assistant', reAsk)
+        transition('speaking')
+        await speakResponse(reAsk)
+      }
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Pending folder multi-turn ─────────────────────────────────────────
+    if (pendingFolderRef.current) {
+      const pf = pendingFolderRef.current
+      addMsg('user', transcript)
+      const rawInput = transcript.replace(/[.!?,;:]+$/, '').trim()
+
+      if (pf.stage === 'name') {
+        const name = rawInput
+          .replace(/^(?:name\s+it|call\s+it|it(?:'?s|\s+is)?|the\s+name\s+is?|name\s+is?)\s+/i, '')
+          .trim()
+        const targetPath = pf.knownPath || 'Desktop'
+        pendingFolderRef.current = null
+        const holdMsg = `Creating the "${name}" folder now.`
+        const aId = addMsg('assistant', holdMsg)
+        transition('speaking')
+        const [, result] = await Promise.all([
+          speakResponse(holdMsg),
+          fetch(`${API_BASE}/api/v1/system/create-folder`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, path: targetPath }),
+          }).then(r => r.json()).catch(() => null),
+        ])
+        transition('processing')
+        let spoken: string
+        if (result?.success) {
+          lastCreatedFolderRef.current = { name, path: result.path || targetPath }
+          spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${targetPath}. Say "open it" to open it.`)
+        } else {
+          spoken = _failsafe('create_folder', result, `Couldn't create the folder. Please try again.`)
+        }
+        updMsg(aId, { text: spoken })
+        transition('speaking')
+        await speakResponse(spoken)
+        transition('idle')
+        isRunningRef.current = false
+        maybeRestartListening()
+        return
+      }
+
+      if (pf.stage === 'path') {
+        const { name } = pf
+        const pathStr = rawInput.replace(/^(?:in|on|inside|at)\s+(?:the\s+)?/i, '').trim()
+        pendingFolderRef.current = null
+        const holdMsg = `Creating the "${name}" folder now.`
+        const aId = addMsg('assistant', holdMsg)
+        transition('speaking')
+        const [, result] = await Promise.all([
+          speakResponse(holdMsg),
+          fetch(`${API_BASE}/api/v1/system/create-folder`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, path: pathStr }),
+          }).then(r => r.json()).catch(() => null),
+        ])
+        transition('processing')
+        let spoken: string
+        if (result?.success) {
+          lastCreatedFolderRef.current = { name, path: result.path || pathStr }
+          spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${pathStr}. Say "open it" to open it.`)
+        } else {
+          spoken = _failsafe('create_folder', result, `Couldn't create the folder. Please try again.`)
+        }
+        updMsg(aId, { text: spoken })
+        transition('speaking')
+        await speakResponse(spoken)
+        transition('idle')
+        isRunningRef.current = false
+        maybeRestartListening()
+        return
+      }
+    }
+
+    // ── Stop command ──────────────────────────────────────────────────────
+    if (isStopPhrase(transcript)) {
+      console.log('[VOICE] route: stop command')
+      activeRef.current = false
+      abortTask()
+      stopMedia()
+      addMsg('user', transcript)
+      addMsg('assistant', STOP_RESPONSE)
+      transition('processing')
+      transition('speaking')
+      await speakResponse(STOP_RESPONSE)
+      transition('stopped')
+      isRunningRef.current = false
+      setSessionActive(false)
+      setTimeout(forceIdle, 1500)
+      return
+    }
+
+    // ── Identity fast-path ────────────────────────────────────────────────
+    const { mode: _mode } = readAssistantSettings()
+    const identityReply = checkIdentityResponse(transcript, _mode)
+    if (identityReply) {
+      console.log('[VOICE] route: identity')
+      addMsg('user', transcript)
+      addMsg('assistant', identityReply)
+      transition('processing')
+      transition('speaking')
+      await speakResponse(identityReply)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()   // ← safe auto-restart after speaking
+      return
+    }
+
+    // ── System action fast-path ───────────────────────────────────────────
+    const sysAction = detectSystemAction(transcript)
+    if (sysAction) {
+      console.log('[VOICE] route: system-action', sysAction)
+      transition('processing')
+
+      // "Do it again" — re-run the last stored action
+      if (sysAction.intent === 'repeat_last') {
+        if (lastActionRef.current) {
+          const { action, transcript: prevT } = lastActionRef.current
+          await _handleSystemAction(action, prevT, API_BASE)
+        } else {
+          addMsg('user', transcript)
+          const msg = "I don't have a previous action to repeat."
+          addMsg('assistant', msg)
+          transition('speaking')
+          await speakResponse(msg)
+          transition('idle')
+          isRunningRef.current = false
+          maybeRestartListening()
+        }
+        return
+      }
+
+      // Store this action as last for future "repeat" / "do it again"
+      if (sysAction.intent) lastActionRef.current = { intent: sysAction.intent, action: sysAction, transcript }
+
+      await _handleSystemAction(sysAction, transcript, API_BASE)
+      // _handleSystemAction ends with: transition('idle') + isRunningRef.current = false
+      return
+    }
+
+    const t2 = performance.now()
+    console.log(`[PERF] t2-t0 (speech end → GPT request): ${(t2 - t0).toFixed(0)}ms`)
+    console.log('[VOICE] route: GPT stream')
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 4 — STREAMING AI RESPONSE
+    // ══════════════════════════════════════════════════════════════════════
+
+    addMsg('user', transcript)
+    transition('processing')
+    const aId = addMsg('assistant', '', 'processing')
+
+    const ctrl = new AbortController()
+    taskCtrlRef.current = ctrl
+
+    const { voice, speed, volume, mode: personalityMode } = readAssistantSettings()
+    const history = historyRef.current.slice(-20)
+    let chunkText = ''
+    isStreamingRef.current = true
+
+    const queue = new AudioQueue({
+      volume,
+      onEmpty: () => {
+        // All audio drained — release the run lock and transition to idle.
+        // maybeRestartListening() immediately re-checks all guards and begins
+        // the next listen cycle if the session is still active and truly quiet.
+        isStreamingRef.current = false
+        isRunningRef.current   = false
+        const s = stateRef.current
+        console.log(`[VOICE] queue empty → idle (was: ${s})`)
+        if (!ctrl.signal.aborted && (s === 'speaking' || s === 'processing')) {
+          transition('idle')
+          maybeRestartListening()   // ← ONLY auto-restart path
+        }
+      },
+    })
+    queueRef.current = queue
+
+    try {
+      await streamAndSpeak(
+        transcript, history, queue, ctrl.signal, voice, speed, API_BASE,
+        {
+          onChunk: (text, _idx) => {
+            if (!chunkText) {
+              const t3 = performance.now()
+              console.log(`[PERF] t3-t0 (speech end → first TTS chunk): ${(t3 - t0).toFixed(0)}ms  ← goal <500ms`)
+              console.log(`[PERF] t3-t2 (GPT request → first chunk): ${(t3 - t2).toFixed(0)}ms`)
+              transition('speaking')
+              console.log('[VOICE] speaking: first chunk')
+            }
+            chunkText += (chunkText ? ' ' : '') + text
+            updMsg(aId, { text: chunkText, status: 'processing' })
+          },
+
+          onDone: (fullText, source) => {
+            console.log('[VOICE] stream: done')
+            isStreamingRef.current = false
+            updMsg(aId, { text: fullText || chunkText, status: 'done' })
+            if (source === 'ollama') setOfflineMode(true)
+            else setOfflineMode(false)
+            // Do NOT release isRunningRef here — wait for queue.onEmpty (audio must finish first)
+          },
+
+          onError: (msg) => {
+            if (ctrl.signal.aborted) return
+            console.warn('[VOICE] stream: error', msg)
+            isStreamingRef.current = false
+            isRunningRef.current   = false
+            updMsg(aId, { text: msg || 'Sorry, something went wrong.', status: 'error' })
+            queue.abort()
+            forceIdle()
+            // NO restart — user must tap mic
+          },
+
+          onAction: (actionUrl, actionApp, actionPath) => {
+            if (actionUrl && typeof window !== 'undefined') window.open(actionUrl, '_blank', 'noopener')
+            if (actionApp) {
+              fetch(`${API_BASE}/api/v1/system/open-app`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ app: actionApp }),
+              }).catch(() => {})
+            }
+            if (actionPath) {
+              fetch(`${API_BASE}/api/v1/system/open-directory`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: actionPath }),
+              }).catch(() => {})
+            }
+          },
+
+          onConfirmRequired: ({ tool, params, prompt }) => {
+            // Store the pending action — the NEXT voice turn will intercept it
+            pendingConfirmRef.current = { tool, params, prompt }
+            // The spoken confirmation prompt is already in the GPT stream text
+          },
+
+          onFollowUp: (suggestion) => {
+            setFollowUp(suggestion)
+            // Auto-dismiss after 8s
+            setTimeout(() => setFollowUp(null), 8000)
+          },
+
+          onProfileSwitch: (profile, voice) => {
+            // Persist the new voice into assistant settings
+            try {
+              const raw  = localStorage.getItem('ai-operator:assistant-settings')
+              const prev = raw ? JSON.parse(raw) : {}
+              const next = { ...prev, mode: profile as any, voice: voice as any }
+              localStorage.setItem('ai-operator:assistant-settings', JSON.stringify(next))
+            } catch { /* ok */ }
+            if (profile === 'chill') {
+              setFollowUp('Chill mode on — ask me what to watch, Netflix picks or YouTube vibes?')
+              setTimeout(() => setFollowUp(null), 12000)
+            }
+          },
+
+          onModeChange: (mode) => {
+            currentModeRef.current = mode
+            const modeMessages: Record<string, string> = {
+              morning:       'Morning routine started — weather, calendar, and music opened.',
+              jarvis:        'Welcome home — system stats ready.',
+              entertainment: 'Entertainment mode — opening content for you.',
+            }
+            const hint = modeMessages[mode]
+            if (hint) {
+              setFollowUp(hint)
+              setTimeout(() => setFollowUp(null), 8000)
+            }
+          },
+
+          onSystemConfirm: (action) => {
+            const prompts: Record<string, string> = {
+              shutdown: "Say 'yes' to confirm shutdown, or 'cancel' to abort.",
+              restart:  "Say 'yes' to confirm restart, or 'cancel' to abort.",
+            }
+            const prompt = prompts[action] ?? `Confirm ${action}?`
+            setFollowUp(prompt)
+            setTimeout(() => setFollowUp(null), 15000)
+          },
+        },
+        sessionIdRef.current,
+        personalityMode,
+      )
+    } catch (e) {
+      if (!ctrl.signal.aborted) {
+        console.error('[VOICE] stream: exception', e)
+        isStreamingRef.current = false
+        isRunningRef.current   = false
+        updMsg(aId, { text: 'Sorry, my response was interrupted. Please ask again.', status: 'error' })
+        queue.abort()
+        forceIdle()
+        // NO restart
+      }
+    }
+
+    // SSE stream has ended. Audio queue may still be draining.
+    // onEmpty handles the final → idle transition.
+    // isRunningRef is released in onEmpty (not here).
+  }
+
+  // ── Inline system action handler ──────────────────────────────────────────
+  //
+  // Defined as a closure inside the hook body so it has access to all callbacks.
+  // Ends with: transition('idle') + isRunningRef.current = false — always.
+  // NO auto-restart.
+
+  async function _handleSystemAction(
+    sysAction: SystemAction, transcript: string, API_BASE: string,
+  ) {
+    // ── "Remember that X" ─────────────────────────────────────────────────
+    if (sysAction.rememberFact) {
+      addMsg('user', transcript)
+      const aId = addMsg('assistant', sysAction.response)
+      // Store in backend (fire-and-forget OK — confirmaton is spoken regardless)
+      fetch(`${API_BASE}/api/v1/voice/remember`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fact: sysAction.rememberFact }),
+      }).catch(() => {})
+      updMsg(aId, { text: sysAction.response })
+      transition('speaking')
+      await speakResponse(sysAction.response)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── "What do you remember?" ───────────────────────────────────────────
+    if (sysAction.queryMemory) {
+      addMsg('user', transcript)
+      const aId = addMsg('assistant', sysAction.response)
+      transition('speaking')
+      const holdPromise = speakResponse(sysAction.response)
+      const memPromise  = fetch(`${API_BASE}/api/v1/voice/memories`)
+        .then(r => r.json()).catch(() => null)
+      const [, memData] = await Promise.all([holdPromise, memPromise])
+      const spoken = (memData?.spoken as string | undefined) || "I don't have anything stored about you yet."
+      transition('processing')
+      updMsg(aId, { text: spoken })
+      transition('speaking')
+      await speakResponse(spoken)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── "Time to work" wake flow ──────────────────────────────────────────
+    if (sysAction.workMode) {
+      addMsg('user', transcript)
+      const aId = addMsg('assistant', sysAction.response)
+      fetch(`${API_BASE}/api/v1/system/open-app`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app: 'vscode' }),
+      }).then(r => r.json()).then(res => console.log('[TOOL] work_mode vscode:', res)).catch(() => {})
+      if (typeof window !== 'undefined')
+        window.open('https://github.com/TayyabAziz11', '_blank', 'noopener')
+      updMsg(aId, { text: sysAction.response })
+      transition('speaking')
+      await speakResponse(sysAction.response)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Chill mode ────────────────────────────────────────────────────────
+    if (sysAction.chillMode) {
+      addMsg('user', transcript)
+      const aId = addMsg('assistant', sysAction.response)
+      try {
+        const raw  = localStorage.getItem('ai-operator:assistant-settings')
+        const prev = raw ? JSON.parse(raw) : {}
+        localStorage.setItem('ai-operator:assistant-settings', JSON.stringify({ ...prev, mode: 'chill', voice: 'shimmer' }))
+      } catch { /* ok */ }
+      currentModeRef.current = 'chill'
+      if (typeof window !== 'undefined') {
+        // Open YouTube (tracked — "play X" commands reuse this tab)
+        if (!mediaSessionRef.current.isOpen || mediaSessionRef.current.platform !== 'youtube') {
+          const tab = window.open('https://www.youtube.com', '_blank')
+          mediaSessionRef.current = { platform: 'youtube', isOpen: true, tabRef: tab, lastQuery: null }
+        }
+        // Always open Netflix alongside YouTube
+        window.open('https://www.netflix.com', '_blank', 'noopener')
+      }
+      setFollowUp('YouTube & Netflix open — say "play trending music", "play lo-fi", or ask for Netflix recommendations.')
+      setTimeout(() => setFollowUp(null), 15000)
+      updMsg(aId, { text: sysAction.response })
+      transition('speaking')
+      await speakResponse(sysAction.response)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Folder creation ───────────────────────────────────────────────────
+    if (sysAction.createFolder != null) {
+      const { name, path, subfolders } = sysAction.createFolder as { name?: string; path?: string; subfolders?: string[] }
+
+      const _createWithSubs = async (folderName: string, folderPath: string): Promise<{ spoken: string; createdPath: string }> => {
+        const result = await fetch(`${API_BASE}/api/v1/system/create-folder`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: folderName, path: folderPath }),
+        }).then(r => r.json()).catch(() => null)
+
+        if (!result?.success) {
+          return { spoken: `Couldn't create the folder. Please try again.`, createdPath: '' }
+        }
+
+        const createdPath = result.path || folderPath
+        lastCreatedFolderRef.current = { name: folderName, path: createdPath }
+
+        if (subfolders && subfolders.length > 0) {
+          const subResult = await fetch(`${API_BASE}/api/v1/system/create-subfolders`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ parent: createdPath, names: subfolders }),
+          }).then(r => r.json()).catch(() => null)
+          const subNote = subResult?.success
+            ? ` with subfolders ${subfolders.map(s => `"${s}"`).join(', ')}`
+            : ''
+          return { spoken: `Done! Created "${folderName}"${subNote}. Say "open it" to open it.`, createdPath }
+        }
+        return { spoken: _failsafe('create_folder', result, `Done! I created the "${folderName}" folder. Say "open it" to open it.`), createdPath }
+      }
+
+      addMsg('user', transcript)
+      if (name && path) {
+        const aId = addMsg('assistant', sysAction.response)
+        transition('speaking')
+        const [, { spoken }] = await Promise.all([
+          speakResponse(sysAction.response),
+          _createWithSubs(name, path),
+        ])
+        transition('processing')
+        updMsg(aId, { text: spoken })
+        transition('speaking')
+        await speakResponse(spoken)
+      } else if (name) {
+        // Name given — default to Desktop
+        pendingFolderRef.current = null
+        const aId = addMsg('assistant', sysAction.response)
+        transition('speaking')
+        const [, { spoken }] = await Promise.all([
+          speakResponse(sysAction.response),
+          _createWithSubs(name, 'Desktop'),
+        ])
+        transition('processing')
+        updMsg(aId, { text: spoken })
+        transition('speaking')
+        await speakResponse(spoken)
+      } else {
+        // Need name — ask
+        pendingFolderRef.current = { stage: 'name', knownPath: path || undefined }
+        addMsg('assistant', sysAction.response)
+        transition('speaking')
+        await speakResponse(sysAction.response)
+      }
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Open last folder ──────────────────────────────────────────────────
+    if (sysAction.openLastFolder) {
+      addMsg('user', transcript)
+      if (lastCreatedFolderRef.current) {
+        const { name, path } = lastCreatedFolderRef.current
+        fetch(`${API_BASE}/api/v1/system/open-directory`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path }),
+        }).catch(() => {})
+        const spoken = `Opening it now — the "${name}" folder.`
+        addMsg('assistant', spoken)
+        transition('speaking')
+        await speakResponse(spoken)
+      } else {
+        const spoken = "I don't have a recently created folder on record. Try saying 'create folder' first."
+        addMsg('assistant', spoken)
+        transition('speaking')
+        await speakResponse(spoken)
+      }
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Fire app / directory launches immediately ─────────────────────────
+    // Capture the launch result so we can give real spoken feedback if it
+    // fails instead of blindly saying "Done" regardless.
+    let appLaunchPromise: Promise<{ success: boolean; message?: string } | null> | null = null
+    if (sysAction.app) {
+      appLaunchPromise = fetch(`${API_BASE}/api/v1/system/open-app`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app: sysAction.app }),
+      }).then(r => r.json()).catch(() => null)
+    }
+    if (sysAction.path) {
+      // Directory opens are best-effort — no spoken failure needed
+      fetch(`${API_BASE}/api/v1/system/open-directory`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: sysAction.path }),
+      }).catch(() => {})
+    }
+
+    addMsg('user', transcript)
+    const aId = addMsg('assistant', sysAction.response)
+
+    const _finish = async (spoken: string) => {
+      // If an app launch was attempted, wait for the result and adapt the
+      // spoken response — "I couldn't open X" beats a confident lie.
+      let finalSpoken = spoken
+      if (appLaunchPromise) {
+        try {
+          const launchResult = await appLaunchPromise
+          if (launchResult && !launchResult.success) {
+            const appName = sysAction.app ?? 'that app'
+            finalSpoken = `I couldn't open ${appName}. ${launchResult.message ?? 'It may not be installed.'}`
+          }
+        } catch { /* keep original spoken */ }
+      }
+      updMsg(aId, { text: finalSpoken })
+      transition('speaking')
+      await speakResponse(finalSpoken)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+    }
+
+    // Plays the holding phrase in the user's selected TTS voice while the data
+    // fetch runs in parallel. When both are done we have data ready to speak.
+    const _holdAndFetch = async <T>(fetchPromise: Promise<T>): Promise<T> => {
+      transition('speaking')
+      const [, result] = await Promise.all([
+        speakResponse(sysAction.response),
+        fetchPromise,
+      ])
+      transition('processing')
+      return result
+    }
+
+    if (sysAction.newsQuery) {
+      const newsUrl = `https://news.google.com/search?q=${encodeURIComponent(sysAction.newsQuery)}&hl=en`
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/news?q=${encodeURIComponent(sysAction.newsQuery)}&limit=5&topic=${sysAction.newsQueryTopic ?? false}`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.success && d.spoken ? d.spoken : 'I had trouble fetching the news. Check Google News in your browser.'
+      if (typeof window !== 'undefined') window.open(newsUrl, '_blank', 'noopener')
+      await _finish(spoken)
+      return
+    }
+
+    if (sysAction.priceQuery) {
+      const gUrl = `https://google.com/search?q=${encodeURIComponent(sysAction.priceQuery + ' price today')}`
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/price?q=${encodeURIComponent(sysAction.priceQuery)}`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.success && d.spoken ? d.spoken : `I couldn't fetch the live price for ${sysAction.priceQuery} right now.`
+      if (typeof window !== 'undefined') window.open(gUrl, '_blank', 'noopener')
+      await _finish(spoken)
+      return
+    }
+
+    if (sysAction.youtubeQuery) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/youtube-play`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: sysAction.youtubeQuery }),
+      }).then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      let videoUrl = `https://youtube.com/search?q=${encodeURIComponent(sysAction.youtubeQuery)}`
+      let msg = 'Here you go!'
+      if (d?.url) {
+        videoUrl = d.url
+        if (d.title) {
+          const picks = [`Found it — ${d.title}.`, `Here it is, ${d.title}.`, `Playing ${d.title} now.`, `Got it! ${d.title}, coming right up.`]
+          msg = picks[Math.floor(Math.random() * picks.length)]
+        }
+      }
+      if (typeof window !== 'undefined') {
+        const ms = mediaSessionRef.current
+        const tabAlive = ms.tabRef != null && !ms.tabRef.closed
+        if (ms.platform === 'youtube' && ms.isOpen && tabAlive) {
+          // Reuse existing YouTube tab — navigate in place, no new tab
+          ms.tabRef!.location.href = videoUrl
+          ms.tabRef!.focus()
+        } else {
+          const tab = window.open(videoUrl, '_blank')
+          mediaSessionRef.current = { platform: 'youtube', isOpen: true, tabRef: tab, lastQuery: sysAction.youtubeQuery }
+        }
+        mediaSessionRef.current.lastQuery = sysAction.youtubeQuery
+      }
+      await _finish(msg)
+      return
+    }
+
+    if (sysAction.getSystemInfo) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/system-info`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.message || 'I had trouble reading your system information right now.'
+      await _finish(spoken)
+      return
+    }
+
+    if (sysAction.url && typeof window !== 'undefined') {
+      const tab = window.open(sysAction.url, '_blank')
+      // Track media platform opens for session continuity
+      if (/youtube\.com/i.test(sysAction.url))
+        mediaSessionRef.current = { platform: 'youtube', isOpen: true, tabRef: tab, lastQuery: null }
+      else if (/netflix\.com/i.test(sysAction.url))
+        mediaSessionRef.current = { platform: 'netflix', isOpen: true, tabRef: tab, lastQuery: null }
+      else if (/spotify\.com/i.test(sysAction.url))
+        mediaSessionRef.current = { platform: 'spotify', isOpen: true, tabRef: tab, lastQuery: null }
+    }
+
+    // ── Wikipedia quick-facts ─────────────────────────────────────────────
+    if (sysAction.wikiTopic) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/wiki?topic=${encodeURIComponent(sysAction.wikiTopic)}`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.spoken || `I couldn't find anything on Wikipedia for ${sysAction.wikiTopic}.`
+      await _finish(spoken)
+      return
+    }
+
+    // ── Clipboard read ────────────────────────────────────────────────────
+    if (sysAction.readClipboard) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/clipboard`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const text = d?.data?.text || d?.text || ''
+      const spoken = text ? `Your clipboard has: ${text.slice(0, 200)}` : "Your clipboard appears to be empty."
+      await _finish(spoken)
+      return
+    }
+
+    // ── Clipboard write ───────────────────────────────────────────────────
+    if (sysAction.writeClipboard) {
+      fetch(`${API_BASE}/api/v1/system/clipboard`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: sysAction.writeClipboard }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+
+    // ── Screen reading (vision) ───────────────────────────────────────────
+    if (sysAction.readScreen) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/screen-read`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: transcript }),
+      }).then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.spoken || d?.message || "I had trouble reading your screen."
+      await _finish(spoken)
+      return
+    }
+
+    // ── Typing automation ─────────────────────────────────────────────────
+    if (sysAction.typeText) {
+      fetch(`${API_BASE}/api/v1/system/type-text`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: sysAction.typeText }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+
+    // ── Window control ────────────────────────────────────────────────────
+    if (sysAction.winMinimize) {
+      fetch(`${API_BASE}/api/v1/system/window`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'minimize' }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+    if (sysAction.winMaximize) {
+      fetch(`${API_BASE}/api/v1/system/window`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'maximize' }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+    if (sysAction.winClose) {
+      fetch(`${API_BASE}/api/v1/system/window`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'close' }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+    if (sysAction.winSwitch) {
+      fetch(`${API_BASE}/api/v1/system/window`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'switch', title: sysAction.winSwitch }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+
+    // ── Reminder creation ─────────────────────────────────────────────────
+    if (sysAction.createReminder) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/reminders`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: sysAction.createReminder }),
+      }).then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.spoken || "Got it — I'll remind you."
+      await _finish(spoken)
+      return
+    }
+
+    // ── Gmail read ────────────────────────────────────────────────────────
+    if (sysAction.readGmail) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/gmail/inbox`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.spoken || d?.message || "I had trouble reading your inbox. Make sure Gmail is connected."
+      await _finish(spoken)
+      return
+    }
+
+    // ── Calendar read ─────────────────────────────────────────────────────
+    if (sysAction.readCalendar) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/system/calendar/events`)
+        .then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.spoken || d?.message || "I couldn't read your calendar. Make sure Google Calendar is connected."
+      await _finish(spoken)
+      return
+    }
+
+    // ── Hotkey ────────────────────────────────────────────────────────────
+    if (sysAction.desktopHotkey) {
+      fetch(`${API_BASE}/api/v1/automation/hotkey`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keys: sysAction.desktopHotkey }),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+
+    // ── Scroll ────────────────────────────────────────────────────────────
+    if (sysAction.desktopScroll) {
+      fetch(`${API_BASE}/api/v1/automation/scroll`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sysAction.desktopScroll),
+      }).catch(() => {})
+      await _finish(sysAction.response)
+      return
+    }
+
+    // ── Workflow trigger ──────────────────────────────────────────────────
+    if (sysAction.runWorkflow) {
+      const dataFetch = fetch(`${API_BASE}/api/v1/automation/workflow`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trigger: sysAction.runWorkflow }),
+      }).then(r => r.json()).catch(() => null)
+      const d = await _holdAndFetch(dataFetch)
+      const spoken = d?.spoken || d?.message || 'Done!'
+      await _finish(spoken)
+      return
+    }
+
+    await _finish(sysAction.response)
+  }
+
+  // ── Public: start listening (called by user tap / wake word) ─────────────
+
+  const startListening = useCallback(() => {
+    _startListeningRef.current()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ── Public: start session (greet, then wait for mic tap) ─────────────────
+
+  const startSession = useCallback(async () => {
+    if (stateRef.current !== 'idle') return
+    setError(null)
+    setMessages([])
+    historyRef.current     = []
+    sessionIdRef.current   = crypto.randomUUID()
+    activeRef.current      = true
+    isRunningRef.current   = false
+    isStreamingRef.current = false
+    setSessionActive(true)
+
+    transition('greeting')
+    const { mode } = readAssistantSettings()
+    const GREETING = buildGreeting(mode)
+    addMsg('assistant', GREETING)
+
+    try {
+      await Promise.race([
+        speakResponse(GREETING),
+        new Promise<void>((r) => setTimeout(r, 12_000)),
+      ])
+    } catch { /* ok */ }
+
+    if (!activeRef.current) return  // stopped during greeting
+    transition('idle')
+    // Short cooldown so the mic doesn't pick up the tail of the greeting audio
+    await new Promise<void>((r) => setTimeout(r, 450))
+    console.log('[VOICE] greeting done — auto-starting listen')
+    maybeRestartListening()       // ← kick off first listen cycle automatically
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionState, addMsg, speakResponse, transition, maybeRestartListening])
+
+  // ── Public: stop session ──────────────────────────────────────────────────
+
+  const stopSession = useCallback(() => {
+    console.log('[VOICE] session stopped by user')
+    activeRef.current      = false
+    isStreamingRef.current = false
+    isRunningRef.current   = false
+    sessionIdRef.current   = ''
+    abortTask()
+    stopMedia()
+    if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
+    stateRef.current = 'idle'
+    setSessionState('idle')
+    setSessionActive(false)
+    setMessages([])
+    historyRef.current = []
+  }, [abortTask, stopMedia])
+
+  const clearMessages = useCallback(() => {
+    setMessages([])
+    historyRef.current = []
+  }, [])
+
+  // ── Cleanup on unmount ────────────────────────────────────────────────────
+
+  useEffect(() => {
+    return () => {
+      activeRef.current = false
+      abortTask()
+      stopMedia()
+      if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  return {
+    state:          sessionState,
+    messages,
+    error,
+    startSession,
+    stopSession,
+    startListening,  // trigger one listen cycle (mic tap / wake word)
+    clearMessages,
+    isActive:        sessionActive,   // true = session running (even while idle between taps)
+    isListening:     sessionState === 'listening',
+    followUp,
+    dismissFollowUp: () => setFollowUp(null),
+    offlineMode,
+  }
+}

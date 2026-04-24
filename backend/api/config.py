@@ -31,6 +31,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        env_ignore_empty=True,        # empty env vars don't override .env values
     )
 
     # Server
@@ -38,10 +39,13 @@ class Settings(BaseSettings):
     api_port: int = 8000
     debug: bool = True
 
-    # CORS
+    # CORS — Next.js web dashboard + Electron desktop app dev server
     cors_origins: List[str] = [
         "http://localhost:3000",
         "http://localhost:3001",
+        "http://localhost:5173",  # electron-vite dev renderer
+        "http://localhost:4173",  # electron-vite preview
+        "http://localhost:5174",  # fallback if 5173 is taken
     ]
 
     # Paths (auto-detected, can be overridden via env)

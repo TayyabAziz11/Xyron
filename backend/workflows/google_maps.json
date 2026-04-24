@@ -1,0 +1,18 @@
+{
+  "name": "google_maps",
+  "display_name": "Google Maps",
+  "triggers": [
+    "directions to {location}",
+    "navigate to {location}",
+    "how do i get to {location}",
+    "open google maps for {location}",
+    "find {location} on maps",
+    "show me {location} on the map",
+    "take me to {location}"
+  ],
+  "completion_message": "Showing directions on Google Maps.",
+  "steps": [
+    { "action": "browser.goto", "url": "https://maps.google.com/maps?q={location}", "delay": 2.5 },
+    { "action": "browser.wait", "selector": "div#scene", "timeout": 10000, "delay": 0.5 }
+  ]
+}

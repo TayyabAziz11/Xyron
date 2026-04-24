@@ -1,5 +1,5 @@
 """
-AI Operator — FastAPI application entry point.
+Xyron — FastAPI application entry point.
 
 Mounts all routers under /api/v1 with CORS configured for the web dashboard.
 Agent registry is initialized at startup.
@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, drafts
+from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,9 @@ def _init_agent_registry() -> None:
 
 
 app = FastAPI(
-    title="AI Operator API",
+    title="Xyron API",
     description=(
-        "Backend API for the AI Operator dashboard — "
+        "Backend API for the Xyron dashboard — "
         "command intake, approvals, activity, and integrations."
     ),
     version="1.0.0",
@@ -47,6 +47,18 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup() -> None:
     _init_agent_registry()
+    # Start background services
+    try:
+        from .config import settings as _s
+        from .services.screen_context_service import screen_context_service
+        from .services.proactive_service import proactive_service
+        from .tools import browser_tools  # noqa: F401 — registers browser tools
+        if _s.openai_api_key and _s.openai_api_key.startswith("sk-"):
+            screen_context_service.start(_s.openai_api_key)
+            proactive_service.start(_s.openai_api_key)
+    except Exception as _exc:
+        import logging
+        logging.getLogger(__name__).warning("Background service startup failed: %s", _exc)
 
 
 # CORS — allow the Next.js dashboard
@@ -68,3 +80,12 @@ app.include_router(workflows.router)
 app.include_router(events.router)
 app.include_router(voice.router)
 app.include_router(drafts.router)
+app.include_router(system.router)
+app.include_router(tasks.router)
+app.include_router(reminders.router)
+app.include_router(history.router)
+app.include_router(macros.router)
+app.include_router(notes.router)
+app.include_router(meeting.router)
+app.include_router(proactive.router)
+app.include_router(automation.router, prefix="/api/v1/automation", tags=["automation"])

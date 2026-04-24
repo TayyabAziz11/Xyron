@@ -1,0 +1,21 @@
+{
+  "name": "youtube_search",
+  "display_name": "YouTube Search",
+  "triggers": [
+    "play {query} on youtube",
+    "open youtube and play {query}",
+    "search {query} on youtube",
+    "youtube {query}",
+    "put on {query} on youtube",
+    "find {query} on youtube"
+  ],
+  "completion_message": "Playing it on YouTube now.",
+  "steps": [
+    { "action": "browser.goto",  "url": "https://www.youtube.com", "delay": 1.5 },
+    { "action": "browser.wait",  "selector": "input#search", "timeout": 8000, "delay": 0.3 },
+    { "action": "browser.fill",  "selector": "input#search", "value": "{query}", "delay": 0.4 },
+    { "action": "browser.press", "key": "Enter", "delay": 2.0 },
+    { "action": "browser.wait",  "selector": "ytd-video-renderer", "timeout": 10000, "delay": 0.5 },
+    { "action": "browser.click", "selector": "ytd-video-renderer:first-of-type a#video-title", "delay": 0.5 }
+  ]
+}

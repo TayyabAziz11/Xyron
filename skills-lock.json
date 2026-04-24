@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "skills": {
+    "ai-rag-pipeline": {
+      "source": "inference-sh/skills",
+      "sourceType": "github",
+      "computedHash": "0a094c7b4f3bfab05b1a1b31aa93d9e11c85e7310c00272a21a6fe28e0b9bde8"
+    },
+    "firecrawl": {
+      "source": "firecrawl/cli",
+      "sourceType": "github",
+      "computedHash": "9c4db067e89af047603e7ebf9d1ef8769ef0c25cee8701f4cb37a2af6b3b9825"
+    },
+    "playwright-best-practices": {
+      "source": "currents-dev/playwright-best-practices-skill",
+      "sourceType": "github",
+      "computedHash": "320eaf861e3a0a923bfaad0726cb311a3fe30093378f8d26c89b9c5ae5c42b35"
+    },
+    "python-executor": {
+      "source": "inference-sh/agent-skills-registry",
+      "sourceType": "github",
+      "computedHash": "2979857a8ffb1b1a64665dc611caa4fa9669c47edbf242261b27a6b15638d08c"
+    },
+    "supabase-postgres-best-practices": {
+      "source": "supabase/agent-skills",
+      "sourceType": "github",
+      "computedHash": "f4cd7570115d97af6bcb2946eb891a958c8d04a43b479871c9ccadbc670ad058"
+    },
+    "systematic-debugging": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "computedHash": "72e9ab72627e4fd8ed26a582e82309a98ecdc4f6e1c99418430ac05682c9e91d"
+    },
+    "tavily-search": {
+      "source": "tavily-ai/skills",
+      "sourceType": "github",
+      "computedHash": "bda6e90a41addbe0f8750a38aebdf59c5bdc8514d23aaf2015ffe45de6958b74"
+    },
+    "using-superpowers": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "computedHash": "e0eced9fbb205c212f420aded0c6f2bf5d5f059254679a8459b4fe72390160be"
+    }
+  }
+}

@@ -62,7 +62,7 @@ function Navbar() {
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand">
             <span className="text-sm font-bold text-white">AI</span>
           </div>
-          <span className="text-sm font-semibold text-text-primary">AI Operator</span>
+          <span className="text-sm font-semibold text-text-primary">Xyron</span>
         </div>
         <Link
           href="/app/dashboard"
@@ -107,7 +107,7 @@ function Hero() {
           className="text-5xl sm:text-6xl lg:text-7xl font-bold tracking-tight leading-[1.05] mb-6"
         >
           <span className="bg-gradient-to-r from-white to-text-secondary bg-clip-text text-transparent">
-            Your AI Operator.
+            Your Xyron.
           </span>
           <br />
           <span className="bg-gradient-to-r from-brand-light to-white bg-clip-text text-transparent">
@@ -122,7 +122,7 @@ function Hero() {
           variants={fadeUp}
           className="text-lg text-text-secondary max-w-2xl mx-auto mb-10 leading-relaxed"
         >
-          Give natural commands. AI Operator drafts emails, posts content, manages approvals,
+          Give natural commands. Xyron drafts emails, posts content, manages approvals,
           and runs your workflows — with a human-in-the-loop at every critical step.
         </motion.p>
 
@@ -240,7 +240,7 @@ function Capabilities() {
             Everything you need to automate work
           </h2>
           <p className="text-text-secondary max-w-xl mx-auto">
-            AI Operator brings together all the tools your AI needs to act — and all the controls
+            Xyron brings together all the tools your AI needs to act — and all the controls
             you need to stay in charge.
           </p>
         </div>
@@ -328,7 +328,7 @@ function UseCases() {
       <div className="max-w-4xl mx-auto">
         <div className="text-center mb-16">
           <h2 className="text-3xl font-bold text-text-primary mb-4">
-            What AI Operator can do for you
+            What Xyron can do for you
           </h2>
         </div>
         <motion.ul
@@ -388,7 +388,7 @@ function FinalCTA() {
             href="/app/dashboard"
             className="inline-flex items-center gap-2 rounded-xl bg-brand px-8 py-4 text-base font-semibold text-white hover:bg-brand-light transition-colors"
           >
-            Open AI Operator
+            Open Xyron
             <ArrowRight className="h-5 w-5" />
           </Link>
         </motion.div>
@@ -402,7 +402,7 @@ function Footer() {
   return (
     <footer className="border-t border-surface-border bg-surface-raised/30 py-8 px-6">
       <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
-        <span className="text-xs text-text-muted">AI Operator — v0.1.0</span>
+        <span className="text-xs text-text-muted">Xyron — v0.1.0</span>
         <span className="text-xs text-text-muted">
           Built with Python + Next.js · Voice pipeline coming soon
         </span>

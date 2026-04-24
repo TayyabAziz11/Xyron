@@ -1,0 +1,21 @@
+{
+  "name": "gmail_compose",
+  "display_name": "Gmail Compose",
+  "triggers": [
+    "send email to {name}",
+    "compose email to {name}",
+    "write email to {name}",
+    "open gmail and send email to {name}",
+    "email {name}",
+    "send a mail to {name}"
+  ],
+  "completion_message": "Gmail is open and the compose window is ready. I've pre-filled the recipient.",
+  "steps": [
+    { "action": "browser.goto",  "url": "https://mail.google.com", "delay": 2.0 },
+    { "action": "browser.wait",  "selector": "div[role=main]", "timeout": 12000, "delay": 0.5 },
+    { "action": "browser.click", "selector": "div[gh=cm]", "delay": 1.0 },
+    { "action": "browser.wait",  "selector": "input[name=to]", "timeout": 6000, "delay": 0.3 },
+    { "action": "browser.fill",  "selector": "input[name=to]", "value": "{name}", "delay": 0.5 },
+    { "action": "browser.press", "key": "Tab", "delay": 0.3 }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "github_search",
+  "display_name": "GitHub Repository Search",
+  "triggers": [
+    "open github and search {query}",
+    "search github for {query}",
+    "find {query} on github",
+    "github search {query}"
+  ],
+  "completion_message": "Showing GitHub search results.",
+  "steps": [
+    { "action": "browser.goto", "url": "https://github.com/search?q={query}&type=repositories", "delay": 1.5 },
+    { "action": "browser.wait", "selector": "div[data-testid='search-results']", "timeout": 8000, "delay": 0.3 }
+  ]
+}

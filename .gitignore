@@ -37,9 +37,17 @@ out/
 npm-debug.log*
 yarn-debug.log*
 
-# Electron build output
+# Electron build output — only binaries/build artifacts, NOT source code
 desktop/dist/
 desktop/out/
+desktop-app/node_modules/
+desktop-app/out/
+desktop-app/release/
+*.exe
+*.app
+*.deb
+*.dmg
+*.AppImage
 
 # Runtime logs and checkpoints
 backend/Logs/
@@ -57,13 +65,20 @@ ralph_loop.log
 Thumbs.db
 desktop.ini
 
-# IDE
+# IDE / local tools
 .vscode/
 .idea/
 .obsidian/
+.claude/
 *.swp
 *.swo
 *~
+
+# WSL / local runtime config (contains credentials)
+.wslrun
+
+# Unnecessary local assets
+Public/
 
 # Misc
 *.bak

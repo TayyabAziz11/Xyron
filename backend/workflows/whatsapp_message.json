@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp_message",
+  "display_name": "WhatsApp Web Message",
+  "triggers": [
+    "send whatsapp to {name}",
+    "send whatsapp message to {name}",
+    "message {name} on whatsapp",
+    "open whatsapp and message {name}",
+    "whatsapp {name}"
+  ],
+  "completion_message": "WhatsApp Web is open. Find your contact and send the message.",
+  "steps": [
+    { "action": "browser.goto",  "url": "https://web.whatsapp.com", "delay": 3.0 },
+    { "action": "browser.wait",  "selector": "div[contenteditable=true]", "timeout": 15000, "delay": 0.5 },
+    { "action": "browser.fill",  "selector": "div[aria-label='Search input textbox']", "value": "{name}", "delay": 1.0 }
+  ]
+}
