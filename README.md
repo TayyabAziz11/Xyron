@@ -1,189 +1,244 @@
-# AI Operator
+# Xyron — Voice-Driven AI Assistant
 
-> Talk naturally. It does your work.
-
-AI Operator is a voice-first personal AI assistant built for productivity. You give it natural commands — it drafts emails, creates LinkedIn posts, manages approvals, summarises your priorities, and routes tasks to the right agents automatically.
-
-This is not a smart-home assistant. This is an AI that handles real business work.
+> Talk naturally. It does the work.
 
 ---
 
-## Product Vision
+## What is Xyron?
 
-**Phase 1 — Foundation (current)**
-- Push-to-talk voice command input (local Whisper STT)
-- Web dashboard: approvals, logs, command history, integrations
-- Core agents: email, LinkedIn, task routing
-- Approval gates for risky actions (nothing auto-sends without review)
+Imagine having a super-smart assistant that lives on your computer and listens to your voice. You say something like **"open my IT Course folder"** or **"set volume to 50 and play that video"** — and it just does it. No clicking. No searching. Just talk.
 
-**Phase 2 — Desktop Companion**
-- Electron tray app with push-to-talk
-- Always-accessible popup assistant
-- Wake word support (openWakeWord)
+That's Xyron.
 
-**Phase 2 — Desktop Companion + Voice Responses (current)**
-- Electron tray app with push-to-talk
-- Always-accessible popup assistant
-- Wake word support (openWakeWord)
-- **Text-to-speech voice responses** — assistant speaks results after every command (pyttsx3/espeak)
-- Voice settings panel: enable/disable, speed, volume, auto-play
-- Web dashboard + desktop app both support audio playback
+It's a **voice-first AI assistant for your Windows PC** (running through WSL2). You speak a command, it figures out what you mean, runs the right action, and talks back to you with the result.
 
-**Phase 3 — Expansion**
-- WhatsApp, Instagram, calendar, booking workflows
-- Multi-user / team support
+Here's what it can do out of the box:
+
+- Open files, folders, apps, and websites by name
+- Control your volume and screen brightness
+- Search the web and answer questions
+- Read your Gmail inbox
+- Take screenshots
+- Remember what you asked before (so you can say "play **that** video" and it knows what you mean)
+- Remind you about upcoming calendar events
+- Run compound commands like **"open Chrome and then set volume to 30"**
+- Detect wake words like **"hey Xyron"** so you don't have to press anything
 
 ---
 
-## Tech Stack
-
-| Layer | Tech |
-|---|---|
-| Web Dashboard | Next.js + TypeScript + Tailwind CSS |
-| Desktop App | Electron + TypeScript |
-| Backend / Agents | Python 3.13 |
-| Voice (STT) | OpenAI Whisper (local) |
-| Voice (TTS) | pyttsx3 / espeak-ng (local, no model download) |
-| Wake Word | openWakeWord (Phase 2) |
-| Agent Orchestration | Custom Python orchestrator |
-| Approval Workflow | File-based HITL (human-in-the-loop) |
-| Logging | JSON + Markdown audit trail |
-
----
-
-## Repository Structure
+## How It's Built (The Three Pieces)
 
 ```
-ai-operator/
-  backend/          Python backend — agents, orchestrator, MCP servers, core utils
-    src/
-      ai_operator/  Main Python package
-        core/       Shared utilities (Gmail, LinkedIn, Odoo, audit, content)
-        skills/     Agent skills by domain
-    mcp_servers/    Custom MCP server implementations (WhatsApp, Odoo)
-    scripts/        CLI entry points and wrappers
-    tests/          Backend tests
-    pyproject.toml
-    requirements.txt
-
-  web/              Next.js web dashboard (to be built)
-  desktop/          Electron desktop companion (to be built)
-  shared/           Shared types and schemas
-  docs/             Product and integration documentation
-    integrations/   Setup guides for Gmail, LinkedIn, WhatsApp, Odoo, etc.
-    architecture/   Architecture reference docs
-  LICENSE
-  README.md
-  ARCHITECTURE.md
-  CLEANUP_SUMMARY.md
+Xyron/
+  backend/       ← The brain (Python + FastAPI)
+  web/           ← The dashboard you see in your browser (Next.js)
+  desktop-app/   ← The Electron tray app on Windows/WSL2
 ```
 
----
+| Piece | What it does | Tech |
+|---|---|---|
+| **Backend** | Processes your voice, routes commands, calls tools | Python 3.10+, FastAPI |
+| **Web Dashboard** | Shows history, stats, approvals, command center | Next.js, TypeScript, Tailwind |
+| **Desktop App** | Puts Xyron in your system tray (always accessible) | Electron |
 
-## What Is Implemented vs Planned
-
-### Implemented (backend — ready to wire up)
-
-- **Gmail agent** — OAuth2 perception + email action execution
-- **LinkedIn agent** — OAuth2 + post creation
-- **WhatsApp agent** — Web automation via Playwright MCP server
-- **Instagram agent** — Graph API integration
-- **Odoo agent** — Accounting queries and invoice actions (JSON-RPC MCP server)
-- **Approval workflow** — File-based HITL; plans require approval before execution
-- **Plan generation** — Structured AI-generated action plans
-- **Audit logging** — Append-only JSON + Markdown logs with PII redaction
-- **Content generation** — OpenAI GPT-4o integration
-- **Agent orchestrator** — Autonomous loop with safety controls
-
-### To Build
-
-- [ ] Web dashboard (new frontend)
-- [ ] Desktop Electron app
-- [ ] Voice command pipeline (Whisper STT → text → agent router)
-- [x] Voice response pipeline (command result → generate_assistant_response → pyttsx3 TTS → WAV → browser Audio playback)
-- [ ] Push-to-talk UI
-- [ ] Command history and approval UI
-- [ ] Settings and integrations management UI
+The backend does the heavy lifting. The web and desktop apps are the faces you interact with.
 
 ---
 
-## Running
+## Before You Start — What You Need
 
-### Backend API
+Make sure you have these installed:
+
+| Tool | Why | Check if installed |
+|---|---|---|
+| **Python 3.10+** | Runs the backend | `python3 --version` |
+| **Node.js 18+** | Runs the web dashboard | `node --version` |
+| **npm** | Installs web packages | `npm --version` |
+| **Git** | Downloads the code | `git --version` |
+| **WSL2** (Windows only) | Runs Linux on Windows | You're in WSL2 if this path works: `/mnt/c/` |
+
+You'll also need a free **OpenAI API key** from [platform.openai.com](https://platform.openai.com) — this powers the voice understanding and AI responses.
+
+---
+
+## Setup: Step by Step
+
+### Step 1 — Clone the Repository
+
+Open a terminal and run:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/Xyron.git
+cd Xyron
+```
+
+> Replace `YOUR_USERNAME` with the actual GitHub username where the repo lives.
+
+---
+
+### Step 2 — Set Up the Backend (The Brain)
 
 ```bash
 cd backend
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e .
+```
 
-# Copy and fill in environment variables
+Install the Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+> This installs everything the backend needs — the voice pipeline, AI models, tool handlers, etc. It might take a few minutes on the first run because it downloads some AI models.
+
+Now create your environment file (this tells the backend your API key and settings):
+
+```bash
 cp .env.example .env
-
-# Run the FastAPI server
-uvicorn api.main:app --reload --port 8000
 ```
 
-### Web Dashboard
+Open the `.env` file and fill in your real values:
+
+```env
+OPENAI_API_KEY=sk-proj-YOUR_KEY_HERE
+API_PORT=8000
+CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+```
+
+> **Important:** Never share your `.env` file or commit it to GitHub. It contains your private API key.
+
+Start the backend server:
 
 ```bash
-cd web
+python3 -m uvicorn api.main:app --reload --port 8000
+```
+
+You should see something like:
+
+```
+INFO:     Uvicorn running on http://0.0.0.0:8000
+INFO:     Application startup complete.
+```
+
+Leave this terminal open — the backend needs to keep running.
+
+---
+
+### Step 3 — Set Up the Web Dashboard
+
+Open a **new terminal tab/window** and run:
+
+```bash
+cd Xyron/web
 npm install
-npm run dev      # starts on http://localhost:3001
+npm run dev
 ```
 
-### URLs
+The web dashboard starts at **http://localhost:3001**
 
-| Surface | URL |
-|---|---|
-| Homepage | http://localhost:3001 |
-| Dashboard | http://localhost:3001/app/dashboard |
-| Command Center | http://localhost:3001/app/command-center |
-| Approvals | http://localhost:3001/app/approvals |
-| Activity | http://localhost:3001/app/activity |
-| Integrations | http://localhost:3001/app/integrations |
-| Workflows | http://localhost:3001/app/workflows |
-| Settings | http://localhost:3001/app/settings |
-| API | http://localhost:8000 |
-| API Docs | http://localhost:8000/docs |
+---
 
-### Route structure
+### Step 4 — (Optional) Set Up the Desktop App
 
-```
-/               → Public landing page (homepage)
-/app            → Redirects to /app/dashboard
-/app/dashboard  → Main dashboard
-/app/command-center  → Command input + history
-/app/approvals  → Approval queue
-/app/activity   → Audit log
-/app/integrations → Integration status
-/app/workflows  → Workflow tracker
-/app/settings   → System settings
-```
-
-### Legacy scripts
+The Electron tray app lets you use Xyron without opening a browser.
 
 ```bash
-# Run the agent daemon
-python scripts/agent_daemon.py
-
-# Run a specific skill
-python scripts/gmail_watcher_skill.py
+cd Xyron/desktop-app
+npm install
+npm run dev:wsl       # use this if you're on WSL2
+# OR
+npm run dev           # use this on native Linux/Mac
 ```
 
 ---
 
-## Integration Setup Guides
+## All the URLs
 
-See `docs/integrations/` for step-by-step setup:
-- Gmail OAuth2 → `docs/integrations/gmail_oauth_setup.md`
-- LinkedIn OAuth → `docs/integrations/linkedin_real_setup.md`
-- WhatsApp Web → `docs/integrations/mcp_whatsapp_web_setup.md`
-- Odoo → `docs/integrations/mcp_odoo_setup.md`
-- Instagram → `docs/integrations/mcp_instagram_setup.md`
+Once both the backend and web are running:
+
+| What | URL |
+|---|---|
+| Homepage | http://localhost:3001 |
+| Command Center (voice) | http://localhost:3001/app/command-center |
+| Dashboard | http://localhost:3001/app/dashboard |
+| Conversation History | http://localhost:3001/app/history |
+| Usage Stats | http://localhost:3001/app/stats |
+| Approvals Queue | http://localhost:3001/app/approvals |
+| Activity Log | http://localhost:3001/app/activity |
+| Integrations | http://localhost:3001/app/integrations |
+| Settings | http://localhost:3001/app/settings |
+| Backend API | http://localhost:8000 |
+| API Docs (auto-generated) | http://localhost:8000/docs |
+
+---
+
+## How to Use It
+
+1. Go to **http://localhost:3001/app/command-center**
+2. Click the microphone button (or say **"hey Xyron"** if wake word is on)
+3. Speak your command
+4. Xyron thinks, acts, and responds
+
+**Example commands to try:**
+- `"Open Chrome"`
+- `"What's my battery level?"`
+- `"Set volume to 40"`
+- `"Open my downloads folder"`
+- `"Take a screenshot"`
+- `"Open Chrome and set volume to 50"` ← runs two things at once
+
+---
+
+## Project Structure (For the Curious)
+
+```
+Xyron/
+  backend/
+    api/
+      main.py              ← FastAPI app entry point
+      routers/             ← API endpoints (voice, history, memory, etc.)
+      services/            ← Core logic (intent routing, episodic memory, etc.)
+      tools/               ← Things Xyron can actually DO (open files, etc.)
+    voice/                 ← Voice recording and text-to-speech
+    requirements.txt       ← Python dependencies
+    .env.example           ← Template for your secrets
+
+  web/
+    src/
+      app/                 ← Next.js pages
+      components/          ← Reusable UI pieces
+      hooks/               ← Data-fetching logic
+      lib/                 ← Shared utilities
+
+  desktop-app/
+    src/                   ← Electron main + renderer process
+
+  shared/                  ← Types shared between frontend and backend
+  docs/                    ← Integration setup guides
+```
+
+---
+
+## Common Issues
+
+**Backend won't start?**
+- Make sure you're in the `backend/` folder
+- Check that your `.env` file exists and has a valid `OPENAI_API_KEY`
+- Try: `python3 --version` — needs to be 3.10 or higher
+
+**Microphone not working in browser?**
+- Use **Chrome or Edge** (Firefox has limited mic support)
+- Make sure you clicked "Allow" when the browser asked for mic permission
+
+**Voice commands not understood?**
+- Speak clearly and don't start talking until the mic indicator turns red/active
+- Try simpler commands first to test the connection
+
+**`npm install` fails?**
+- Run `node --version` — needs to be 18 or higher
+- Try: `npm install --legacy-peer-deps`
 
 ---
 
 ## License
 
-See `LICENSE`.
+See [LICENSE](./LICENSE).

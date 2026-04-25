@@ -10,11 +10,17 @@ import logging
 import sys
 from pathlib import Path
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+    stream=sys.stdout,
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation
+from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory
 
 logger = logging.getLogger(__name__)
 
@@ -89,3 +95,4 @@ app.include_router(notes.router)
 app.include_router(meeting.router)
 app.include_router(proactive.router)
 app.include_router(automation.router, prefix="/api/v1/automation", tags=["automation"])
+app.include_router(memory.router)

@@ -31,3 +31,6 @@ google-api-python-client>=2.80.0
 
 # Feature #9 — Browser control (run: playwright install chromium)
 playwright>=1.44.0
+
+# Intent classifier — local semantic matching, no API cost (~90MB model download on first use)
+sentence-transformers>=3.0.0

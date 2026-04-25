@@ -11,6 +11,7 @@ Registered tools:
 """
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 import platform
@@ -1190,14 +1191,77 @@ def _store_last_action(ctx: Dict[str, Any], tool: str, params: dict, result: str
 
 # ── Volume control ────────────────────────────────────────────────────────────
 
+_SET_VOLUME_PS1_TMPL = r"""
+try {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+[Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator2 {
+    int N1();
+    [PreserveSig] int GetDefaultAudioEndpoint(int d, int r, out IMMDevice2 p);
+}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice2 {
+    [PreserveSig] int Activate(ref Guid iid, int ctx2, IntPtr ap, [MarshalAs(UnmanagedType.IUnknown)] out object pp);
+}
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume2 {
+    int N1(); int N2();
+    [PreserveSig] int SetMasterVolumeLevelScalar(float f, ref Guid g);
+}
+public class VolSetter {
+    static Guid CLSID = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
+    static Guid IID  = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
+    [DllImport("ole32.dll")] static extern int CoCreateInstance(ref Guid r, IntPtr u, int c, ref Guid i, out IntPtr p);
+    public static void Set(float level) {
+        IntPtr pE; CoCreateInstance(ref CLSID, IntPtr.Zero, 1, ref IID, out pE);
+        IMMDeviceEnumerator2 en = (IMMDeviceEnumerator2)Marshal.GetObjectForIUnknown(pE);
+        IMMDevice2 dev; en.GetDefaultAudioEndpoint(0,1,out dev);
+        Guid vIID = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+        object vo; dev.Activate(ref vIID, 1, IntPtr.Zero, out vo);
+        IAudioEndpointVolume2 vol = (IAudioEndpointVolume2)vo;
+        Guid empty = Guid.Empty; vol.SetMasterVolumeLevelScalar(level, ref empty);
+    }
+}
+"@ -ErrorAction Stop
+[VolSetter]::Set(LEVEL_FLOAT)
+Write-Output "OK"
+} catch { Write-Output "ERR:$($_.Exception.Message)" }
+"""
+
+
 def _exec_volume_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    action = params.get("action", "up")   # up | down | mute | unmute
+    action = params.get("action", "up")   # up | down | mute | unmute | set
     steps  = max(1, min(20, int(params.get("steps", 5))))
 
     cmd_exe = _find_cmdexe()
     if not cmd_exe:
         return ToolResult(success=False, text="cmd.exe not found.",
                           spoken="Volume control is not available on this system.")
+
+    if action == "set":
+        level = max(0, min(100, int(params.get("level", 50))))
+        ps1_path = "/mnt/c/Windows/Temp/_xyron_setvol.ps1"
+        win_path = "C:\\Windows\\Temp\\_xyron_setvol.ps1"
+        script = _SET_VOLUME_PS1_TMPL.replace("LEVEL_FLOAT", f"{level / 100:.3f}")
+        try:
+            Path(ps1_path).write_text(script)
+            result = subprocess.run(
+                [cmd_exe, "/c", f'powershell -NoProfile -NonInteractive -File "{win_path}"'],
+                capture_output=True, timeout=15,
+            )
+            out = (result.stdout or b"").decode("utf-8", errors="ignore").strip()
+            if out.startswith("ERR:"):
+                return ToolResult(success=False, text=out, spoken="Volume set failed.", error=out)
+            spoken = f"Volume set to {level}%."
+            _store_last_action(ctx, "volume_control", params, spoken)
+            return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": "set", "level": level})
+        except Exception as exc:
+            return ToolResult(success=False, text=str(exc), spoken="Volume set failed.", error=str(exc))
 
     if action in ("mute", "unmute"):
         key_code = 173   # VK_VOLUME_MUTE toggle
@@ -1286,9 +1350,11 @@ def _exec_sleep_system(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResul
         return ToolResult(success=False, text="cmd.exe not found.",
                           spoken="Sleep is not available on this system.")
     try:
-        subprocess.run(
+        # Fire-and-forget: the sleep command suspends the OS so it never
+        # returns within a blocking timeout — use Popen to avoid that hang.
+        subprocess.Popen(
             [cmd_exe, "/c", "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"],
-            check=True, capture_output=True, timeout=5,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         spoken = "Going to sleep. Sweet dreams."
         return ToolResult(success=True, text=spoken, spoken=spoken, data={})
@@ -1875,3 +1941,1143 @@ registry.register(
     risk="high",
     category="system",
 )
+
+
+# =============================================================================
+# EXTENDED SYSTEM CONTROL — 30 new tools
+# Process, Display, Network/WiFi, Battery/Power, Storage, Audio, Maintenance
+# Zero OpenAI — all pure OS/subprocess/psutil calls
+# =============================================================================
+
+_POWERSHELL_PATH: str | None = None
+
+
+def _find_powershell() -> str | None:
+    global _POWERSHELL_PATH
+    if _POWERSHELL_PATH is not None:
+        return _POWERSHELL_PATH
+    for p in [
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "/mnt/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe",
+    ]:
+        if Path(p).exists():
+            _POWERSHELL_PATH = p
+            return _POWERSHELL_PATH
+    return None
+
+
+def _ps(command: str, timeout: int = 10) -> tuple[bool, str]:
+    """Run a Windows PowerShell command, return (success, stdout)."""
+    ps = _find_powershell()
+    if not ps:
+        return False, "PowerShell not found"
+    try:
+        r = subprocess.run(
+            [ps, "-NonInteractive", "-NoProfile", "-Command", command],
+            capture_output=True, text=True, timeout=timeout, errors="ignore",
+        )
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0 and not out:
+            return False, err or "PowerShell command failed"
+        return True, out
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out"
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ── PROCESS MANAGEMENT ────────────────────────────────────────────────────────
+
+def _exec_list_processes(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    top_n = int(params.get("top", 15))
+    try:
+        import psutil
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                mem_mb = round(p.info["memory_info"].rss / 1024 / 1024, 1)
+                procs.append((p.info["name"] or "?", p.info["pid"], mem_mb))
+            except Exception:
+                pass
+        procs.sort(key=lambda x: x[2], reverse=True)
+        top = procs[:top_n]
+        lines = [f"{n} (PID {pid}) — {mem}MB" for n, pid, mem in top]
+        spoken = f"Top {len(top)} processes by RAM: " + "; ".join(
+            f"{n} {mem}MB" for n, pid, mem in top[:5]) + "."
+        return ToolResult(success=True, text="\n".join(lines), spoken=spoken,
+                          data={"processes": [{"name": n, "pid": pid, "mem_mb": mem} for n, pid, mem in top]})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't list processes.", error=str(exc))
+
+
+def _exec_kill_process(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    name = params.get("name", "").strip()
+    pid  = params.get("pid")
+    if not name and not pid:
+        return ToolResult(success=False, text="name or pid required.", spoken="Which process should I kill?")
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't kill process — cmd.exe missing.")
+    try:
+        if pid:
+            arg   = f"/pid {pid}"
+            label = f"PID {pid}"
+        else:
+            exe   = name if name.lower().endswith(".exe") else name + ".exe"
+            arg   = f"/im {exe}"
+            label = name
+        r = subprocess.run([cmd_exe, "/c", f"taskkill /f {arg}"],
+                           capture_output=True, timeout=8)
+        out = (r.stdout or b"").decode("utf-8", errors="ignore").strip()
+        err_out = (r.stderr or b"").decode("utf-8", errors="ignore").strip()
+        if r.returncode == 0 or "SUCCESS" in out.upper():
+            spoken = f"Killed {label}."
+            return ToolResult(success=True, text=spoken, spoken=spoken, data={"killed": label})
+        err = out or err_out or "Process not found."
+        return ToolResult(success=False, text=err, spoken=f"Couldn't kill {label}. It may not be running.", error=err)
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Kill failed.", error=str(exc))
+
+
+def _exec_get_startup_apps(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps(
+        "Get-CimInstance Win32_StartupCommand | "
+        "Select-Object Name,Command,Location | ConvertTo-Json -Compress",
+        timeout=15,
+    )
+    if ok and out:
+        try:
+            import json as _j
+            items = _j.loads(out)
+            if isinstance(items, dict):
+                items = [items]
+            names = [i.get("Name", "?") for i in items]
+            spoken = f"{len(names)} startup app{'s' if len(names)!=1 else ''}: " + \
+                     ", ".join(names[:8]) + ("…" if len(names) > 8 else "") + "."
+            return ToolResult(success=True, text="\n".join(names), spoken=spoken, data={"apps": items})
+        except Exception:
+            return ToolResult(success=True, text=out, spoken="Here are your startup apps.", data={})
+    return ToolResult(success=False, text=out, spoken="Couldn't read startup apps.", error=out)
+
+
+def _exec_disable_startup_app(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    name = params.get("name", "").strip()
+    if not name:
+        return ToolResult(success=False, text="name required.", spoken="Which startup app should I disable?")
+    ok, out = _ps(
+        f'$removed=$false; '
+        f'$keys=@("HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",'
+        f'"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"); '
+        f'foreach($k in $keys){{'
+        f' $v=Get-ItemProperty $k -ErrorAction SilentlyContinue; '
+        f' if($v.PSObject.Properties.Name -contains "{name}"){{Remove-ItemProperty $k -Name "{name}" -ErrorAction SilentlyContinue; $removed=$true}} '
+        f'}}; Write-Output $removed'
+    )
+    if ok and "True" in out:
+        spoken = f"Removed '{name}' from startup."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"removed": name})
+    ok2, _ = _ps(f'Disable-ScheduledTask -TaskName "{name}" -ErrorAction SilentlyContinue; Write-Output done')
+    if ok2:
+        spoken = f"Disabled startup task '{name}'."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"disabled": name})
+    return ToolResult(success=False, text=out,
+                      spoken=f"Couldn't find '{name}' in startup. Check the exact name.",
+                      error=out)
+
+
+# ── DISPLAY CONTROL ───────────────────────────────────────────────────────────
+
+_DISPLAY_TYPEDEF = r"""
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public struct DEVMODE {
+    [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string dmDeviceName;
+    public short dmSpecVersion,dmDriverVersion,dmSize,dmDriverExtra;
+    public int dmFields,dmPositionX,dmPositionY,dmDisplayOrientation,dmDisplayFixedOutput;
+    public short dmColor,dmDuplex,dmYResolution,dmTTOption,dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string dmFormName;
+    public short dmLogPixels;
+    public int dmBitsPerPel,dmPelsWidth,dmPelsHeight,dmDisplayFlags,dmDisplayFrequency;
+    public int dmICMMethod,dmICMIntent,dmMediaType,dmDitherType,dmR1,dmR2,dmPW,dmPH;
+}
+public class Display {
+    [DllImport("user32.dll")] public static extern bool EnumDisplaySettings(string n,int m,ref DEVMODE d);
+    [DllImport("user32.dll")] public static extern int ChangeDisplaySettings(ref DEVMODE d,int f);
+}
+"@ -ErrorAction SilentlyContinue
+"""
+
+
+def _exec_set_display_resolution(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    w = int(params.get("width",  1920))
+    h = int(params.get("height", 1080))
+    script = _DISPLAY_TYPEDEF + f"""
+$dm = New-Object DEVMODE
+$dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm)
+[Display]::EnumDisplaySettings($null, -1, [ref]$dm) | Out-Null
+$dm.dmPelsWidth = {w}; $dm.dmPelsHeight = {h}
+$dm.dmFields = 0x80000 -bor 0x100000
+Write-Output ([Display]::ChangeDisplaySettings([ref]$dm, 0))
+"""
+    ok, out = _ps(script, timeout=15)
+    if ok and out.strip() == "0":
+        spoken = f"Resolution set to {w}×{h}."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"width": w, "height": h})
+    return ToolResult(success=False, text=out,
+                      spoken=f"Couldn't set {w}×{h}. That resolution may not be supported.", error=out)
+
+
+def _exec_set_refresh_rate(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    rate = int(params.get("rate", 60))
+    script = _DISPLAY_TYPEDEF + f"""
+$dm = New-Object DEVMODE
+$dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm)
+[Display]::EnumDisplaySettings($null, -1, [ref]$dm) | Out-Null
+$dm.dmDisplayFrequency = {rate}
+$dm.dmFields = 0x400000
+Write-Output ([Display]::ChangeDisplaySettings([ref]$dm, 0))
+"""
+    ok, out = _ps(script, timeout=15)
+    if ok and out.strip() == "0":
+        spoken = f"Refresh rate set to {rate}Hz."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"rate": rate})
+    return ToolResult(success=False, text=out,
+                      spoken=f"Couldn't set {rate}Hz. Check if your monitor supports it.", error=out)
+
+
+def _exec_virtual_desktop_create(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    _ps(
+        'Add-Type -MemberDefinition \'[DllImport("user32.dll")] public static extern void keybd_event(byte v,byte s,uint f,UIntPtr e);\' '
+        '-Name VDKB -Namespace vd -ErrorAction SilentlyContinue; '
+        'vd.VDKB.keybd_event(0x5B,0,0,[UIntPtr]::Zero); '  # Win down
+        'vd.VDKB.keybd_event(0x11,0,0,[UIntPtr]::Zero); '  # Ctrl down
+        'vd.VDKB.keybd_event(0x44,0,0,[UIntPtr]::Zero); '  # D down
+        'Start-Sleep -Milliseconds 80; '
+        'vd.VDKB.keybd_event(0x44,0,2,[UIntPtr]::Zero); '  # D up
+        'vd.VDKB.keybd_event(0x11,0,2,[UIntPtr]::Zero); '  # Ctrl up
+        'vd.VDKB.keybd_event(0x5B,0,2,[UIntPtr]::Zero); '  # Win up
+        'Write-Output done'
+    )
+    spoken = "New virtual desktop created."
+    return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+
+
+def _exec_virtual_desktop_switch(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    direction = params.get("direction", "right").lower()
+    vk        = 0x27 if direction == "right" else 0x25  # VK_RIGHT / VK_LEFT
+    _ps(
+        f'Add-Type -MemberDefinition \'[DllImport("user32.dll")] public static extern void keybd_event(byte v,byte s,uint f,UIntPtr e);\' '
+        f'-Name VDKB2 -Namespace vd2 -ErrorAction SilentlyContinue; '
+        f'vd2.VDKB2.keybd_event(0x5B,0,0,[UIntPtr]::Zero); '
+        f'vd2.VDKB2.keybd_event(0x11,0,0,[UIntPtr]::Zero); '
+        f'vd2.VDKB2.keybd_event({vk},0,0,[UIntPtr]::Zero); '
+        f'Start-Sleep -Milliseconds 80; '
+        f'vd2.VDKB2.keybd_event({vk},0,2,[UIntPtr]::Zero); '
+        f'vd2.VDKB2.keybd_event(0x11,0,2,[UIntPtr]::Zero); '
+        f'vd2.VDKB2.keybd_event(0x5B,0,2,[UIntPtr]::Zero); '
+        f'Write-Output done'
+    )
+    label = "next" if direction == "right" else "previous"
+    spoken = f"Switched to {label} virtual desktop."
+    return ToolResult(success=True, text=spoken, spoken=spoken, data={"direction": direction})
+
+
+def _exec_take_screenshot(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    import time as _t
+    ts   = int(_t.time())
+    dest = (params.get("path") or "").strip() or f"C:\\Users\\Public\\Pictures\\screenshot_{ts}.png"
+    script = f"""
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing -ErrorAction SilentlyContinue
+$s = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($s.Location, [System.Drawing.Point]::Empty, $s.Size)
+$bmp.Save("{dest}")
+$g.Dispose(); $bmp.Dispose()
+Write-Output OK
+"""
+    ok, out = _ps(script, timeout=15)
+    if ok and "OK" in out:
+        spoken = f"Screenshot saved to {dest}."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"path": dest})
+    return ToolResult(success=False, text=out, spoken="Screenshot failed.", error=out)
+
+
+# ── NETWORK / WIFI ────────────────────────────────────────────────────────────
+
+def _exec_wifi_list(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="WiFi list unavailable.")
+    try:
+        r = subprocess.run([cmd_exe, "/c", "netsh wlan show networks mode=bssid"],
+                           capture_output=True, timeout=12)
+        out = (r.stdout or b"").decode("utf-8", errors="ignore")
+        ssids = list(dict.fromkeys(re.findall(r'(?<!\w)SSID\s+\d+\s*:\s*(.+)', out)))
+        ssids = [s.strip() for s in ssids if s.strip()]
+        if ssids:
+            spoken = f"Found {len(ssids)} network{'s' if len(ssids)!=1 else ''}: " + \
+                     ", ".join(ssids[:8]) + ("…" if len(ssids) > 8 else "") + "."
+            return ToolResult(success=True, text="\n".join(ssids), spoken=spoken, data={"networks": ssids})
+        return ToolResult(success=False, text="No networks found.",
+                          spoken="No WiFi networks detected. Make sure WiFi is turned on.")
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't scan WiFi.", error=str(exc))
+
+
+def _exec_wifi_connect(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ssid = params.get("ssid", "").strip()
+    if not ssid:
+        return ToolResult(success=False, text="ssid required.", spoken="Which WiFi network should I connect to?")
+    cmd_exe = _find_cmdexe()
+    try:
+        r = subprocess.run([cmd_exe, "/c", f'netsh wlan connect name="{ssid}"'],
+                           capture_output=True, timeout=10)
+        out = (r.stdout or b"").decode("utf-8", errors="ignore").strip()
+        if "successfully" in out.lower() or r.returncode == 0:
+            spoken = f"Connecting to {ssid}."
+            return ToolResult(success=True, text=spoken, spoken=spoken, data={"ssid": ssid})
+        return ToolResult(success=False, text=out,
+                          spoken=f"Couldn't connect to {ssid}. Make sure the profile exists first.", error=out)
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="WiFi connect failed.", error=str(exc))
+
+
+def _exec_wifi_disconnect(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    cmd_exe = _find_cmdexe()
+    try:
+        subprocess.run([cmd_exe, "/c", "netsh wlan disconnect"], capture_output=True, timeout=8)
+        spoken = "WiFi disconnected."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't disconnect WiFi.", error=str(exc))
+
+
+def _exec_network_speed_test(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    import time as _t, urllib.request as _ur
+    url = "http://speedtest.tele2.net/1MB.zip"
+    try:
+        start = _t.time()
+        with _ur.urlopen(url, timeout=20) as resp:
+            data = resp.read()
+        elapsed = max(_t.time() - start, 0.01)
+        mb      = len(data) / 1024 / 1024
+        mbps    = round((mb * 8) / elapsed, 2)
+        spoken  = f"Download speed is about {mbps} Mbps."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"download_mbps": mbps})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc),
+                          spoken="Speed test failed. Check your connection.", error=str(exc))
+
+
+def _exec_get_ip_info(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    try:
+        import socket, urllib.request as _ur
+        local_ip = socket.gethostbyname(socket.gethostname())
+        try:
+            pub = _ur.urlopen("https://api.ipify.org", timeout=5).read().decode().strip()
+        except Exception:
+            pub = "unavailable"
+        spoken = f"Local IP is {local_ip}, public IP is {pub}."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"local": local_ip, "public": pub})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't get IP info.", error=str(exc))
+
+
+def _exec_flush_dns(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="DNS flush unavailable.")
+    try:
+        subprocess.run([cmd_exe, "/c", "ipconfig /flushdns"], capture_output=True, timeout=10, check=True)
+        spoken = "DNS cache flushed."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="DNS flush failed.", error=str(exc))
+
+
+# ── BATTERY & POWER PLANS ─────────────────────────────────────────────────────
+
+def _exec_get_battery_status(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    try:
+        import psutil
+        bat = psutil.sensors_battery()
+        if bat is None:
+            return ToolResult(success=False, text="No battery.",
+                              spoken="No battery detected. This machine is likely desktop or always plugged in.")
+        pct      = round(bat.percent, 1)
+        charging = bat.power_plugged
+        secs     = bat.secsleft if bat.secsleft and bat.secsleft > 0 else None
+        if charging:
+            status = "charging"
+            time_str = (f", fully charged in about {secs//3600}h {(secs%3600)//60}m"
+                        if secs else "")
+        else:
+            status = "discharging"
+            time_str = (f", roughly {secs//3600}h {(secs%3600)//60}m remaining"
+                        if secs else "")
+        spoken = f"Battery is at {pct}% and {status}{time_str}."
+        return ToolResult(success=True, text=spoken, spoken=spoken,
+                          data={"percent": pct, "charging": charging, "secs_left": secs})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't read battery status.", error=str(exc))
+
+
+_POWER_PLAN_GUIDS: Dict[str, str] = {
+    "balanced":         "381b4222-f694-41f0-9685-ff5bb260df2e",
+    "power saver":      "a1841308-3541-4fab-bc81-f71556f20b4a",
+    "saver":            "a1841308-3541-4fab-bc81-f71556f20b4a",
+    "performance":      "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+    "high performance": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+}
+_POWER_PLAN_LABELS: Dict[str, str] = {
+    "balanced": "Balanced", "power saver": "Power Saver", "saver": "Power Saver",
+    "performance": "High Performance", "high performance": "High Performance",
+}
+
+
+def _exec_set_power_plan(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    plan = params.get("plan", "balanced").strip().lower()
+    guid = _POWER_PLAN_GUIDS.get(plan)
+    if not guid:
+        return ToolResult(success=False, text=f"Unknown plan: {plan}",
+                          spoken="Unknown power plan. Try balanced, performance, or power saver.")
+    cmd_exe = _find_cmdexe()
+    try:
+        subprocess.run([cmd_exe, "/c", f"powercfg /setactive {guid}"],
+                       capture_output=True, timeout=10, check=True)
+        label  = _POWER_PLAN_LABELS.get(plan, plan.title())
+        spoken = f"Power plan switched to {label}."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"plan": label, "guid": guid})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't change power plan.", error=str(exc))
+
+
+def _exec_schedule_shutdown(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    minutes = int(params.get("minutes", 0))
+    hours   = int(params.get("hours",   0))
+    seconds = minutes * 60 + hours * 3600
+    if seconds <= 0:
+        return ToolResult(success=False, text="minutes or hours required.",
+                          spoken="How many minutes until shutdown?")
+    cmd_exe = _find_cmdexe()
+    try:
+        subprocess.run([cmd_exe, "/c", f"shutdown /s /t {seconds}"],
+                       capture_output=True, timeout=5, check=True)
+        label = (f"{hours}h {minutes}m" if hours and minutes else
+                 f"{hours}h" if hours else f"{minutes} minute{'s' if minutes!=1 else ''}")
+        spoken = f"Shutdown scheduled in {label}."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"seconds": seconds})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't schedule shutdown.", error=str(exc))
+
+
+# ── STORAGE & DISK ────────────────────────────────────────────────────────────
+
+def _exec_get_disk_usage(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    # Use PowerShell to get Windows drives directly — avoids WSL2 duplicate /dev/sdd mounts
+    ok, out = _ps(
+        "Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Root -match '^[A-Z]:\\\\'} | "
+        "ForEach-Object { "
+        "  $total=[math]::Round(($_.Used+$_.Free)/1GB,1); "
+        "  $used=[math]::Round($_.Used/1GB,1); "
+        "  $free=[math]::Round($_.Free/1GB,1); "
+        "  $pct=if($total -gt 0){[math]::Round($_.Used/($_.Used+$_.Free)*100,1)}else{0}; "
+        "  Write-Output \"$($_.Root)|$used|$total|$free|$pct\" "
+        "}",
+        timeout=15,
+    )
+    lines: list[str] = []
+    data:  list[dict] = []
+    if ok and out:
+        for row in out.splitlines():
+            parts = row.strip().split("|")
+            if len(parts) == 5:
+                drive, used, total, free, pct = parts
+                try:
+                    lines.append(f"{drive}  {used}GB / {total}GB  ({pct}% full, {free}GB free)")
+                    data.append({"device": drive, "total_gb": float(total), "used_gb": float(used),
+                                 "free_gb": float(free), "percent": float(pct)})
+                except ValueError:
+                    pass
+    if lines:
+        spoken = "Disk usage — " + "; ".join(lines) + "."
+        return ToolResult(success=True, text="\n".join(lines), spoken=spoken, data={"drives": data})
+    # Fallback to psutil if PowerShell unavailable
+    try:
+        import psutil
+        seen: set[str] = set()
+        for p in psutil.disk_partitions(all=False):
+            if p.mountpoint in seen:
+                continue
+            seen.add(p.mountpoint)
+            try:
+                u     = psutil.disk_usage(p.mountpoint)
+                total = round(u.total / 1024**3, 1)
+                used  = round(u.used  / 1024**3, 1)
+                free  = round(u.free  / 1024**3, 1)
+                lines.append(f"{p.mountpoint}  {used}GB / {total}GB  ({u.percent}% full, {free}GB free)")
+                data.append({"device": p.mountpoint, "total_gb": total, "used_gb": used,
+                             "free_gb": free, "percent": u.percent})
+            except Exception:
+                pass
+        if lines:
+            spoken = "Disk usage — " + "; ".join(lines) + "."
+            return ToolResult(success=True, text="\n".join(lines), spoken=spoken, data={"drives": data})
+    except Exception:
+        pass
+    return ToolResult(success=False, text="No drives found.", spoken="Couldn't read disk usage.")
+
+
+def _exec_empty_recycle_bin(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps("Clear-RecycleBin -Force -ErrorAction SilentlyContinue; Write-Output done", timeout=30)
+    if ok:
+        spoken = "Recycle bin emptied."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+    return ToolResult(success=False, text=out, spoken="Couldn't empty the recycle bin.", error=out)
+
+
+def _exec_get_temp_files_size(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps(
+        "$s=(Get-ChildItem $env:TEMP -Recurse -ErrorAction SilentlyContinue | "
+        "Measure-Object -Property Length -Sum).Sum; "
+        "[math]::Round($s/1MB, 1)",
+        timeout=20,
+    )
+    if ok and out:
+        try:
+            mb     = float(out.strip())
+            spoken = f"Your temp folder contains {mb} MB of files."
+            return ToolResult(success=True, text=spoken, spoken=spoken, data={"size_mb": mb})
+        except Exception:
+            pass
+    return ToolResult(success=False, text=out, spoken="Couldn't measure temp files.", error=out)
+
+
+def _exec_clear_temp_files(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps(
+        'Remove-Item "$env:TEMP\\*" -Recurse -Force -ErrorAction SilentlyContinue; Write-Output done',
+        timeout=60,
+    )
+    if ok:
+        spoken = "Temp files cleared."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+    return ToolResult(success=False, text=out, spoken="Couldn't clear temp files.", error=out)
+
+
+# ── AUDIO ─────────────────────────────────────────────────────────────────────
+
+_GET_VOLUME_PS1 = r"""
+try {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class _AudioHelper {
+    [DllImport("ole32.dll")] static extern int CoCreateInstance(ref Guid clsid,IntPtr pUnk,int ctx,ref Guid iid,out IntPtr ppv);
+    [DllImport("ole32.dll")] static extern int CoInitializeEx(IntPtr r,int f);
+    [DllImport("ole32.dll")] static extern void CoUninitialize();
+    static Guid _CLSID = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
+    static Guid _IID   = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
+    [ComImport,Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator {
+        void EnumAudioEndpoints(int df,int st,out IntPtr c);
+        void GetDefaultAudioEndpoint(int df,int role,[MarshalAs(UnmanagedType.Interface)]out IMMDevice d);
+    }
+    [ComImport,Guid("D666063F-1587-4E43-81F1-B948E807363F"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice {
+        [PreserveSig] int Activate(ref Guid iid,int ctx,IntPtr p,[MarshalAs(UnmanagedType.IUnknown)]out object pp);
+        void OpenPropertyStore(int a,out IntPtr s);
+        void GetId([MarshalAs(UnmanagedType.LPWStr)]out string id);
+        void GetState(out int s);
+    }
+    [ComImport,Guid("5CDF2C82-841E-4546-9722-0CF74078229A"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume {
+        void Reg(IntPtr n);void Unreg(IntPtr n);void GetCC(out uint c);
+        void SetLvl(float v,ref Guid g);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float v,ref Guid g);
+        void GetLvl(out float v);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float v);
+        void SetChLvl(uint c,float v,ref Guid g);
+        [PreserveSig] int SetChVolScalar(uint c,float v,ref Guid g);
+        void GetChLvl(uint c,out float v);
+        [PreserveSig] int GetChVolScalar(uint c,out float v);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)]bool m,ref Guid g);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)]out bool m);
+    }
+    public static string Get() {
+        CoInitializeEx(IntPtr.Zero,0);
+        try {
+            var clsid=_CLSID; var iid=_IID; IntPtr pv;
+            CoCreateInstance(ref clsid,IntPtr.Zero,1,ref iid,out pv);
+            var en=(IMMDeviceEnumerator)Marshal.GetObjectForIUnknown(pv);
+            IMMDevice dev; en.GetDefaultAudioEndpoint(0,1,out dev);
+            var vIid=new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+            object vo; dev.Activate(ref vIid,1,IntPtr.Zero,out vo);
+            var ev=(IAudioEndpointVolume)vo;
+            float lv; ev.GetMasterVolumeLevelScalar(out lv);
+            bool mt; ev.GetMute(out mt);
+            return string.Format("VOL:{0}|MUTE:{1}",(int)Math.Round(lv*100),mt);
+        } finally { CoUninitialize(); }
+    }
+}
+"@ -ErrorAction Stop
+Write-Output ([_AudioHelper]::Get())
+} catch { Write-Output "ERROR:$_" }
+"""
+
+
+def _exec_get_volume(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    # Write to a temp PS1 file — avoids all string-escaping issues with subprocess
+    ps1_path = "/mnt/c/Windows/Temp/_xyron_vol.ps1"
+    win_path = "C:\\Windows\\Temp\\_xyron_vol.ps1"
+    try:
+        Path(ps1_path).write_text(_GET_VOLUME_PS1)
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't write volume script.", error=str(exc))
+    ps = _find_powershell()
+    if not ps:
+        return ToolResult(success=False, text="PowerShell not found.", spoken="Couldn't read volume.")
+    try:
+        r = subprocess.run([ps, "-NonInteractive", "-NoProfile", "-File", win_path],
+                           capture_output=True, text=True, timeout=12, errors="ignore")
+        out = (r.stdout or "").strip()
+        if "VOL:" in out:
+            line  = [l for l in out.splitlines() if "VOL:" in l][-1]
+            parts = dict(p.split(":", 1) for p in line.split("|"))
+            vol   = int(parts.get("VOL", "0"))
+            muted = parts.get("MUTE", "False").strip().lower() == "true"
+            suffix = " and muted" if muted else ""
+            spoken = f"Volume is at {vol}%{suffix}."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"volume": vol, "muted": muted})
+        return ToolResult(success=False, text=out, spoken="Couldn't read volume.", error=out)
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Volume read failed.", error=str(exc))
+
+
+def _exec_mute_unmute(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    _ps(
+        'Add-Type -MemberDefinition \'[DllImport("user32.dll")] '
+        'public static extern void keybd_event(byte v,byte s,uint f,UIntPtr e);\' '
+        '-Name MUTKB -Namespace mutns -ErrorAction SilentlyContinue; '
+        'mutns.MUTKB.keybd_event(0xAD,0,0,[UIntPtr]::Zero); '
+        'Start-Sleep -Milliseconds 60; '
+        'mutns.MUTKB.keybd_event(0xAD,0,2,[UIntPtr]::Zero); Write-Output done',
+        timeout=8,
+    )
+    action = params.get("action", "toggle").lower()
+    spoken = "Muted." if action == "mute" else ("Unmuted." if action == "unmute" else "Audio toggled.")
+    return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": action})
+
+
+def _exec_list_audio_devices(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps(
+        "Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | "
+        "Where-Object {$_.Status -eq 'OK'} | "
+        "Select-Object FriendlyName | ConvertTo-Json -Compress"
+    )
+    if ok and out:
+        try:
+            import json as _j
+            items = _j.loads(out)
+            if isinstance(items, dict):
+                items = [items]
+            names = [i.get("FriendlyName", "?") for i in items]
+            spoken = f"{len(names)} audio device{'s' if len(names)!=1 else ''}: " + ", ".join(names) + "."
+            return ToolResult(success=True, text="\n".join(names), spoken=spoken, data={"devices": names})
+        except Exception:
+            return ToolResult(success=True, text=out, spoken="Here are your audio devices.", data={})
+    return ToolResult(success=False, text=out, spoken="Couldn't list audio devices.", error=out)
+
+
+def _exec_set_default_audio(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    name = params.get("name", "").strip()
+    if not name:
+        return ToolResult(success=False, text="name required.", spoken="Which audio device should I set as default?")
+    nircmd_candidates = [
+        "/mnt/c/Windows/nircmd.exe", "/mnt/c/nircmd.exe",
+        "/mnt/c/Program Files/NirCmd/nircmd.exe",
+        "/mnt/c/Users/Public/nircmd.exe",
+    ]
+    nircmd = next((p for p in nircmd_candidates if Path(p).exists()), None)
+    if nircmd:
+        subprocess.Popen([nircmd, "setdefaultsounddevice", name],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        spoken = f"Default audio set to {name}."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"device": name})
+    ok, out = _ps(
+        f'$d=Get-PnpDevice -Class AudioEndpoint | Where-Object {{$_.FriendlyName -like "*{name}*"}} | Select-Object -First 1; '
+        f'if($d){{Write-Output "FOUND:$($d.FriendlyName)"}}else{{Write-Output "NOTFOUND"}}'
+    )
+    if ok and out.startswith("FOUND:"):
+        found = out.replace("FOUND:", "").strip()
+        spoken = (f"Found '{found}' but switching default audio requires NirCmd. "
+                  "Drop nircmd.exe into C:\\Windows and it'll work next time.")
+        return ToolResult(success=False, text=spoken, spoken=spoken, error="nircmd not installed")
+    return ToolResult(success=False, text=out,
+                      spoken=f"No audio device matching '{name}' found.", error=out)
+
+
+# ── SYSTEM MAINTENANCE ────────────────────────────────────────────────────────
+
+def _exec_clear_clipboard(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps(
+        "Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; "
+        "[System.Windows.Forms.Clipboard]::Clear(); Write-Output done"
+    )
+    if ok:
+        spoken = "Clipboard cleared."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+    return ToolResult(success=False, text=out, spoken="Couldn't clear clipboard.", error=out)
+
+
+def _exec_get_uptime(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    try:
+        import psutil, time as _t
+        elapsed = _t.time() - psutil.boot_time()
+        days    = int(elapsed // 86400)
+        hours   = int((elapsed % 86400) // 3600)
+        mins    = int((elapsed % 3600) // 60)
+        if days:
+            spoken = f"The system has been running for {days} day{'s' if days!=1 else ''} and {hours} hour{'s' if hours!=1 else ''}."
+        else:
+            spoken = f"System uptime is {hours} hour{'s' if hours!=1 else ''} and {mins} minute{'s' if mins!=1 else ''}."
+        return ToolResult(success=True, text=spoken, spoken=spoken,
+                          data={"days": days, "hours": hours, "minutes": mins})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't get system uptime.", error=str(exc))
+
+
+def _exec_run_disk_cleanup(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="Disk Cleanup unavailable.")
+    try:
+        subprocess.Popen([cmd_exe, "/c", "start cleanmgr /d C:"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        spoken = "Disk Cleanup launched for C drive."
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={})
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't launch Disk Cleanup.", error=str(exc))
+
+
+def _exec_check_windows_updates(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    ok, out = _ps(
+        "try { "
+        "$s=(New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher(); "
+        "$r=$s.Search(\"IsInstalled=0 and Type='Software'\"); "
+        "$cnt=$r.Updates.Count; "
+        "$names=($r.Updates | ForEach-Object {$_.Title} | Select-Object -First 5) -join '||'; "
+        "Write-Output \"COUNT:$cnt|NAMES:$names\" "
+        "} catch { Write-Output \"ERROR:$_\" }",
+        timeout=60,
+    )
+    if ok and "COUNT:" in out:
+        try:
+            head, _, tail = out.partition("|NAMES:")
+            count  = int(head.replace("COUNT:", "").strip())
+            names  = [n.strip() for n in tail.split("||") if n.strip()]
+            if count == 0:
+                spoken = "Your system is up to date. No pending updates."
+            else:
+                spoken = f"{count} update{'s' if count!=1 else ''} available"
+                if names:
+                    spoken += ": " + ", ".join(names[:3])
+                    if count > 3:
+                        spoken += f" and {count-3} more"
+                spoken += "."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"pending": count, "updates": names})
+        except Exception:
+            pass
+    spoken = "Couldn't check updates. Windows Update service may be restricted."
+    return ToolResult(success=False, text=out, spoken=spoken, error=out)
+
+
+# =============================================================================
+# REGISTRY — register all 30 extended tools
+# =============================================================================
+
+registry.register(name="list_processes",
+    definition={"type":"function","function":{"name":"list_processes",
+        "description":"List running processes sorted by memory usage. Use for: 'what processes are running', 'task manager', 'what\\'s using RAM'.",
+        "parameters":{"type":"object","properties":{"top":{"type":"integer","description":"How many to return (default 15)"}},
+        "required":[]}}},
+    executor=_exec_list_processes, risk="low", category="system")
+
+registry.register(name="kill_process",
+    definition={"type":"function","function":{"name":"kill_process",
+        "description":"Force-kill a running process by name or PID. Use for: 'kill Chrome', 'stop Notepad', 'end process X'.",
+        "parameters":{"type":"object","properties":{
+            "name":{"type":"string","description":"Process name (e.g. 'chrome', 'notepad.exe')"},
+            "pid": {"type":"integer","description":"Process ID"}},
+        "required":[]}}},
+    executor=_exec_kill_process, risk="medium", category="system")
+
+registry.register(name="get_startup_apps",
+    definition={"type":"function","function":{"name":"get_startup_apps",
+        "description":"List programs that run on Windows startup. Use for: 'show startup apps', 'what starts on boot'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_startup_apps, risk="low", category="system")
+
+registry.register(name="disable_startup_app",
+    definition={"type":"function","function":{"name":"disable_startup_app",
+        "description":"Disable a program from running on startup. Use for: 'disable Spotify from startup', 'remove Teams from startup'.",
+        "parameters":{"type":"object","properties":{
+            "name":{"type":"string","description":"Exact startup entry name"}},
+        "required":["name"]}}},
+    executor=_exec_disable_startup_app, risk="medium", category="system")
+
+registry.register(name="set_display_resolution",
+    definition={"type":"function","function":{"name":"set_display_resolution",
+        "description":"Change the screen resolution. Use for: 'set resolution to 1920x1080', 'change resolution to 4K'.",
+        "parameters":{"type":"object","properties":{
+            "width": {"type":"integer","description":"Width in pixels"},
+            "height":{"type":"integer","description":"Height in pixels"}},
+        "required":["width","height"]}}},
+    executor=_exec_set_display_resolution, risk="low", category="system")
+
+registry.register(name="set_refresh_rate",
+    definition={"type":"function","function":{"name":"set_refresh_rate",
+        "description":"Change the monitor refresh rate. Use for: 'set refresh rate to 144hz', 'change to 60hz'.",
+        "parameters":{"type":"object","properties":{
+            "rate":{"type":"integer","description":"Refresh rate in Hz (e.g. 60, 120, 144, 165, 240)"}},
+        "required":["rate"]}}},
+    executor=_exec_set_refresh_rate, risk="low", category="system")
+
+registry.register(name="virtual_desktop_create",
+    definition={"type":"function","function":{"name":"virtual_desktop_create",
+        "description":"Create a new Windows virtual desktop (Win+Ctrl+D). Use for: 'create new desktop', 'new virtual desktop'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_virtual_desktop_create, risk="low", category="system")
+
+registry.register(name="virtual_desktop_switch",
+    definition={"type":"function","function":{"name":"virtual_desktop_switch",
+        "description":"Switch to next or previous virtual desktop. Use for: 'switch to next desktop', 'previous virtual desktop'.",
+        "parameters":{"type":"object","properties":{
+            "direction":{"type":"string","enum":["left","right"],"description":"left=previous, right=next"}},
+        "required":[]}}},
+    executor=_exec_virtual_desktop_switch, risk="low", category="system")
+
+registry.register(name="take_screenshot",
+    definition={"type":"function","function":{"name":"take_screenshot",
+        "description":"Capture a screenshot of the entire screen to a file. Use for: 'take a screenshot', 'capture the screen', 'screenshot'.",
+        "parameters":{"type":"object","properties":{
+            "path":{"type":"string","description":"Save path (optional, defaults to Public Pictures)"}},
+        "required":[]}}},
+    executor=_exec_take_screenshot, risk="low", category="system")
+
+registry.register(name="wifi_list",
+    definition={"type":"function","function":{"name":"wifi_list",
+        "description":"Scan and list available WiFi networks. Use for: 'show wifi', 'available networks', 'scan wifi'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_wifi_list, risk="low", category="system")
+
+registry.register(name="wifi_connect",
+    definition={"type":"function","function":{"name":"wifi_connect",
+        "description":"Connect to a WiFi network. Use for: 'connect to HomeWifi', 'join network X'.",
+        "parameters":{"type":"object","properties":{
+            "ssid":{"type":"string","description":"Network name (SSID)"}},
+        "required":["ssid"]}}},
+    executor=_exec_wifi_connect, risk="medium", category="system")
+
+registry.register(name="wifi_disconnect",
+    definition={"type":"function","function":{"name":"wifi_disconnect",
+        "description":"Disconnect from the current WiFi network. Use for: 'disconnect wifi', 'turn off wifi'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_wifi_disconnect, risk="low", category="system")
+
+registry.register(name="network_speed_test",
+    definition={"type":"function","function":{"name":"network_speed_test",
+        "description":"Test internet download speed. Use for: 'speed test', 'how fast is my internet', 'check internet speed'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_network_speed_test, risk="low", category="system")
+
+registry.register(name="get_ip_info",
+    definition={"type":"function","function":{"name":"get_ip_info",
+        "description":"Get local and public IP addresses. Use for: 'what\\'s my IP', 'show IP address', 'what\\'s my public IP'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_ip_info, risk="low", category="system")
+
+registry.register(name="flush_dns",
+    definition={"type":"function","function":{"name":"flush_dns",
+        "description":"Flush the Windows DNS cache. Use for: 'flush DNS', 'clear DNS cache', 'reset DNS'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_flush_dns, risk="low", category="system")
+
+registry.register(name="get_battery_status",
+    definition={"type":"function","function":{"name":"get_battery_status",
+        "description":"Get battery percentage, charging state, and time remaining. Use for: 'battery level', 'how\\'s my battery', 'is it charging'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_battery_status, risk="low", category="system")
+
+registry.register(name="set_power_plan",
+    definition={"type":"function","function":{"name":"set_power_plan",
+        "description":"Switch Windows power plan. Use for: 'switch to performance mode', 'enable power saver', 'balanced mode'.",
+        "parameters":{"type":"object","properties":{
+            "plan":{"type":"string","enum":["balanced","performance","high performance","power saver","saver"],
+                    "description":"Power plan name"}},
+        "required":["plan"]}}},
+    executor=_exec_set_power_plan, risk="low", category="system")
+
+registry.register(name="schedule_shutdown",
+    definition={"type":"function","function":{"name":"schedule_shutdown",
+        "description":"Schedule a shutdown after a set time. Use for: 'shutdown in 30 minutes', 'turn off in 2 hours'.",
+        "parameters":{"type":"object","properties":{
+            "minutes":{"type":"integer","description":"Minutes from now"},
+            "hours":  {"type":"integer","description":"Hours from now"}},
+        "required":[]}}},
+    executor=_exec_schedule_shutdown, risk="medium", category="system")
+
+registry.register(name="get_disk_usage",
+    definition={"type":"function","function":{"name":"get_disk_usage",
+        "description":"Get disk/storage usage for all drives. Use for: 'how much space do I have', 'disk usage', 'storage on E drive'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_disk_usage, risk="low", category="system")
+
+registry.register(name="empty_recycle_bin",
+    definition={"type":"function","function":{"name":"empty_recycle_bin",
+        "description":"Empty the Windows Recycle Bin. Use for: 'empty the trash', 'empty recycle bin', 'delete trash'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_empty_recycle_bin, risk="medium", category="system")
+
+registry.register(name="get_temp_files_size",
+    definition={"type":"function","function":{"name":"get_temp_files_size",
+        "description":"Check how much disk space temp files are using. Use for: 'how big is temp folder', 'temp files size'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_temp_files_size, risk="low", category="system")
+
+registry.register(name="clear_temp_files",
+    definition={"type":"function","function":{"name":"clear_temp_files",
+        "description":"Delete all files in the Windows temp folder. Use for: 'clear temp files', 'clean temp folder', 'delete junk'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_clear_temp_files, risk="medium", category="system")
+
+registry.register(name="get_volume",
+    definition={"type":"function","function":{"name":"get_volume",
+        "description":"Get the current system volume level and mute status. Use for: 'what\\'s the volume', 'current volume', 'is it muted'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_volume, risk="low", category="system")
+
+registry.register(name="mute_unmute",
+    definition={"type":"function","function":{"name":"mute_unmute",
+        "description":"Toggle, mute, or unmute system audio. Use for: 'mute audio', 'unmute', 'toggle mute'.",
+        "parameters":{"type":"object","properties":{
+            "action":{"type":"string","enum":["mute","unmute","toggle"],"description":"What to do (default toggle)"}},
+        "required":[]}}},
+    executor=_exec_mute_unmute, risk="low", category="system")
+
+registry.register(name="list_audio_devices",
+    definition={"type":"function","function":{"name":"list_audio_devices",
+        "description":"List available audio output/input devices. Use for: 'show audio devices', 'list speakers and headphones'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_list_audio_devices, risk="low", category="system")
+
+registry.register(name="set_default_audio",
+    definition={"type":"function","function":{"name":"set_default_audio",
+        "description":"Set the default audio output device. Use for: 'switch to headphones', 'use speakers as default', 'change audio output'.",
+        "parameters":{"type":"object","properties":{
+            "name":{"type":"string","description":"Partial device name (e.g. 'Headphones', 'Speakers', 'Realtek')"}},
+        "required":["name"]}}},
+    executor=_exec_set_default_audio, risk="low", category="system")
+
+registry.register(name="clear_clipboard",
+    definition={"type":"function","function":{"name":"clear_clipboard",
+        "description":"Clear the Windows clipboard contents. Use for: 'clear clipboard', 'wipe clipboard', 'empty clipboard'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_clear_clipboard, risk="low", category="system")
+
+registry.register(name="get_uptime",
+    definition={"type":"function","function":{"name":"get_uptime",
+        "description":"Get how long the system has been running since last boot. Use for: 'system uptime', 'how long has the PC been on'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_uptime, risk="low", category="system")
+
+registry.register(name="run_disk_cleanup",
+    definition={"type":"function","function":{"name":"run_disk_cleanup",
+        "description":"Launch the Windows Disk Cleanup utility for C drive. Use for: 'run disk cleanup', 'clean up disk', 'free up space'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_run_disk_cleanup, risk="low", category="system")
+
+registry.register(name="check_windows_updates",
+    definition={"type":"function","function":{"name":"check_windows_updates",
+        "description":"Check for pending Windows updates. Use for: 'check for updates', 'any Windows updates', 'is Windows up to date'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_check_windows_updates, risk="low", category="system")
+
+
+# ── WiFi panel ────────────────────────────────────────────────────────────────
+
+def _exec_open_wifi_panel(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't open WiFi panel.")
+    try:
+        subprocess.Popen([cmd_exe, "/c", "start ms-availablenetworks:"])
+        spoken = "Opening available WiFi networks."
+        _store_last_action(ctx, "open_wifi_panel", {}, spoken)
+        return ToolResult(success=True, text=spoken, spoken=spoken)
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't open WiFi panel.", error=str(exc))
+
+registry.register(name="open_wifi_panel",
+    definition={"type":"function","function":{"name":"open_wifi_panel",
+        "description":"Open the Windows WiFi available networks panel. Use for: 'show wifi networks', 'open wifi', 'show available wifi', 'nearby wifi', 'connect to wifi'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_open_wifi_panel, risk="low", category="system")
+
+
+# ── Smart open: search and open files/folders/videos/pictures by name ────────
+
+def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    """Find anything on the system by name and open it."""
+    query     = params.get("query", "").strip()
+    open_type = params.get("type", "any").lower()   # folder | file | video | image | any
+
+    if not query:
+        return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
+
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't open files on this system.")
+
+    # ── Fast path: check the file-system index first (<5ms) ──────────────────
+    try:
+        from api.services.fs_index import fs_index
+        if fs_index.is_ready:
+            _type_filter = "folder" if open_type == "folder" else (
+                "file" if open_type in ("file", "video", "image") else None
+            )
+            _hits = fs_index.search(query, type_filter=_type_filter, limit=3)
+            if _hits:
+                # Apply extension filter for video/image
+                VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+                IMAGE_EXTS_IDX = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
+                for _hit in _hits:
+                    if open_type == "video" and _hit.suffix.lower() not in VIDEO_EXTS_IDX:
+                        continue
+                    if open_type == "image" and _hit.suffix.lower() not in IMAGE_EXTS_IDX:
+                        continue
+                    # Found — open it directly (/mnt/e/foo → E:\foo)
+                    _p_str = str(_hit)
+                    _mnt_m = re.match(r'^/mnt/([a-z])/(.*)', _p_str)
+                    if _mnt_m:
+                        _win_path = _mnt_m.group(1).upper() + ":\\" + _mnt_m.group(2).replace("/", "\\")
+                    else:
+                        _win_path = _p_str
+                    subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    spoken = f"Opening {_hit.name}."
+                    return ToolResult(success=True, text=spoken, spoken=spoken,
+                                      data={"path": str(_hit), "source": "index"})
+    except Exception as _idx_exc:
+        import logging as _l
+        _l.getLogger(__name__).debug("fs_index fast-path skipped: %s", _idx_exc)
+    # ── Slow path: incremental find ───────────────────────────────────────────
+
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
+
+    # Search data drives first (D:, E:, F:, G:) — user content lives here.
+    # Then the user profile on C: (not all of C: — too large).
+    home_fs = _fs_path(_windows_home())
+    search_roots_fs = []
+    for drive in ("d", "e", "f", "g"):
+        mount = Path(f"/mnt/{drive}")
+        if mount.exists():
+            search_roots_fs.append(str(mount))
+    # User profile on C: (Desktop, Documents, Downloads, etc.)
+    if home_fs.exists():
+        search_roots_fs.append(str(home_fs))
+
+    # Incremental depth search — finds shallow matches first (prefers "IT Course" over
+    # deeply nested "course" folders inside project trees). Stops immediately on first hit.
+    _prune_names = [
+        "node_modules", ".git", "__pycache__", ".next", ".venv", "venv",
+        "AppData", "Windows", "ProgramData", "$RECYCLE.BIN",
+    ]
+    _type_clause = (
+        ["-type", "d"] if open_type == "folder" else
+        ["-type", "f"] if open_type in ("file", "video", "image") else []
+    )
+
+    def _prune_clause():
+        expr = ["("]
+        for i, name in enumerate(_prune_names):
+            if i > 0:
+                expr.append("-o")
+            expr += ["-name", name]
+        expr += [")", "-prune", "-o"]
+        return expr
+
+    found_path: Path | None = None
+    deadline = __import__("time").time() + 8
+
+    for max_depth in range(1, 9):
+        if __import__("time").time() > deadline:
+            break
+        find_cmd = (
+            ["find"] + search_roots_fs +
+            ["-maxdepth", str(max_depth)] +
+            _prune_clause() +
+            ["(", "-iname", f"*{query}*"] + _type_clause + ["-print", ")"]
+        )
+        proc = subprocess.Popen(
+            find_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, errors="replace",
+        )
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                p = Path(line)
+                if open_type == "video" and p.suffix.lower() not in VIDEO_EXTS:
+                    continue
+                if open_type == "image" and p.suffix.lower() not in IMAGE_EXTS:
+                    continue
+                found_path = p
+                proc.kill()
+                break
+            else:
+                proc.wait()
+        except Exception:
+            proc.kill()
+        if found_path:
+            break
+
+    if not found_path:
+        return ToolResult(
+            success=False, text=f"Nothing found matching '{query}'.",
+            spoken=f"I couldn't find anything named '{query}' on your system.",
+        )
+
+    # Convert WSL path → Windows path
+    win_target = (str(found_path)
+                  .replace("/mnt/c/", "C:\\")
+                  .replace("/mnt/d/", "D:\\")
+                  .replace("/mnt/e/", "E:\\")
+                  .replace("/mnt/f/", "F:\\")
+                  .replace("/mnt/g/", "G:\\")
+                  .replace("/", "\\"))
+
+    try:
+        subprocess.Popen([cmd_exe, "/c", f'start "" "{win_target}"'])
+        name = found_path.name
+        spoken = f"Opening {name}."
+        _store_last_action(ctx, "smart_open", params, spoken)
+        return ToolResult(success=True, text=f"Opened: {win_target}", spoken=spoken,
+                          action_path=win_target)
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Couldn't open that.", error=str(exc))
+
+registry.register(name="smart_open",
+    definition={"type":"function","function":{"name":"smart_open",
+        "description":"Search the user's system for a file, folder, video, or picture by name and open it. Use for: 'open my course folder', 'play that video', 'show that picture', 'open the Downloads folder', 'play the movie'.",
+        "parameters":{"type":"object","properties":{
+            "query":{"type":"string","description":"Name or partial name of the file/folder to find"},
+            "type":{"type":"string","enum":["folder","file","video","image","any"],"description":"Type to search for"}
+        },"required":["query"]}}},
+    executor=_exec_smart_open, risk="low", category="system")

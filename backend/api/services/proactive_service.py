@@ -92,6 +92,53 @@ class ProactiveService:
     def _check_all(self) -> None:
         self._check_break()
         self._check_meetings()
+        self._check_habit_suggestions()
+
+    def _check_habit_suggestions(self) -> None:
+        """Suggest tools the user typically uses at this hour, based on episodic memory."""
+        try:
+            from .episodic_memory import episodic_memory
+            import time as _time
+
+            hour = int(_time.strftime("%H"))
+            patterns = episodic_memory.tools_at_hour(hour)
+            if not patterns:
+                return
+
+            # Only suggest if the user has been active recently (last 5 min)
+            idle_minutes = (_time.time() - self._last_active) / 60
+            if idle_minutes > 5:
+                return
+
+            # Only suggest once per hour
+            last_hour_key = f"habit_{hour}"
+            now_ts = _time.time()
+            if getattr(self, "_last_habit_ts", {}).get(last_hour_key, 0) > now_ts - 3600:
+                return
+
+            # Find the top tool not in "boring" category
+            _boring = {"system_info", "system_health", "get_volume", "get_battery_status"}
+            top_tool = next((t for t in patterns if t not in _boring and patterns[t] >= 3), None)
+            if not top_tool:
+                return
+
+            _suggestions = {
+                "read_inbox":    "You usually check your inbox around this time — want me to open it?",
+                "get_summary":   "Want your daily summary? You usually check it around now.",
+                "take_screenshot": "Heads up — you often take screenshots at this hour. Need one?",
+                "search_web":    "You usually search the web around now. What are you looking for?",
+                "open_application": "Ready to start working? You usually launch apps around this time.",
+                "smart_open":    "You often open files around now. Want me to find something?",
+            }
+            msg = _suggestions.get(top_tool)
+            if msg:
+                if not hasattr(self, "_last_habit_ts"):
+                    self._last_habit_ts = {}
+                self._last_habit_ts[last_hour_key] = now_ts
+                self._emit(msg, category="habit", priority=8)
+        except Exception as exc:
+            import logging as _l
+            _l.getLogger(__name__).debug("Habit suggestion error: %s", exc)
 
     def _check_break(self) -> None:
         idle_minutes = (time.time() - self._last_active) / 60

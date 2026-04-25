@@ -945,6 +945,7 @@ export interface StreamCbs {
   onDone:               (fullText: string, source?: string) => void
   onError:              (msg: string) => void
   onAction?:            (actionUrl: string | null, actionApp: string | null, actionPath: string | null) => void
+  onToolAction?:        (tool: string, params: Record<string, unknown>, spoken: string) => void
   onConfirmRequired?:   (payload: ConfirmPayload) => void
   onFollowUp?:          (suggestion: string) => void
   onProfileSwitch?:     (profile: string, voice: string) => void
@@ -1033,6 +1034,7 @@ export async function streamAndSpeak(
           type: string; index?: number; text?: string
           full_text?: string; message?: string
           action_url?: string | null; action_app?: string | null; action_path?: string | null
+          tool?: string; params?: Record<string, unknown>; spoken?: string
           confirm_required?: boolean; confirm_tool?: string
           confirm_params?: Record<string, unknown>; confirm_prompt?: string
         }
@@ -1045,8 +1047,11 @@ export async function streamAndSpeak(
               params: ev.confirm_params ?? {},
               prompt: ev.confirm_prompt ?? 'Are you sure? Say yes to confirm or no to cancel.',
             })
+          } else if (ev.tool) {
+            // Named tool action — call execute-tool on the backend
+            cb.onToolAction?.(ev.tool, ev.params ?? {}, ev.spoken ?? '')
           } else {
-            // Tool executed server-side — handle side-effects in caller
+            // URL / app / path side-effect
             cb.onAction?.(ev.action_url ?? null, ev.action_app ?? null, ev.action_path ?? null)
           }
         } else if (ev.type === 'chunk' && ev.text) {  // eslint-disable-line

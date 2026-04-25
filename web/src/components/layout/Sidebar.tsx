@@ -12,6 +12,8 @@ import {
   GitBranch,
   Settings,
   ArrowLeft,
+  Clock,
+  BarChart2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { StatusDot } from '@/components/ui/StatusDot'
@@ -26,6 +28,8 @@ const navItems = [
   { href: '/app/activity', label: 'Activity', icon: Activity },
   { href: '/app/integrations', label: 'Integrations', icon: Puzzle },
   { href: '/app/workflows', label: 'Workflows', icon: GitBranch },
+  { href: '/app/history', label: 'History', icon: Clock },
+  { href: '/app/stats', label: 'Stats', icon: BarChart2 },
   { href: '/app/settings', label: 'Settings', icon: Settings },
 ]
 

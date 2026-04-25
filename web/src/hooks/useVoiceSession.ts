@@ -724,6 +724,13 @@ export function useVoiceSession() {
             // NO restart — user must tap mic
           },
 
+          onToolAction: (tool, params, _spoken) => {
+            fetch(`${API_BASE}/api/v1/system/execute-tool`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tool, params }),
+            }).catch(() => {})
+          },
+
           onAction: (actionUrl, actionApp, actionPath) => {
             if (actionUrl && typeof window !== 'undefined') window.open(actionUrl, '_blank', 'noopener')
             if (actionApp) {

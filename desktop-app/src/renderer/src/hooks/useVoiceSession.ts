@@ -899,8 +899,16 @@ async function _streamAndSpeak(
         } else if (ev.type === 'action') {
           const act = ev as {
             action_url?: string; action_app?: string; action_path?: string; url?: string
+            tool?: string; params?: Record<string, unknown>
           }
-          if (act.action_url || act.url) {
+          if (act.tool) {
+            // Named tool — execute server-side via execute-tool endpoint
+            console.log('[TOOL] stream action: execute-tool |', act.tool, act.params)
+            fetch(`${API_BASE}/api/v1/system/execute-tool`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tool: act.tool, params: act.params ?? {} }),
+            }).then(r => r.json()).then(res => console.log('[TOOL] execute-tool result:', res)).catch(() => {})
+          } else if (act.action_url || act.url) {
             openUrl((act.action_url || act.url)!)
           } else if (act.action_path) {
             console.log('[TOOL] stream action: open_directory | path:', act.action_path)

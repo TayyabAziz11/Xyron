@@ -481,6 +481,227 @@ _RESTART_RE   = re.compile(r'\b(?:restart|reboot)\b', re.IGNORECASE)
 _SLEEP_RE     = re.compile(r'\b(?:sleep|go\s+to\s+sleep|suspend|put\s+(?:the\s+)?(?:pc|computer|system)\s+to\s+sleep)\b', re.IGNORECASE)
 _HIBERNATE_RE = re.compile(r'\bhibernate\b', re.IGNORECASE)
 _LOCK_RE      = re.compile(r'\b(?:lock(?:\s+(?:the\s+)?(?:screen|computer|pc|system))?|lock\s+screen)\b', re.IGNORECASE)
+
+# ── Process management ────────────────────────────────────────────────────────
+_LIST_PROCS_RE = re.compile(
+    r'\b(?:(?:list|show|what(?:\'s|\s+are)?|display)\s+(?:(?:all|running|active)\s+)?(?:processes?|tasks?|apps?))'
+    r'|task\s*manager|what(?:\'s|\s+is)\s+(?:using|eating|consuming)\s+(?:my\s+)?(?:memory|ram|cpu)'
+    r'|top\s+processes?\b',
+    re.IGNORECASE,
+)
+_KILL_PROC_RE = re.compile(
+    r'\b(?:kill|stop|end|terminate|close|force(?:\s+quit)?)\s+(?:process\s+|task\s+)?'
+    r'(?P<proc>[A-Za-z0-9][A-Za-z0-9_\-\.\s]{0,40}?)(?:\s+process|\s+app|\s+task)?\s*$',
+    re.IGNORECASE,
+)
+_STARTUP_LIST_RE = re.compile(
+    r'\b(?:(?:show|list|what(?:\'s|\s+are)?|display)\s+(?:my\s+)?startup\s+(?:apps?|programs?|items?))'
+    r'|what\s+(?:apps?|programs?)\s+(?:run|start|launch)\s+(?:on\s+)?(?:startup|boot|start)'
+    r'|what\s+(?:runs?|starts?|launches?)\s+(?:on\s+)?(?:startup|boot|start)'
+    r'|(?:apps?|programs?)\s+(?:that\s+)?(?:run|start)\s+(?:on\s+)?(?:startup|boot)'
+    r'|startup\s+(?:apps?|programs?|items?)\b',
+    re.IGNORECASE,
+)
+_STARTUP_DISABLE_RE = re.compile(
+    r'\b(?:disable|remove|stop)\s+(?P<app>[A-Za-z0-9][A-Za-z0-9_\-\.\s]{0,50}?)'
+    r'\s+(?:from\s+)?(?:startup|boot|autostart|auto[- ]start)\b',
+    re.IGNORECASE,
+)
+
+# ── Display control ───────────────────────────────────────────────────────────
+_RESOLUTION_RE = re.compile(
+    r'\b(?:set|change|switch)\s+(?:the\s+)?(?:screen\s+|display\s+)?resolution\s+to\s+'
+    r'(?P<w>\d{3,4})\s*[xX×]\s*(?P<h>\d{3,4})'
+    r'|(?P<preset>1080p|720p|4k|2k|1440p|fhd|hd|uhd)\b',
+    re.IGNORECASE,
+)
+_REFRESH_RATE_RE = re.compile(
+    r'\b(?:set|change|switch)\s+(?:the\s+)?(?:monitor\s+|display\s+|screen\s+)?refresh\s+rate\s+to\s+'
+    r'(?P<rate>\d{2,3})\s*(?:hz|hertz)?\b'
+    r'|\b(?P<rate2>\d{2,3})\s*hz\s+(?:refresh\s+rate|mode)\b',
+    re.IGNORECASE,
+)
+_VDESK_CREATE_RE = re.compile(
+    r'\b(?:create|add|new|open)\s+(?:a\s+)?(?:new\s+)?virtual\s+desktop\b'
+    r'|\bnew\s+desktop\b',
+    re.IGNORECASE,
+)
+_VDESK_SWITCH_RE = re.compile(
+    r'\b(?:switch|go|move)\s+to\s+(?:the\s+)?(?P<dir>next|previous|prev|left|right)\s+(?:virtual\s+)?desktop\b'
+    r'|\b(?P<dir2>next|previous|prev)\s+desktop\b',
+    re.IGNORECASE,
+)
+_SCREENSHOT_RE = re.compile(
+    r'\b(?:take\s+(?:a\s+)?screenshot|capture\s+(?:the\s+)?(?:screen|screenshot)|screenshot(?:\s+this)?)\b',
+    re.IGNORECASE,
+)
+
+# ── Network / WiFi ────────────────────────────────────────────────────────────
+_WIFI_LIST_RE = re.compile(
+    r'\b(?:(?:show|list|scan|find|what(?:\'s|\s+are)?)\s+(?:available\s+)?(?:wifi|wi-fi|wireless)\s+(?:networks?|connections?|hotspots?)?)'
+    r'|available\s+(?:wifi|wi-fi|networks?)'
+    r'|(?:wifi|wi-fi)\s+(?:list|networks?|scan)\b'
+    r'|\b(?:show|find|get|list)\s+me\s+(?:(?:near(?:by|est)?|available|closest)\s+)?(?:wifi|wi-fi|wireless)\b'
+    r'|\b(?:wifi|wi-fi)\s+(?:near\s+me|nearby|around\s+here)\b',
+    re.IGNORECASE,
+)
+_WIFI_CONNECT_RE = re.compile(
+    r'\b(?:connect\s+to|join)\s+(?:wifi\s+|wi-fi\s+|network\s+)?["\']?(?P<ssid>[A-Za-z0-9][A-Za-z0-9_\-\.\s]{0,60}?)["\']?\s*$',
+    re.IGNORECASE,
+)
+_WIFI_DISCONNECT_RE = re.compile(
+    r'\b(?:disconnect|turn\s+off|disable)\s+(?:from\s+)?(?:wifi|wi-fi|wireless|the\s+network)\b'
+    r'|(?:wifi|wi-fi)\s+(?:off|disconnect)\b',
+    re.IGNORECASE,
+)
+_SPEED_TEST_RE = re.compile(
+    r'\b(?:(?:run|do|check|test)\s+(?:(?:a|my|the)\s+)?(?:internet\s+|network\s+)?speed\s*test)'
+    r'|(?:how\s+fast\s+is\s+(?:my\s+)?(?:internet|connection|wifi|wi-fi))'
+    r'|(?:internet|network|wifi|connection)\s+speed\b',
+    re.IGNORECASE,
+)
+_IP_INFO_RE = re.compile(
+    r'\b(?:what(?:\'s|\s+is)\s+my\s+(?:ip|ip\s+address|public\s+ip|local\s+ip))'
+    r'|(?:show|get|find)\s+(?:my\s+)?(?:ip|ip\s+address)'
+    r'|my\s+(?:ip|ip\s+address)\b',
+    re.IGNORECASE,
+)
+_FLUSH_DNS_RE = re.compile(
+    r'\b(?:flush|clear|reset|purge)\s+(?:the\s+)?dns(?:\s+cache)?\b'
+    r'|dns\s+(?:flush|reset|clear)\b',
+    re.IGNORECASE,
+)
+
+# ── Battery & power ───────────────────────────────────────────────────────────
+_BATTERY_RE = re.compile(
+    r'\b(?:(?:how(?:\'?s|\s+is)\s+(?:my\s+)?(?:battery|charge))'
+    r'|(?:battery\s+(?:level|status|percentage|life|percent|remaining|left|charge)?)'
+    r'|(?:(?:how\s+much|what(?:\'?s|\s+is))\s+(?:the\s+|my\s+)?battery)'
+    r'|(?:is\s+(?:my\s+)?(?:battery|laptop)\s+(?:charging|charged|full|low))'
+    r'|(?:my\s+battery))\b',
+    re.IGNORECASE,
+)
+_POWER_PLAN_RE = re.compile(
+    r'\b(?:(?:switch|change|set|enable|use|activate)\s+(?:to\s+)?'
+    r'(?P<plan>balanced|performance|high\s+performance|power\s+saver|saver|battery\s+saver)\s+(?:mode|plan)?)'
+    r'|(?P<plan2>balanced|performance|high\s+performance|power\s+saver|saver)\s+(?:power\s+)?(?:mode|plan)\b',
+    re.IGNORECASE,
+)
+_SCHED_SHUTDOWN_RE = re.compile(
+    r'\b(?:shutdown|shut\s*down|turn\s+off|power\s+off)\s+(?:the\s+(?:pc|computer|system)\s+)?'
+    r'in\s+(?P<n>\d+)\s+(?P<unit>minute|min|hour|hr)s?\b',
+    re.IGNORECASE,
+)
+
+# ── Storage / disk ────────────────────────────────────────────────────────────
+_DISK_USAGE_RE = re.compile(
+    r'\b(?:(?:how\s+much\s+(?:disk\s+|storage\s+)?(?:space|room))'
+    r'|(?:disk\s+(?:usage|space|storage))'
+    r'|(?:storage\s+(?:usage|space))'
+    r'|(?:(?:how\s+full|how\s+much)\s+(?:is\s+)?(?:\w+\s+)?drive)\b)',
+    re.IGNORECASE,
+)
+_RECYCLE_BIN_RE = re.compile(
+    r'\b(?:empty|clear|delete|clean)\s+(?:the\s+)?(?:recycle\s+bin|trash|recycling\s+bin)\b'
+    r'|(?:recycle\s+bin|trash)\s+(?:empty|clear)\b',
+    re.IGNORECASE,
+)
+_TEMP_SIZE_RE = re.compile(
+    r'\b(?:(?:how\s+(?:big|large|much)\s+(?:is\s+)?(?:the\s+)?temp(?:orary)?\s+(?:folder|files?|folder))'
+    r'|(?:temp(?:orary)?\s+files?\s+size)'
+    r'|(?:size\s+of\s+temp(?:orary)?\s+(?:folder|files?)))\b',
+    re.IGNORECASE,
+)
+_CLEAR_TEMP_RE = re.compile(
+    r'\b(?:(?:clear|clean\s+up?|delete|remove)\s+(?:(?:all\s+)?temp(?:orary)?\s+files?|junk\s+files?))'
+    r'|(?:clean\s+(?:up\s+)?(?:my\s+)?(?:temp|temporary|junk))\b',
+    re.IGNORECASE,
+)
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+_GET_VOLUME_RE = re.compile(
+    r'\b(?:what(?:\'s|\s+is)\s+(?:the\s+)?(?:current\s+)?(?:volume|sound\s+level))'
+    r'|(?:(?:current|how\s+(?:loud|quiet))\s+(?:is\s+(?:the\s+)?)?volume)'
+    r'|volume\s+level\b',
+    re.IGNORECASE,
+)
+_AUDIO_DEVICES_RE = re.compile(
+    r'\b(?:(?:list|show|what(?:\'s|\s+are)?|display)\s+(?:(?:all|my|available)\s+)?'
+    r'(?:audio|sound)\s+(?:devices?|outputs?|inputs?|speakers?|headphones?))'
+    r'|(?:audio|sound)\s+devices?\b',
+    re.IGNORECASE,
+)
+_SET_AUDIO_RE = re.compile(
+    r'\b(?:(?:set|switch|change|use)\s+(?:(?:default\s+)?(?:audio|sound)\s+(?:to|device\s+to)|to))\s+'
+    r'["\']?(?P<device>[A-Za-z0-9][A-Za-z0-9_\-\.\s]{0,60}?)["\']?\s*$'
+    r'|switch\s+(?:audio|sound|output)\s+to\s+(?P<device2>[A-Za-z0-9].{0,60}?)\s*$',
+    re.IGNORECASE,
+)
+
+# ── System maintenance ────────────────────────────────────────────────────────
+_CLEAR_CLIPBOARD_RE = re.compile(
+    r'\b(?:clear|wipe|empty|clean)\s+(?:(?:my\s+)?(?:the\s+)?)?clipboard\b',
+    re.IGNORECASE,
+)
+_UPTIME_RE = re.compile(
+    r'\b(?:(?:how\s+long\s+(?:has|have)\s+(?:the\s+)?(?:pc|computer|system|laptop)\s+been\s+(?:on|running|up))'
+    r'|(?:system\s+uptime|uptime)'
+    r'|(?:when\s+(?:was|did)\s+(?:the\s+)?(?:pc|computer|system)\s+(?:started?|booted?|turned\s+on)))\b',
+    re.IGNORECASE,
+)
+_DISK_CLEANUP_RE = re.compile(
+    r'\b(?:(?:run|open|launch|start)\s+(?:windows\s+)?disk\s+clean(?:up)?)'
+    r'|(?:free\s+up\s+(?:disk\s+)?space)'
+    r'|(?:clean\s+(?:up\s+(?:the\s+)?)?(?:disk|drive|c\s+drive))\b',
+    re.IGNORECASE,
+)
+_WIN_UPDATES_RE = re.compile(
+    r'\b(?:(?:check\s+(?:for\s+)?(?:windows\s+)?updates?)'
+    r'|(?:any\s+(?:windows\s+|pending\s+)?updates?)'
+    r'|(?:is\s+(?:windows|my\s+(?:pc|system))\s+(?:up\s+to\s+date|updated?))'
+    r'|windows\s+update)\b',
+    re.IGNORECASE,
+)
+
+# ── Smart open: play video / show picture / open named folder or file ─────────
+_PLAY_MEDIA_RE = re.compile(
+    r'\b(?:play|watch)\s+(?:the\s+|that\s+|my\s+|this\s+|a\s+)?(.+?)(?:\s+(?:video|movie|film|clip|song|music|audio))?\s*$',
+    re.IGNORECASE,
+)
+# Matches "open [my] IT course folder" — name comes BEFORE the word "folder"
+_OPEN_NAMED_FOLDER_SUFFIX_RE = re.compile(
+    r'\b(?:open|show(?:\s+me)?|go\s+to|navigate\s+to)\s+'
+    r'(?:(?:the|that|my|this)\s+)?'
+    r'(.+?)\s+folder\s*$',
+    re.IGNORECASE,
+)
+# Matches "open folder IT course" / "open folder named IT course" — name comes AFTER
+_OPEN_NAMED_FOLDER_PREFIX_RE = re.compile(
+    r'\b(?:open|show(?:\s+me)?|go\s+to|navigate\s+to)\s+'
+    r'(?:(?:the|that|my|this)\s+)?'
+    r'folder\s+(?:named\s+|called\s+)?'
+    r'(.+?)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _OPEN_NAMED_FOLDER_RE_match(text: str):
+    """Match both "open X folder" and "open folder X" patterns. Returns match or None."""
+    return _OPEN_NAMED_FOLDER_SUFFIX_RE.search(text) or _OPEN_NAMED_FOLDER_PREFIX_RE.search(text)
+
+
+# Keep the old name as a shim so existing callers that use .search() still work
+class _FolderRE:
+    def search(self, text: str):
+        return _OPEN_NAMED_FOLDER_RE_match(text)
+
+
+_OPEN_NAMED_FOLDER_RE = _FolderRE()
+_OPEN_NAMED_FILE_RE = re.compile(
+    r'\b(?:open|show(?:\s+me)?)\s+(?:the\s+|that\s+|my\s+|this\s+)?(.+?)\s+(?:picture|photo|image|pic|video|movie|film|clip|file|document|doc)\b',
+    re.IGNORECASE,
+)
+
 _SYS_CONFIRM_RE = re.compile(
     r'\b(?:yes|confirm|proceed|go\s+ahead|do\s+it|sure|okay|ok|yep|affirmative)\b',
     re.IGNORECASE,
@@ -503,6 +724,11 @@ _UNMUTE_RE = re.compile(
     r'\b(?:unmute|un\s*mute|turn\s+(?:the\s+)?(?:volume|sound|audio)\s+(?:back\s+)?on)\b',
     re.IGNORECASE,
 )
+_SET_VOLUME_RE = re.compile(
+    r'\b(?:set|put|change|make|increase|decrease|turn)\s+(?:the\s+)?(?:volume|sound)\s+(?:to|at)\s+(\d{1,3})\s*%?'
+    r'|\bvolume\s+(?:to|at)\s+(\d{1,3})\s*%?',
+    re.IGNORECASE,
+)
 
 # ── System control: brightness ────────────────────────────────────────────────
 _BRIGHTNESS_UP_RE   = re.compile(
@@ -511,6 +737,11 @@ _BRIGHTNESS_UP_RE   = re.compile(
 )
 _BRIGHTNESS_DOWN_RE = re.compile(
     r'\b(?:(?:turn\s+)?brightness\s+down|decrease\s+(?:the\s+)?brightness|dimmer?|lower\s+(?:the\s+)?(?:brightness|screen))\b',
+    re.IGNORECASE,
+)
+_SET_BRIGHTNESS_RE = re.compile(
+    r'\b(?:set|put|change|make|increase|decrease|turn)\s+(?:the\s+)?brightness\s+(?:to|at)\s+(\d{1,3})\s*%?'
+    r'|\bbrightness\s+(?:to|at)\s+(\d{1,3})\s*%?',
     re.IGNORECASE,
 )
 
@@ -584,7 +815,9 @@ _SYSTEM_INFO_KEYWORDS = frozenset([
     "tell my system", "tell me my system", "tell me about my",
     "my storage", "my ram", "my cpu", "my processor", "my memory",
     "my drives", "my drive", "my hard drive", "my ssd",
-    "what's my", "whats my", "show my", "check my system",
+    "what's my ram", "what's my cpu", "what's my storage", "what's my specs",
+    "whats my ram", "whats my cpu", "whats my storage", "whats my specs",
+    "show my", "check my system",
     "how is my computer", "how is my laptop", "how is my pc",
 ])
 
@@ -610,6 +843,16 @@ _SYSTEM_TOOL_NAMES = frozenset([
     "system_info", "system_health", "get_running_apps",
     "volume_control", "brightness_control",
     "shutdown_system", "restart_system", "sleep_system", "hibernate_system", "lock_system",
+    # extended tools
+    "list_processes", "kill_process", "get_startup_apps", "disable_startup_app",
+    "set_display_resolution", "set_refresh_rate", "virtual_desktop_create", "virtual_desktop_switch",
+    "take_screenshot",
+    "wifi_list", "wifi_connect", "wifi_disconnect", "network_speed_test", "get_ip_info", "flush_dns",
+    "get_battery_status", "set_power_plan", "schedule_shutdown",
+    "get_disk_usage", "empty_recycle_bin", "get_temp_files_size", "clear_temp_files",
+    "get_volume", "mute_unmute", "list_audio_devices", "set_default_audio",
+    "clear_clipboard", "get_uptime", "run_disk_cleanup", "check_windows_updates",
+    "open_wifi_panel", "smart_open",
 ])
 
 # Tools with pre-built spoken output — no GPT narration needed
@@ -621,7 +864,49 @@ _DIRECT_SPOKEN_TOOLS = frozenset({
     "kill_app", "open_system_settings",
     "volume_control", "brightness_control",
     "shutdown_system", "restart_system", "sleep_system", "hibernate_system", "lock_system",
+    # extended tools
+    "list_processes", "kill_process", "get_startup_apps", "disable_startup_app",
+    "set_display_resolution", "set_refresh_rate", "virtual_desktop_create", "virtual_desktop_switch",
+    "take_screenshot",
+    "wifi_list", "wifi_connect", "wifi_disconnect", "network_speed_test", "get_ip_info", "flush_dns",
+    "get_battery_status", "set_power_plan", "schedule_shutdown",
+    "get_disk_usage", "empty_recycle_bin", "get_temp_files_size", "clear_temp_files",
+    "get_volume", "mute_unmute", "list_audio_devices", "set_default_audio",
+    "clear_clipboard", "get_uptime", "run_disk_cleanup", "check_windows_updates",
+    "open_wifi_panel", "smart_open",
+    # file operations — spoken result is already clear
+    "delete_file", "move_file", "write_file", "search_files",
+    "open_url", "open_drive",
+    # desktop automation — result confirms the action
+    "desktop_click", "desktop_focus_app", "desktop_hotkey",
+    "desktop_scroll", "desktop_type", "desktop_screenshot",
+    # browser — result confirms navigation
+    "browser_navigate", "browser_click", "browser_fill",
+    "browser_close", "browser_screenshot",
+    # system info
+    "get_running_apps",
 })
+
+# ── Retry + fallback config ───────────────────────────────────────────────────
+
+# Tools that are safe to retry once on failure (idempotent or near-idempotent)
+_RETRYABLE_TOOLS: dict[str, bool] = {
+    "network_speed_test": True,
+    "wifi_list": True,
+    "get_ip_info": True,
+    "read_inbox": True,
+    "get_summary": True,
+    "search_web": True,
+    "open_url": True,
+}
+
+# Fallback: if tool X fails validation, try tool Y instead
+# Format: tool_name → (fallback_tool, params_transformer)
+_TOOL_FALLBACKS: dict[str, tuple] = {
+    "open_application": ("smart_open", lambda p: {"query": p.get("app_name", p.get("name", "")), "type": "file"}),
+    "open_file":        ("smart_open", lambda p: {"query": p.get("path", "").split("/")[-1].split("\\")[-1]}),
+    "open_directory":   ("smart_open", lambda p: {"query": p.get("path", "").split("/")[-1].split("\\")[-1], "type": "folder"}),
+}
 
 # ── Intent classification ─────────────────────────────────────────────────────
 
@@ -729,7 +1014,8 @@ _WIKI_RE = re.compile(
 
 # Guard phrases — these look like wiki queries but should go to GPT instead.
 _WIKI_EXCLUDE_RE = re.compile(
-    r'\b(?:weather|news|today|latest|current|price|stock|rate|bitcoin|crypto|my\s+name|your\s+name|you|time|date|doing|feel|think|want|need)\b',
+    r'\b(?:weather|news|today|latest|current|price|stock|rate|bitcoin|crypto|my\s+name|your\s+name|you|time|date|doing|feel|think|want|need'
+    r'|battery|charge|charging|wifi|volume|brightness|cpu|ram|disk|storage|uptime|ip\s+address|speed\s+test|my\s+(?:battery|volume|screen|laptop|pc|system|cpu|ram|disk))\b',
     re.IGNORECASE,
 )
 
@@ -982,7 +1268,10 @@ def _extract_subfolder_params(text: str, last_action: dict | None) -> dict:
     m_count = re.search(r'(?:create|make|add)\s+(\d+)\s+sub', text, re.IGNORECASE)
     count = int(m_count.group(1)) if m_count else 0
 
-    m_names = re.search(r'\b(?:named?|called)\s+(.+?)(?:\s+in\s+|\s*$)', text, re.IGNORECASE)
+    # "named X Y Z"  OR  "create subfolders X Y Z inside..."
+    m_names = re.search(r'\b(?:named?|called)\s+(.+?)(?:\s+in\s+|\s+inside\s+|\s*$)', text, re.IGNORECASE)
+    if not m_names:
+        m_names = re.search(r'\bsub\s*folders?\s+([A-Za-z0-9][A-Za-z0-9 ,]+?)(?:\s+in\s+|\s+inside\s+|\s+on\s+|\s*$)', text, re.IGNORECASE)
     names: list[str] = []
     if m_names:
         raw = m_names.group(1).strip()
@@ -1174,6 +1463,16 @@ async def respond_stream(body: _RespondStreamBody):
     _ensure_paths()
     turn_id = str(uuid.uuid4())
 
+    # Resolve vague pronouns ("it", "that", "the file") → concrete entity
+    # Must happen before _generate closure captures body, so body.text is clean.
+    try:
+        from ..services.context_resolver import resolve as _resolve_ctx
+        _resolved_text = _resolve_ctx(body.text, body.session_id or turn_id)
+        if _resolved_text != body.text:
+            body = body.model_copy(update={"text": _resolved_text})
+    except Exception:
+        pass
+
     async def _generate():  # noqa: C901
         try:
             from ..config import settings
@@ -1185,6 +1484,8 @@ async def respond_stream(body: _RespondStreamBody):
 
             from openai import AsyncOpenAI
             from ..services.memory_service import memory_service
+            from ..services.episodic_memory import episodic_memory as _epi_mem
+            from ..services.intent_router import intent_router as _intent_router
 
             client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -1199,12 +1500,30 @@ async def respond_stream(body: _RespondStreamBody):
             if mem_context:
                 system_content += f"\n\n{mem_context}"
 
+            # Inject usage habit context from episodic memory
+            try:
+                _activity = _epi_mem.summary_since(24)
+                _top_now = _epi_mem.top_tools_now(3)
+                if _activity and "No commands" not in _activity:
+                    system_content += f"\n\nUSER HABITS (last 24h): {_activity}"
+                if _top_now:
+                    system_content += f"\nTools likely needed now: {', '.join(_top_now)}"
+            except Exception:
+                pass
+
             # Build message list — use last 20 turns (up from 6)
             msgs: list[dict] = [{"role": "system", "content": system_content}]
             for t in body.history[-20:]:
                 if t.role in ("user", "assistant") and t.text.strip():
                     msgs.append({"role": t.role, "content": t.text})
             msgs.append({"role": "user", "content": body.text})
+
+            # ── Episodic memory: save this user turn ──────────────────────────
+            try:
+                _epi_mem.save(body.session_id or turn_id, "user", body.text)
+            except Exception:
+                pass
+
 
             # ── LAYER -1: Pure conversation bypass ────────────────────────────
             # Casual inputs (jokes, "haha", etc.) — no tool routing, straight to GPT.
@@ -1455,17 +1774,31 @@ async def respond_stream(body: _RespondStreamBody):
             if _SYS_CONFIRM_RE.search(body.text.strip()):
                 _last_sc = memory_service.get_last_action()
                 if _last_sc and _last_sc.get("tool") == "shutdown_pending":
+                    from api.tools import registry as _ereg2
+                    _ereg2.execute("shutdown_system", {"delay": 0}, {})
                     _spoken_sc = "Shutting down. Goodbye."
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _spoken_sc})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _spoken_sc})}\n\n"
-                    yield f"data: {json.dumps({'type': 'action', 'tool': 'shutdown_system', 'params': {}, 'spoken': 'Shutting down.'})}\n\n"
                     return
                 if _last_sc and _last_sc.get("tool") == "restart_pending":
+                    from api.tools import registry as _ereg2
+                    _ereg2.execute("restart_system", {"delay": 0}, {})
                     _spoken_sc = "Restarting now. See you soon."
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _spoken_sc})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _spoken_sc})}\n\n"
-                    yield f"data: {json.dumps({'type': 'action', 'tool': 'restart_system', 'params': {}, 'spoken': 'Restarting.'})}\n\n"
                     return
+
+            if _SCHED_SHUTDOWN_RE.search(body.text.strip()):
+                _scm  = _SCHED_SHUTDOWN_RE.search(body.text.strip())
+                _scn  = int(_scm.group("n"))
+                _scu  = _scm.group("unit").lower()
+                _scp  = {"hours": _scn, "minutes": 0} if _scu.startswith("h") else {"hours": 0, "minutes": _scn}
+                from api.tools import registry as _screg
+                _scr  = _screg.execute("schedule_shutdown", _scp, {})
+                _scs  = _scr.spoken or f"Shutdown scheduled in {_scn} {'hour' if _scu.startswith('h') else 'minute'}s."
+                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _scs})}\n\n"
+                yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _scs})}\n\n"
+                return
 
             if _SHUTDOWN_RE.search(body.text.strip()):
                 memory_service.set_last_action("shutdown_pending", {}, "awaiting_confirmation")
@@ -1483,26 +1816,39 @@ async def respond_stream(body: _RespondStreamBody):
                 yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'restart'})}\n\n"
                 return
 
-            # ── LAYER 0e8: Sleep / Hibernate / Lock (no confirmation needed) ──
+            # ── LAYER 0e8: Sleep / Hibernate / Lock — execute server-side directly ──
+            # These used to emit SSE action events (requiring frontend to call execute-tool).
+            # Now they run here so they work regardless of which frontend is used.
             if _LOCK_RE.search(body.text.strip()):
-                spoken_lk = "Screen locked."
+                from api.tools import registry as _ereg
+                _er = _ereg.execute("lock_system", {}, {})
+                spoken_lk = _er.spoken or "Screen locked."
                 yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': spoken_lk})}\n\n"
                 yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': spoken_lk})}\n\n"
-                yield f"data: {json.dumps({'type': 'action', 'tool': 'lock_system', 'params': {}, 'spoken': spoken_lk})}\n\n"
                 return
 
             if _HIBERNATE_RE.search(body.text.strip()):
-                spoken_hb = "Hibernating now. See you when you're back."
+                from api.tools import registry as _ereg
+                _er = _ereg.execute("hibernate_system", {}, {})
+                spoken_hb = _er.spoken or "Hibernating now. See you when you're back."
                 yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': spoken_hb})}\n\n"
                 yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': spoken_hb})}\n\n"
-                yield f"data: {json.dumps({'type': 'action', 'tool': 'hibernate_system', 'params': {}, 'spoken': spoken_hb})}\n\n"
                 return
 
             if _SLEEP_RE.search(body.text.strip()):
-                spoken_sl = "Going to sleep. Sweet dreams."
+                from api.tools import registry as _ereg
+                _er = _ereg.execute("sleep_system", {}, {})
+                spoken_sl = _er.spoken or "Going to sleep. Sweet dreams."
                 yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': spoken_sl})}\n\n"
                 yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': spoken_sl})}\n\n"
-                yield f"data: {json.dumps({'type': 'action', 'tool': 'sleep_system', 'params': {}, 'spoken': spoken_sl})}\n\n"
+                return
+
+            if _SCREENSHOT_RE.search(body.text.strip()):
+                from api.tools import registry as _sreg
+                _sr = _sreg.execute("take_screenshot", {}, {"openai_key": settings.openai_api_key})
+                _ss = _sr.spoken or "Screenshot saved."
+                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _ss})}\n\n"
+                yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _ss})}\n\n"
                 return
 
             # ── LAYER 0f: Voice macros (Feature #5) ───────────────────────────
@@ -1633,6 +1979,80 @@ async def respond_stream(body: _RespondStreamBody):
                     tool_params: dict     = {}
                     user_lower = body.text.lower().strip()
 
+                    # ── MULTI-COMMAND: split compound requests and execute each ─
+                    try:
+                        from ..services.command_splitter import split as _cmd_split
+                        _cmd_parts = _cmd_split(body.text)
+                        if len(_cmd_parts) >= 2:
+                            logger.info("[MULTI-CMD] split into %d parts: %s", len(_cmd_parts), _cmd_parts)
+                            _spoken_parts: list[str] = []
+                            for _part in _cmd_parts:
+                                _sub_body = body.model_copy(update={"text": _part})
+                                # Re-use intent router to find tool for each sub-command
+                                _sub_ir = _intent_router.route(_part)
+                                _sub_tool = _sub_ir.tool_name if _sub_ir.tier <= 3 else None
+                                _sub_params = _sub_ir.params if _sub_tool else {}
+                                if _sub_tool:
+                                    _sub_result = registry.execute(_sub_tool, _sub_params, ctx)
+                                    _sp = _sub_result.spoken or _sub_result.text or f"Done: {_part}"
+                                    _spoken_parts.append(_sp)
+                                    try:
+                                        _epi_mem.save(body.session_id or turn_id, "user", _part)
+                                        _epi_mem.save(body.session_id or turn_id, "assistant", _sp)
+                                        _epi_mem.record_tool(_sub_tool, _sub_params, _sub_result.success)
+                                    except Exception:
+                                        pass
+                                else:
+                                    _spoken_parts.append(f"I wasn't sure how to handle: {_part}")
+                            _combined = " ".join(_spoken_parts)
+                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _combined})}\n\n"
+                            yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _combined})}\n\n"
+                            return
+                    except Exception as _mce:
+                        logger.debug("Multi-command split skipped: %s", _mce)
+
+                    # ── LAYER -1: System commands that must beat workflows ────
+                    # WiFi system panel — beats google_maps workflow
+                    if _WIFI_LIST_RE.search(body.text):
+                        tool_name = "open_wifi_panel"
+                        logger.info("[ROUTE] open_wifi_panel (pre-workflow)")
+                    # "play X" without explicit "youtube/spotify/on" → local file
+                    elif _PLAY_MEDIA_RE.search(body.text) and not re.search(
+                        r'\b(?:youtube|spotify|netflix|on\s+youtube|on\s+spotify)\b', body.text, re.IGNORECASE
+                    ):
+                        _pm2 = _PLAY_MEDIA_RE.search(body.text)
+                        _q2  = (_pm2.group(1) or "").strip().rstrip(".,!?")
+                        if _q2:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _q2, "type": "video"}
+                            logger.info("[ROUTE] smart_open (video pre-workflow) → %r", _q2)
+                    elif _OPEN_NAMED_FOLDER_RE.search(body.text):
+                        _onf2 = _OPEN_NAMED_FOLDER_RE.search(body.text)
+                        _q2   = (_onf2.group(1) or "").strip()
+                        if _q2:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _q2, "type": "folder"}
+                            logger.info("[ROUTE] smart_open (folder pre-workflow) → %r", _q2)
+                    elif _OPEN_NAMED_FILE_RE.search(body.text):
+                        _of2  = _OPEN_NAMED_FILE_RE.search(body.text)
+                        _q2   = (_of2.group(1) or "").strip()
+                        _ft2  = _of2.group(0).split()[-1].lower()
+                        _tp2  = "image" if _ft2 in ("picture","photo","image","pic") else \
+                                "video" if _ft2 in ("video","movie","film","clip") else "file"
+                        if _q2:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _q2, "type": _tp2}
+                            logger.info("[ROUTE] smart_open (%s pre-workflow) → %r", _tp2, _q2)
+
+                    # ── IntentRouter Tier 1+2: cache + regex shortcut ─────────
+                    # High-confidence matches skip the full elif chain below.
+                    if not tool_name:
+                        _ir = _intent_router.route(body.text)
+                        if _ir.tier <= 2 and _ir.tool_name:
+                            tool_name   = _ir.tool_name
+                            tool_params = {**_ir.params, **tool_params}
+                            logger.info("[ROUTE] intent-router tier=%d → %s", _ir.tier, tool_name)
+
                     # ── LAYER 0: Workflow trigger (multi-step automation) ──────
                     # Matched FIRST — workflows are explicit multi-step intents
                     # e.g. "play X on youtube", "send email to John"
@@ -1643,7 +2063,7 @@ async def respond_stream(body: _RespondStreamBody):
                     except Exception:
                         pass
 
-                    if _wf_match:
+                    if _wf_match and not tool_name:
                         _wf, _wf_vars = _wf_match
                         tool_name   = "run_workflow"
                         tool_params = {"name": _wf["name"], "variables": _wf_vars}
@@ -1688,6 +2108,63 @@ async def respond_stream(body: _RespondStreamBody):
                                 tool_params = {"path": _folder_path}
                                 logger.info("[ROUTE] open_directory (last folder) → %r", _folder_path)
 
+                    # ── LAYER 0.9: Specific system queries before open_command ─
+                    elif _STARTUP_DISABLE_RE.search(body.text):
+                        _sd0 = _STARTUP_DISABLE_RE.search(body.text)
+                        _a0  = (_sd0.group("app") or "").strip()
+                        if _a0:
+                            tool_name   = "disable_startup_app"
+                            tool_params = {"name": _a0}
+                            logger.info("[ROUTE] disable_startup_app → %r", _a0)
+
+                    elif _STARTUP_LIST_RE.search(body.text):
+                        tool_name = "get_startup_apps"
+                        logger.info("[ROUTE] get_startup_apps")
+
+                    elif _DISK_CLEANUP_RE.search(body.text):
+                        tool_name = "run_disk_cleanup"
+                        logger.info("[ROUTE] run_disk_cleanup")
+
+                    elif _LIST_PROCS_RE.search(body.text):
+                        tool_name = "list_processes"
+                        logger.info("[ROUTE] list_processes")
+
+                    elif _KILL_PROC_RE.search(body.text):
+                        _k0 = _KILL_PROC_RE.search(body.text)
+                        _p0 = (_k0.group("proc") or "").strip().rstrip(".")
+                        if _p0:
+                            tool_name   = "kill_process"
+                            tool_params = {"name": _p0}
+                            logger.info("[ROUTE] kill_process → %r", _p0)
+
+                    # ── LAYER 0.95: Play media / open named folder|file ───────
+                    elif _PLAY_MEDIA_RE.search(body.text):
+                        _pm = _PLAY_MEDIA_RE.search(body.text)
+                        _q  = (_pm.group(1) or "").strip().rstrip(".,!?")
+                        if _q:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _q, "type": "video"}
+                            logger.info("[ROUTE] smart_open (video) → %r", _q)
+
+                    elif _OPEN_NAMED_FILE_RE.search(body.text):
+                        _of = _OPEN_NAMED_FILE_RE.search(body.text)
+                        _q  = (_of.group(1) or "").strip()
+                        _ft = _of.group(0).split()[-1].lower()
+                        _tp = "image" if _ft in ("picture","photo","image","pic") else \
+                              "video" if _ft in ("video","movie","film","clip") else "file"
+                        if _q:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _q, "type": _tp}
+                            logger.info("[ROUTE] smart_open (%s) → %r", _tp, _q)
+
+                    elif _OPEN_NAMED_FOLDER_RE.search(body.text):
+                        _onf = _OPEN_NAMED_FOLDER_RE.search(body.text)
+                        _q   = (_onf.group(1) or "").strip()
+                        if _q:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _q, "type": "folder"}
+                            logger.info("[ROUTE] smart_open (folder) → %r", _q)
+
                     # ── LAYER 1: Open/launch/start <app or path> ──────────────
                     elif _is_open_command(body.text):
                         drive_path = _extract_drive_path(body.text)
@@ -1696,11 +2173,30 @@ async def respond_stream(body: _RespondStreamBody):
                             tool_params = {"path": drive_path}
                             logger.info("[ROUTE] open_directory (drive) → %r", drive_path)
                         else:
-                            app = _extract_app_name(body.text)
-                            if app:
-                                tool_name   = "open_application"
-                                tool_params = {"app_name": app}
-                                logger.info("[ROUTE] open_application → %r", app)
+                            # Named folder/file check before generic app launch
+                            _m1_folder = _OPEN_NAMED_FOLDER_RE.search(body.text)
+                            _m1_file   = _OPEN_NAMED_FILE_RE.search(body.text)
+                            if _m1_folder:
+                                _q = (_m1_folder.group(1) or "").strip()
+                                if _q:
+                                    tool_name   = "smart_open"
+                                    tool_params = {"query": _q, "type": "folder"}
+                                    logger.info("[ROUTE] smart_open (folder L1) → %r", _q)
+                            elif _m1_file:
+                                _q  = (_m1_file.group(1) or "").strip()
+                                _ft = _m1_file.group(0).split()[-1].lower()
+                                _tp = "image" if _ft in ("picture","photo","image","pic") else \
+                                      "video" if _ft in ("video","movie","film","clip") else "file"
+                                if _q:
+                                    tool_name   = "smart_open"
+                                    tool_params = {"query": _q, "type": _tp}
+                                    logger.info("[ROUTE] smart_open (%s L1) → %r", _tp, _q)
+                            else:
+                                app = _extract_app_name(body.text)
+                                if app:
+                                    tool_name   = "open_application"
+                                    tool_params = {"app_name": app}
+                                    logger.info("[ROUTE] open_application → %r", app)
 
                     # ── LAYER 1b: Create folder ───────────────────────────────
                     elif _CREATE_FOLDER_RE.search(body.text) or _NAME_AND_CREATE_RE.search(body.text):
@@ -1752,6 +2248,59 @@ async def respond_stream(body: _RespondStreamBody):
                             tool_params = {"text": _click_text}
                             logger.info("[ROUTE] browser_click → %r", _click_text)
 
+                    # ── LAYER 1z: High-priority specific queries (before generic health/info) ─
+                    elif _DISK_USAGE_RE.search(body.text):
+                        tool_name = "get_disk_usage"
+                        logger.info("[ROUTE] get_disk_usage")
+
+                    elif _BATTERY_RE.search(body.text):
+                        tool_name = "get_battery_status"
+                        logger.info("[ROUTE] get_battery_status")
+
+                    elif _POWER_PLAN_RE.search(body.text):
+                        _ppm2 = _POWER_PLAN_RE.search(body.text)
+                        _plan2 = (_ppm2.group("plan") or _ppm2.group("plan2") or "balanced").strip().lower()
+                        _plan2 = re.sub(r'\s+', ' ', _plan2)
+                        tool_name   = "set_power_plan"
+                        tool_params = {"plan": _plan2}
+                        logger.info("[ROUTE] set_power_plan → %r", _plan2)
+
+                    elif _STARTUP_DISABLE_RE.search(body.text):
+                        _sdm2 = _STARTUP_DISABLE_RE.search(body.text)
+                        _app2 = (_sdm2.group("app") or "").strip()
+                        if _app2:
+                            tool_name   = "disable_startup_app"
+                            tool_params = {"name": _app2}
+                            logger.info("[ROUTE] disable_startup_app → %r", _app2)
+
+                    elif _STARTUP_LIST_RE.search(body.text):
+                        tool_name = "get_startup_apps"
+                        logger.info("[ROUTE] get_startup_apps")
+
+                    elif _DISK_CLEANUP_RE.search(body.text):
+                        tool_name = "run_disk_cleanup"
+                        logger.info("[ROUTE] run_disk_cleanup (priority)")
+
+                    elif _WIN_UPDATES_RE.search(body.text):
+                        tool_name = "check_windows_updates"
+                        logger.info("[ROUTE] check_windows_updates (priority)")
+
+                    elif _UPTIME_RE.search(body.text):
+                        tool_name = "get_uptime"
+                        logger.info("[ROUTE] get_uptime (priority)")
+
+                    elif _SPEED_TEST_RE.search(body.text):
+                        tool_name = "network_speed_test"
+                        logger.info("[ROUTE] network_speed_test (priority)")
+
+                    elif _IP_INFO_RE.search(body.text):
+                        tool_name = "get_ip_info"
+                        logger.info("[ROUTE] get_ip_info (priority 1z)")
+
+                    elif _GET_VOLUME_RE.search(body.text):
+                        tool_name = "get_volume"
+                        logger.info("[ROUTE] get_volume (priority 1z)")
+
                     # ── LAYER 2: System health (live usage) ───────────────────
                     elif _is_system_health_query(body.text):
                         tool_name = "system_health"
@@ -1777,6 +2326,19 @@ async def respond_stream(body: _RespondStreamBody):
                             tool_name   = "search_web"
                             tool_params = {"query": q}
                             logger.info("[ROUTE] search_web → %r", q)
+
+                    # ── LAYER 5a0: Volume / IP (must beat wiki) ───────────────
+                    elif _GET_VOLUME_RE.search(body.text):
+                        tool_name = "get_volume"
+                        logger.info("[ROUTE] get_volume (priority)")
+
+                    elif _IP_INFO_RE.search(body.text):
+                        tool_name = "get_ip_info"
+                        logger.info("[ROUTE] get_ip_info (priority)")
+
+                    elif _SPEED_TEST_RE.search(body.text):
+                        tool_name = "network_speed_test"
+                        logger.info("[ROUTE] network_speed_test (priority)")
 
                     # ── LAYER 5a: Wikipedia quick-facts ──────────────────────
                     elif _extract_wiki_topic(body.text):
@@ -1898,6 +2460,12 @@ async def respond_stream(body: _RespondStreamBody):
                             logger.warning("create_event param extraction failed: %s", gx2)
 
                     # ── LAYER 5i: Volume control ──────────────────────────────
+                    elif _SET_VOLUME_RE.search(body.text):
+                        _m = _SET_VOLUME_RE.search(body.text)
+                        _lvl = int(_m.group(1) or _m.group(2))
+                        tool_name   = "volume_control"
+                        tool_params = {"action": "set", "level": _lvl}
+                        logger.info("[ROUTE] volume_control → set %d", _lvl)
                     elif _UNMUTE_RE.search(body.text):
                         tool_name   = "volume_control"
                         tool_params = {"action": "unmute"}
@@ -1916,6 +2484,12 @@ async def respond_stream(body: _RespondStreamBody):
                         logger.info("[ROUTE] volume_control → down")
 
                     # ── LAYER 5j: Brightness control ──────────────────────────
+                    elif _SET_BRIGHTNESS_RE.search(body.text):
+                        _m = _SET_BRIGHTNESS_RE.search(body.text)
+                        _lvl = int(_m.group(1) or _m.group(2))
+                        tool_name   = "brightness_control"
+                        tool_params = {"action": "set", "level": _lvl}
+                        logger.info("[ROUTE] brightness_control → set %d", _lvl)
                     elif _BRIGHTNESS_UP_RE.search(body.text):
                         tool_name   = "brightness_control"
                         tool_params = {"action": "up", "delta": 20}
@@ -1924,6 +2498,176 @@ async def respond_stream(body: _RespondStreamBody):
                         tool_name   = "brightness_control"
                         tool_params = {"action": "down", "delta": 20}
                         logger.info("[ROUTE] brightness_control → down")
+
+                    # ── LAYER 5k: Process management ──────────────────────────
+                    elif _LIST_PROCS_RE.search(body.text):
+                        tool_name = "list_processes"
+                        logger.info("[ROUTE] list_processes")
+
+                    elif _KILL_PROC_RE.search(body.text):
+                        _km = _KILL_PROC_RE.search(body.text)
+                        _proc = (_km.group("proc") or "").strip().rstrip(".")
+                        if _proc:
+                            tool_name   = "kill_process"
+                            tool_params = {"name": _proc}
+                            logger.info("[ROUTE] kill_process → %r", _proc)
+
+                    elif _STARTUP_DISABLE_RE.search(body.text):
+                        _sdm = _STARTUP_DISABLE_RE.search(body.text)
+                        _app = (_sdm.group("app") or "").strip()
+                        if _app:
+                            tool_name   = "disable_startup_app"
+                            tool_params = {"name": _app}
+                            logger.info("[ROUTE] disable_startup_app → %r", _app)
+
+                    elif _STARTUP_LIST_RE.search(body.text):
+                        tool_name = "get_startup_apps"
+                        logger.info("[ROUTE] get_startup_apps")
+
+                    # ── LAYER 5l: Display control ──────────────────────────────
+                    elif _RESOLUTION_RE.search(body.text):
+                        _rm = _RESOLUTION_RE.search(body.text)
+                        if _rm.group("preset"):
+                            _preset_map = {
+                                "4k": (3840, 2160), "uhd": (3840, 2160),
+                                "2k": (2560, 1440), "1440p": (2560, 1440),
+                                "1080p": (1920, 1080), "fhd": (1920, 1080),
+                                "720p": (1280, 720), "hd": (1280, 720),
+                            }
+                            _w, _h = _preset_map.get(_rm.group("preset").lower(), (1920, 1080))
+                        else:
+                            _w, _h = int(_rm.group("w")), int(_rm.group("h"))
+                        tool_name   = "set_display_resolution"
+                        tool_params = {"width": _w, "height": _h}
+                        logger.info("[ROUTE] set_display_resolution → %dx%d", _w, _h)
+
+                    elif _REFRESH_RATE_RE.search(body.text):
+                        _rrm  = _REFRESH_RATE_RE.search(body.text)
+                        _rate = int(_rrm.group("rate") or _rrm.group("rate2") or 60)
+                        tool_name   = "set_refresh_rate"
+                        tool_params = {"rate": _rate}
+                        logger.info("[ROUTE] set_refresh_rate → %dHz", _rate)
+
+                    elif _VDESK_CREATE_RE.search(body.text):
+                        tool_name = "virtual_desktop_create"
+                        logger.info("[ROUTE] virtual_desktop_create")
+
+                    elif _VDESK_SWITCH_RE.search(body.text):
+                        _vsm = _VDESK_SWITCH_RE.search(body.text)
+                        _vdir_raw = (_vsm.group("dir") or _vsm.group("dir2") or "right").lower()
+                        _vdir = "left" if _vdir_raw in ("previous", "prev", "left") else "right"
+                        tool_name   = "virtual_desktop_switch"
+                        tool_params = {"direction": _vdir}
+                        logger.info("[ROUTE] virtual_desktop_switch → %s", _vdir)
+
+                    elif _SCREENSHOT_RE.search(body.text):
+                        tool_name = "take_screenshot"
+                        logger.info("[ROUTE] take_screenshot")
+
+                    # ── LAYER 5m: Network / WiFi ───────────────────────────────
+                    elif _WIFI_LIST_RE.search(body.text):
+                        tool_name = "open_wifi_panel"
+                        logger.info("[ROUTE] open_wifi_panel")
+
+                    elif _WIFI_CONNECT_RE.search(body.text):
+                        _wcm  = _WIFI_CONNECT_RE.search(body.text)
+                        _ssid = (_wcm.group("ssid") or "").strip()
+                        if _ssid:
+                            tool_name   = "wifi_connect"
+                            tool_params = {"ssid": _ssid}
+                            logger.info("[ROUTE] wifi_connect → %r", _ssid)
+
+                    elif _WIFI_DISCONNECT_RE.search(body.text):
+                        tool_name = "wifi_disconnect"
+                        logger.info("[ROUTE] wifi_disconnect")
+
+                    elif _SPEED_TEST_RE.search(body.text):
+                        tool_name = "network_speed_test"
+                        logger.info("[ROUTE] network_speed_test")
+
+                    elif _IP_INFO_RE.search(body.text):
+                        tool_name = "get_ip_info"
+                        logger.info("[ROUTE] get_ip_info")
+
+                    elif _FLUSH_DNS_RE.search(body.text):
+                        tool_name = "flush_dns"
+                        logger.info("[ROUTE] flush_dns")
+
+                    # ── LAYER 5n: Battery & power plans ───────────────────────
+                    elif _BATTERY_RE.search(body.text):
+                        tool_name = "get_battery_status"
+                        logger.info("[ROUTE] get_battery_status")
+
+                    elif _POWER_PLAN_RE.search(body.text):
+                        _ppm = _POWER_PLAN_RE.search(body.text)
+                        _plan = (_ppm.group("plan") or _ppm.group("plan2") or "balanced").strip().lower()
+                        _plan = re.sub(r'\s+', ' ', _plan)
+                        tool_name   = "set_power_plan"
+                        tool_params = {"plan": _plan}
+                        logger.info("[ROUTE] set_power_plan → %r", _plan)
+
+                    elif _SCHED_SHUTDOWN_RE.search(body.text):
+                        _ssm  = _SCHED_SHUTDOWN_RE.search(body.text)
+                        _n    = int(_ssm.group("n"))
+                        _unit = _ssm.group("unit").lower()
+                        if _unit.startswith("h"):
+                            tool_name   = "schedule_shutdown"
+                            tool_params = {"hours": _n, "minutes": 0}
+                        else:
+                            tool_name   = "schedule_shutdown"
+                            tool_params = {"hours": 0, "minutes": _n}
+                        logger.info("[ROUTE] schedule_shutdown → %r", tool_params)
+
+                    # ── LAYER 5o: Storage / disk ───────────────────────────────
+                    elif _DISK_USAGE_RE.search(body.text):
+                        tool_name = "get_disk_usage"
+                        logger.info("[ROUTE] get_disk_usage")
+
+                    elif _RECYCLE_BIN_RE.search(body.text):
+                        tool_name = "empty_recycle_bin"
+                        logger.info("[ROUTE] empty_recycle_bin")
+
+                    elif _TEMP_SIZE_RE.search(body.text):
+                        tool_name = "get_temp_files_size"
+                        logger.info("[ROUTE] get_temp_files_size")
+
+                    elif _CLEAR_TEMP_RE.search(body.text):
+                        tool_name = "clear_temp_files"
+                        logger.info("[ROUTE] clear_temp_files")
+
+                    # ── LAYER 5p: Audio ────────────────────────────────────────
+                    elif _GET_VOLUME_RE.search(body.text):
+                        tool_name = "get_volume"
+                        logger.info("[ROUTE] get_volume")
+
+                    elif _AUDIO_DEVICES_RE.search(body.text):
+                        tool_name = "list_audio_devices"
+                        logger.info("[ROUTE] list_audio_devices")
+
+                    elif _SET_AUDIO_RE.search(body.text):
+                        _sam = _SET_AUDIO_RE.search(body.text)
+                        _dev = (_sam.group("device") or _sam.group("device2") or "").strip()
+                        if _dev:
+                            tool_name   = "set_default_audio"
+                            tool_params = {"name": _dev}
+                            logger.info("[ROUTE] set_default_audio → %r", _dev)
+
+                    # ── LAYER 5q: System maintenance ───────────────────────────
+                    elif _CLEAR_CLIPBOARD_RE.search(body.text):
+                        tool_name = "clear_clipboard"
+                        logger.info("[ROUTE] clear_clipboard")
+
+                    elif _UPTIME_RE.search(body.text):
+                        tool_name = "get_uptime"
+                        logger.info("[ROUTE] get_uptime")
+
+                    elif _DISK_CLEANUP_RE.search(body.text):
+                        tool_name = "run_disk_cleanup"
+                        logger.info("[ROUTE] run_disk_cleanup")
+
+                    elif _WIN_UPDATES_RE.search(body.text):
+                        tool_name = "check_windows_updates"
+                        logger.info("[ROUTE] check_windows_updates")
 
                     # ── LAYER 5.5: Compound multi-step ("open X and then Y") ──
                     # Detected AFTER single-intent layers so simple commands
@@ -1962,6 +2706,40 @@ async def respond_stream(body: _RespondStreamBody):
                         except Exception as compound_exc:
                             logger.warning("Compound routing failed: %s", compound_exc)
 
+                    # ── IntentRouter Tier 3: semantic classifier ──────────────
+                    # Handles novel phrasings that regex missed, avoids LLM calls.
+                    if not tool_name and _intent_router.classifier_ready:
+                        _ir3 = _intent_router.route(body.text)
+                        if _ir3.tool_name and _ir3.confidence >= 0.65:
+                            tool_name   = _ir3.tool_name
+                            tool_params = _ir3.params
+                            logger.info("[ROUTE] intent-router tier=3 conf=%.2f → %s",
+                                        _ir3.confidence, tool_name)
+
+                    # ── Clarification flow: ambiguous short commands ──────────────
+                    # When no tool was resolved and the query looks like a system
+                    # command (not a question/conversation), offer 2–3 candidates
+                    # instead of falling through to pure GPT.
+                    if not tool_name and len(body.text.split()) <= 6:
+                        try:
+                            _cl_candidates = _intent_router.top_candidates(body.text, n=3)
+                            if _cl_candidates and _cl_candidates[0][1] >= 0.45:
+                                _opts = [t for t, _ in _cl_candidates if _ >= 0.40][:3]
+                                if len(_opts) >= 2:
+                                    _opt_labels = [t.replace("_", " ") for t in _opts]
+                                    _spoken_cl = (
+                                        f"I'm not sure what you mean. Did you want to: "
+                                        + ", or ".join(f"{i+1}) {l}" for i, l in enumerate(_opt_labels))
+                                        + "? Say the number or rephrase."
+                                    )
+                                    logger.info("[CLARIFY] ambiguous → %s", _opts)
+                                    yield f"data: {json.dumps({'type': 'clarify', 'turn_id': turn_id, 'options': _opts, 'text': _spoken_cl})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _spoken_cl})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _spoken_cl})}\n\n"
+                                    return
+                        except Exception:
+                            pass
+
                     if not tool_name and not (msgs and msgs[-1].get("content", "").startswith("I just completed")):
                         logger.info("[ROUTE] no tool → pure GPT stream")
 
@@ -1979,6 +2757,10 @@ async def respond_stream(body: _RespondStreamBody):
                         except Exception as rem_exc:
                             logger.warning("Reminder API call failed: %s", rem_exc)
                             spoken_r = "Got it — I'll remind you."
+                        try:
+                            _epi_mem.save(body.session_id or turn_id, "assistant", spoken_r)
+                        except Exception:
+                            pass
                         yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': spoken_r})}\n\n"
                         yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': spoken_r})}\n\n"
                         return
@@ -1986,10 +2768,52 @@ async def respond_stream(body: _RespondStreamBody):
                     if tool_name and tool_name in registry:
                         t_tool_start = __import__("time").perf_counter()
                         logger.info("[TOOL] executing %s params=%r", tool_name, tool_params)
+
+                        # Retry once on transient failure (network, subprocess timeout)
                         result = registry.execute(tool_name, tool_params, ctx)
+                        if not result.success and _RETRYABLE_TOOLS.get(tool_name):
+                            import time as _time
+                            _time.sleep(0.4)
+                            logger.info("[RETRY] %s attempt 2", tool_name)
+                            result = registry.execute(tool_name, tool_params, ctx)
+
                         t_tool_end = __import__("time").perf_counter()
                         logger.info("[EXEC] %s completed in %.0fms — result len=%d",
                                     tool_name, (t_tool_end - t_tool_start) * 1000, len(result.text or ""))
+
+                        # Execution validation: confirm real state change
+                        if result.success:
+                            try:
+                                from ..services.exec_validator import validate as _validate_exec
+                                from ..tools.registry import ToolResult as _ToolResult
+                                _v_ok, _v_detail = _validate_exec(tool_name, tool_params, result.text or "")
+                                if not _v_ok:
+                                    logger.warning("[VALID] %s failed: %s", tool_name, _v_detail)
+                                    _fb = _TOOL_FALLBACKS.get(tool_name)
+                                    if _fb:
+                                        _fb_tool, _fb_params_fn = _fb
+                                        _fb_params = _fb_params_fn(tool_params)
+                                        if _fb_tool in registry:
+                                            logger.info("[FALLBACK] %s → %s", tool_name, _fb_tool)
+                                            result = registry.execute(_fb_tool, _fb_params, ctx)
+                                    else:
+                                        # No fallback — report honestly rather than claim success
+                                        _fail_msg = f"I tried but the action didn't take effect. {_v_detail}"
+                                        result = _ToolResult(
+                                            success=False,
+                                            text=_fail_msg,
+                                            spoken=_fail_msg,
+                                        )
+                            except Exception:
+                                pass
+
+                        # Backfill tool_name + success onto the user turn saved earlier
+                        try:
+                            _epi_mem.update_last_tool(
+                                body.session_id or turn_id, tool_name, result.success
+                            )
+                        except Exception:
+                            pass
 
                         # Store spoken text as fallback if GPT narration fails
                         _tool_spoken = result.spoken or result.text or ""
@@ -1997,6 +2821,10 @@ async def respond_stream(body: _RespondStreamBody):
                         # If tool itself failed with a spoken message, return it directly
                         # (e.g. screen reading with no API key — avoid double GPT call)
                         if not result.success and _tool_spoken:
+                            try:
+                                _epi_mem.save(body.session_id or turn_id, "assistant", _tool_spoken)
+                            except Exception:
+                                pass
                             yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _tool_spoken})}\n\n"
                             yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _tool_spoken})}\n\n"
                             return
@@ -2005,6 +2833,10 @@ async def respond_stream(body: _RespondStreamBody):
                         # This fixes "AI stream unavailable" for system_info, create_folder,
                         # open commands, etc. — they work even without an OpenAI API key.
                         if result.success and _tool_spoken and tool_name in _DIRECT_SPOKEN_TOOLS:
+                            try:
+                                _epi_mem.save(body.session_id or turn_id, "assistant", _tool_spoken)
+                            except Exception:
+                                pass
                             yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _tool_spoken})}\n\n"
                             yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _tool_spoken})}\n\n"
                             return
@@ -2056,6 +2888,10 @@ async def respond_stream(body: _RespondStreamBody):
                 # GPT call failed (bad key, network, etc.) — fall back to tool spoken text
                 fallback_text = _tool_spoken if _tool_spoken else "I ran into an issue connecting to the AI. Please check your API key and try again."
                 logger.warning("GPT call failed, using fallback: %s", gpt_exc)
+                try:
+                    _epi_mem.save(body.session_id or turn_id, "assistant", fallback_text)
+                except Exception:
+                    pass
                 yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': fallback_text})}\n\n"
                 yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': fallback_text})}\n\n"
                 return
@@ -2132,6 +2968,22 @@ async def respond_stream(body: _RespondStreamBody):
                     memory_service.add_turn(body.session_id, body.text, full_text)
                 except Exception:
                     pass
+
+            # ── Episodic memory: persist assistant turn + teach intent cache ──
+            try:
+                _resolved_tool = locals().get("tool_name")
+                _epi_mem.save(
+                    body.session_id or turn_id, "assistant", full_text,
+                    tool_name=_resolved_tool,
+                    success=True,
+                )
+                # If LLM resolved to a tool, teach Tier 1 cache so next identical
+                # phrasing skips LLM entirely.
+                if _resolved_tool:
+                    _intent_router.confirm(body.text, _resolved_tool,
+                                           locals().get("tool_params") or {})
+            except Exception:
+                pass
 
             # ── Feature #2: Log to history ────────────────────────────────────
             try:
