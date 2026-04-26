@@ -570,6 +570,19 @@ class CommandService:
                 cmd.action_url = action_url
             if action_app is not None:
                 cmd.action_app = action_app
+        # Persist completed turn to SQLite outside the lock (avoids nested locking)
+        if status == CommandStatus.completed and assistant_response and cmd:
+            try:
+                from .sqlite_memory import record_turn
+                record_turn(
+                    session_id=command_id,
+                    user_text=cmd.text,
+                    assistant_text=assistant_response,
+                    tool_name=cmd.intent.agent if cmd.intent else None,
+                    success=True,
+                )
+            except Exception:
+                pass
         return cmd
 
 
