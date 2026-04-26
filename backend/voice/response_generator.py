@@ -120,12 +120,37 @@ def generate_assistant_response(
     Tries OpenAI for a natural reply first; falls back to per-agent templates.
     When a draft was created, appends the voice confirmation hint.
     """
+    spoken = _resolve_spoken_response(command_text, result, agent, skill, draft_id, action_hint, session_id)
+    # Persist turn to SQLite so conversation_context() returns real history
+    if session_id:
+        try:
+            import sys
+            from pathlib import Path
+            _br = Path(__file__).parent.parent
+            if str(_br) not in sys.path:
+                sys.path.insert(0, str(_br))
+            from api.services.sqlite_memory import record_turn
+            record_turn(session_id, command_text, spoken, tool_name=agent)
+        except Exception:
+            pass
+    return spoken
+
+
+def _resolve_spoken_response(
+    command_text: str,
+    result: str,
+    agent: str,
+    skill: str,
+    draft_id: Optional[str],
+    action_hint: str,
+    session_id: Optional[str],
+) -> str:
+    """Compute the spoken response text. Called exclusively by generate_assistant_response."""
     # When a draft was created, use a fixed template — cleaner than AI-generating
     if draft_id and action_hint:
         type_label = {"email": "email draft", "linkedin_post": "LinkedIn post",
                       "instagram": "Instagram post", "whatsapp": "WhatsApp message"}
         label = type_label.get(agent if agent != "confirm" else "", "draft")
-        # Determine label from action_hint context
         if action_hint == "send it":
             label = "email draft"
         elif action_hint == "post it":
