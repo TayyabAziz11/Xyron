@@ -53,6 +53,13 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup() -> None:
     _init_agent_registry()
+    # Pre-warm local Whisper model so first voice transcription has no cold-start delay
+    try:
+        import threading as _threading
+        from .routers.voice import _get_local_whisper_model as _warmup_whisper
+        _threading.Thread(target=_warmup_whisper, daemon=True, name="whisper-warmup").start()
+    except Exception:
+        pass
     # Start background services
     try:
         from .config import settings as _s

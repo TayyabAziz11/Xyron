@@ -79,6 +79,20 @@ def _clean_for_speech(text: str, max_chars: int = 300) -> str:
     return t.strip()
 
 
+# ── Whisper local model cache (avoids 2-3s cold-start on first transcription) ─
+_local_whisper_model = None
+
+
+def _get_local_whisper_model():
+    global _local_whisper_model
+    if _local_whisper_model is None:
+        from faster_whisper import WhisperModel
+        logger.info("Loading local Whisper 'base' model...")
+        _local_whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        logger.info("Local Whisper model ready.")
+    return _local_whisper_model
+
+
 # ── Transcription ─────────────────────────────────────────────────────────────
 
 @router.post("/transcribe")
@@ -154,15 +168,13 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
     # ── 2. faster-whisper local (optional) ───────────────────────────────────
     try:
-        from faster_whisper import WhisperModel  # noqa: PLC0415
-
         suffix = ".webm" if "webm" in (audio.content_type or "") else ".wav"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(audio_bytes)
             tmp_path = Path(tmp.name)
 
         try:
-            model = WhisperModel("base", device="cpu", compute_type="int8")
+            model = _get_local_whisper_model()
             segments, info = model.transcribe(
                 str(tmp_path),
                 beam_size=5,
@@ -1193,6 +1205,22 @@ _NAME_AND_CREATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Delete file/folder ───────────────────────────────────────────────────────
+_DELETE_FILE_RE = re.compile(
+    r'\b(?:delete|remove|erase)\s+(?:(?:the\s+)?(?:folder|directory|file|item)\s+)?'
+    r'(?P<target>[a-zA-Z0-9_\-\.\s]{1,120}?)(?:\s+(?:folder|directory|file))?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _extract_delete_target(text: str) -> str:
+    """Extract the file/folder name from a delete command."""
+    m = _DELETE_FILE_RE.search(text.strip())
+    if not m:
+        return ""
+    return (m.group("target") or "").strip().strip("'\"").strip()
+
+
 # Matches "inside <folder>", "in folder <name>", "under <folder>" for subfolder support
 _PARENT_FOLDER_RE = re.compile(
     r'\b(?:inside|in\s+(?:the\s+)?folder|under)\s+["\']?(?P<parent>[a-zA-Z0-9_\-\.]+)["\']?'
@@ -1787,6 +1815,15 @@ async def respond_stream(body: _RespondStreamBody):
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _spoken_sc})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _spoken_sc})}\n\n"
                     return
+                if _last_sc and _last_sc.get("tool") == "delete_pending":
+                    _del_path = _last_sc.get("params", {}).get("path", "")
+                    if _del_path:
+                        from api.tools import registry as _ereg2
+                        _del_result = _ereg2.execute("delete_file", {"path": _del_path, "confirmed": True}, {})
+                        _spoken_del = _del_result.spoken or f"Deleted {_del_path}."
+                        yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _spoken_del})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _spoken_del})}\n\n"
+                        return
 
             if _SCHED_SHUTDOWN_RE.search(body.text.strip()):
                 _scm  = _SCHED_SHUTDOWN_RE.search(body.text.strip())
@@ -1815,6 +1852,16 @@ async def respond_stream(body: _RespondStreamBody):
                 yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': confirm})}\n\n"
                 yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'restart'})}\n\n"
                 return
+
+            if _DELETE_FILE_RE.search(body.text.strip()) and not _SYS_CONFIRM_RE.search(body.text.strip()):
+                _del_target = _extract_delete_target(body.text.strip())
+                if _del_target:
+                    memory_service.set_last_action("delete_pending", {"path": _del_target}, "awaiting_confirmation")
+                    _del_confirm = f"I'm about to permanently delete '{_del_target}'. Say 'yes' to confirm or 'no' to cancel."
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_confirm})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_confirm})}\n\n"
+                    yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'delete', 'target': _del_target})}\n\n"
+                    return
 
             # ── LAYER 0e8: Sleep / Hibernate / Lock — execute server-side directly ──
             # These used to emit SSE action events (requiring frontend to call execute-tool).

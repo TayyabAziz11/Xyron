@@ -27,6 +27,8 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
     (["post it", "publish it", "go ahead", "yes confirm", "confirm it", "do it", "send it"], "confirm", "confirm_draft"),
     (["cancel it", "reject it", "don't send", "no cancel", "discard it", "never mind"], "cancel", "reject_draft"),
     # ── System / web actions ──────────────────────────────────────────────────
+    (["battery", "battery level", "battery status", "battery percentage", "how much battery",
+      "charging status", "is it charging", "is my battery"], "system", "battery_status"),
     (["search youtube", "youtube search", "find on youtube", "look up on youtube"], "system", "youtube_search"),
     (["play video", "play on youtube", "watch video", "watch on youtube"], "system", "youtube_play"),
     (["search google", "google search", "search the web", "search web", "look up", "google for"], "system", "google_search"),
@@ -103,6 +105,7 @@ def classify_intent_ai(text: str, openai_key: str) -> tuple[str, dict]:
     # ── Keyword fallback ──────────────────────────────────────────────────────
     kw_intent = classify_intent(text)
     _KW_TO_TOOL: dict[str, tuple[str, dict]] = {
+        "battery_status": ("get_battery_status", {}),
         "youtube_search": ("search_youtube",   {"query": text}),
         "youtube_play":   ("search_youtube",   {"query": text}),
         "google_search":  ("search_web",       {"query": text}),
