@@ -22,7 +22,11 @@ _SYSTEM_PROMPT = (
     "Always reply in English only. "
     "Be natural and conversational, like a helpful friend. "
     "Keep replies under 2 sentences for voice output. "
-    "Never use markdown, bullet points, or lists in your reply."
+    "Never use markdown, bullet points, or lists in your reply. "
+    "The user may speak in Urdu, Hindi, or Roman Urdu. "
+    "Always understand their intent and respond in English. "
+    "If they say 'setting on karo' understand they want to open settings. "
+    "Always interpret the meaning, never repeat back the raw command text."
 )
 
 # Keywords that signal the user is stating a personal fact worth remembering
@@ -31,10 +35,26 @@ _FACT_KEYWORDS = frozenset({
     "founder", "i'm a", "i work", "my name",
 })
 
+# Clearly Urdu-only words that signal a non-English AI response
+_ROMAN_NON_ENGLISH: frozenset[str] = frozenset({
+    "karo", "karein", "karna", "kiya", "kiye",
+    "hain",
+    "kya", "nahi", "nahin",
+    "aap", "tum", "mein", "mera", "meri", "tera", "teri",
+    "yeh", "woh", "yahan", "wahan",
+    "bhi", "aur", "lekin", "magar", "agar", "toh",
+    "theek", "accha", "shukriya", "meherbani",
+    "abhi", "zaroor", "bilkul", "seedha",
+    "pehle", "baad", "phir", "dobara",
+})
+
 
 def _is_non_english(text: str) -> bool:
-    """Return True if text contains non-Latin script characters (Arabic, Urdu, Hindi, etc.)."""
-    return any(ord(c) > 1000 for c in text)
+    """Return True if text contains non-Latin script or common Roman Urdu/Hindi words."""
+    if any(ord(c) > 1000 for c in text):
+        return True
+    words = set(text.lower().split())
+    return bool(words & _ROMAN_NON_ENGLISH)
 
 
 def _openai_spoken_response(command: str, result: str, agent: str, session_id: Optional[str] = None) -> Optional[str]:
@@ -92,10 +112,14 @@ def _openai_spoken_response(command: str, result: str, agent: str, session_id: O
         )
         reply = (resp.choices[0].message.content or "").strip().strip('"')
 
-        # English enforcement: re-request if non-Latin script detected
+        # English enforcement: re-request if non-Latin script or Roman Urdu/Hindi detected
         if reply and _is_non_english(reply):
             enforce_messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT + "\n\nIMPORTANT: Reply in English only."},
+                {"role": "system", "content": (
+                    _SYSTEM_PROMPT
+                    + "\n\nIMPORTANT: Your previous response may not have been in English. "
+                    "Respond ONLY in English. No Hindi, no Urdu, no Roman Urdu."
+                )},
                 {"role": "user", "content": user_content},
             ]
             resp2 = client.chat.completions.create(
