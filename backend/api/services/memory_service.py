@@ -188,10 +188,24 @@ class MemoryService:
         try:
             t = user_text.strip()
 
-            # User name
-            m = re.search(r"\bmy name is ([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", t, re.IGNORECASE)
+            # User name — English and Urdu/Hindi patterns
+            m = (
+                re.search(r"\bmy name is ([A-Za-z]+(?:\s+[A-Za-z]+)?)", t, re.IGNORECASE)
+                or re.search(r"\bmera\s+naam\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\s+hai\b", t, re.IGNORECASE)
+                or re.search(r"\bmain\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\s+h[uo]n\b", t, re.IGNORECASE)
+                or re.search(r"\bname(?:\s+is)?\s*[:\-]?\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)", t, re.IGNORECASE)
+            )
             if m:
                 self.set_fact("user_name", m.group(1).title())
+
+            # Founder / role
+            founder_m = re.search(
+                r"\b(?:i(?:\'m| am)(?: the)?\s+)?founder(?:\s+of)?\s+([A-Za-z][A-Za-z0-9\s]{2,40})",
+                t, re.IGNORECASE,
+            )
+            if founder_m:
+                self.set_fact("profession", "founder")
+                self.set_fact("employer", founder_m.group(1).strip().title()[:60])
 
             # Last mentioned contact (email / message target)
             m = re.search(

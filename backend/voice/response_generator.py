@@ -16,12 +16,20 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
-    "You are Xyron, a voice assistant. "
+    "You are Xyron, a voice AI assistant built by Tayyab Aziz. "
+    "You were NOT built by OpenAI — you use OpenAI APIs but Tayyab Aziz built you. "
+    "Never say you were created by OpenAI or any other company. "
     "Always reply in English only. "
     "Be natural and conversational, like a helpful friend. "
     "Keep replies under 2 sentences for voice output. "
     "Never use markdown, bullet points, or lists in your reply."
 )
+
+# Keywords that signal the user is stating a personal fact worth remembering
+_FACT_KEYWORDS = frozenset({
+    "remember", "naam", "name is", "i am", "main hun", "mera naam",
+    "founder", "i'm a", "i work", "my name",
+})
 
 
 def _is_non_english(text: str) -> bool:
@@ -121,6 +129,21 @@ def generate_assistant_response(
     When a draft was created, appends the voice confirmation hint.
     """
     spoken = _resolve_spoken_response(command_text, result, agent, skill, draft_id, action_hint, session_id)
+
+    # Auto-extract personal facts when the user states something memorable
+    cmd_lower = command_text.lower()
+    if any(kw in cmd_lower for kw in _FACT_KEYWORDS):
+        try:
+            import sys
+            from pathlib import Path
+            _br2 = Path(__file__).parent.parent
+            if str(_br2) not in sys.path:
+                sys.path.insert(0, str(_br2))
+            from api.services.memory_service import memory_service as _ms
+            _ms.remember_explicit(command_text)
+        except Exception:
+            pass
+
     # Persist turn to SQLite so conversation_context() returns real history
     if session_id:
         try:
