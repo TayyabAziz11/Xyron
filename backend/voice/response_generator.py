@@ -15,28 +15,91 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+_SYSTEM_PROMPT = (
+    "You are Xyron, a voice assistant. "
+    "Always reply in English only. "
+    "Be natural and conversational, like a helpful friend. "
+    "Keep replies under 2 sentences for voice output. "
+    "Never use markdown, bullet points, or lists in your reply."
+)
 
-def _openai_spoken_response(command: str, result: str, agent: str) -> Optional[str]:
-    """Use OpenAI to produce a natural 1-sentence spoken response."""
+
+def _is_non_english(text: str) -> bool:
+    """Return True if text contains non-Latin script characters (Arabic, Urdu, Hindi, etc.)."""
+    return any(ord(c) > 1000 for c in text)
+
+
+def _openai_spoken_response(command: str, result: str, agent: str, session_id: Optional[str] = None) -> Optional[str]:
+    """Use gpt-4o-mini to produce a natural conversational spoken response with memory context."""
     try:
         import sys
         from pathlib import Path
-        src = Path(__file__).parent.parent / "src"
-        if str(src) not in sys.path:
-            sys.path.insert(0, str(src))
-        from ai_operator.core.content_generator import ContentGenerator
-        gen = ContentGenerator()
-        # Strip markdown/noise from result before sending
+        backend_root = Path(__file__).parent.parent
+        if str(backend_root) not in sys.path:
+            sys.path.insert(0, str(backend_root))
+
+        from api.config import settings
+        key = settings.openai_api_key
+        if not key or not key.startswith("sk-"):
+            return None
+
+        from openai import OpenAI
+
+        # Inject long-term user facts into system prompt
+        system_prompt = _SYSTEM_PROMPT
+        try:
+            from api.services.memory_service import memory_service
+            ctx = memory_service.get_context_string()
+            if ctx:
+                system_prompt += f"\n\n{ctx}"
+        except Exception:
+            pass
+
+        # Episodic context: last 5 turns for this session
+        history: list[dict] = []
+        if session_id:
+            try:
+                from api.services.episodic_memory import episodic_memory
+                history = episodic_memory.conversation_context(session_id, n=5)
+            except Exception:
+                pass
+
         clean_result = re.sub(r'[\n\r]+', ' ', result or '')[:300]
-        prompt = (
+        user_content = (
             f"User said: '{command}'\n"
             f"Result: {clean_result}\n\n"
-            "Write a single natural spoken sentence (max 20 words) that an AI assistant "
-            "would say to summarise this result. No markdown. Sound friendly and concise."
+            "Summarise this result in 1-2 natural spoken sentences."
         )
-        reply = gen.chat(prompt, system_prompt="You write ultra-concise spoken AI assistant replies.", max_tokens=60)
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_content})
+
+        client = OpenAI(api_key=key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=80,
+            temperature=0.7,
+        )
+        reply = (resp.choices[0].message.content or "").strip().strip('"')
+
+        # English enforcement: re-request if non-Latin script detected
+        if reply and _is_non_english(reply):
+            enforce_messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT + "\n\nIMPORTANT: Reply in English only."},
+                {"role": "user", "content": user_content},
+            ]
+            resp2 = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=enforce_messages,
+                max_tokens=80,
+                temperature=0.3,
+            )
+            reply = (resp2.choices[0].message.content or "").strip().strip('"')
+
         if reply and len(reply) < 200:
-            return reply.strip().strip('"')
+            return reply
     except Exception as exc:
         logger.debug("OpenAI spoken response failed: %s", exc)
     return None
@@ -49,6 +112,7 @@ def generate_assistant_response(
     skill: str,
     draft_id: Optional[str] = None,
     action_hint: str = "",
+    session_id: Optional[str] = None,
 ) -> str:
     """
     Produce a short, spoken-friendly response for the command result.
@@ -74,7 +138,7 @@ def generate_assistant_response(
         return clean[:120] if clean else "Done."
 
     # Try OpenAI for a natural spoken reply
-    ai_reply = _openai_spoken_response(command_text, result, agent)
+    ai_reply = _openai_spoken_response(command_text, result, agent, session_id)
     if ai_reply:
         return ai_reply
 
