@@ -36,6 +36,7 @@ _FACT_KEYWORDS = frozenset({
 })
 
 # Clearly Urdu-only words that signal a non-English AI response
+# (ambiguous English words like "the", "tha", "thi", "hai", "mat", "wo" excluded)
 _ROMAN_NON_ENGLISH: frozenset[str] = frozenset({
     "karo", "karein", "karna", "kiya", "kiye",
     "hain",
