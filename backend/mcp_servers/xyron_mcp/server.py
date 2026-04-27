@@ -252,7 +252,8 @@ def handle_smart_open(args: Dict) -> str:
     target = args.get("target", "").strip()
     if not target:
         return json.dumps({"success": False, "error": "target is required"})
-    result = _post("/api/v1/system/execute-tool", {"tool": "smart_open", "params": {"target": target}})
+    # smart_open registry tool uses "query", not "target"
+    result = _post("/api/v1/system/execute-tool", {"tool": "smart_open", "params": {"query": target}})
     return json.dumps(result, ensure_ascii=False)
 
 
