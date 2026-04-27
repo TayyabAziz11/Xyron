@@ -1143,8 +1143,27 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
 
     fs = _fs_path(win_path)
     if not fs.exists():
-        return ToolResult(success=False, text=f"Not found: {win_path}",
-                          spoken=f"I couldn't find {fs.name}. Does it exist?")
+        # Bare name with no path separators — search common locations
+        if not any(c in raw for c in ('\\', '/', ':')):
+            special = _get_win_special()
+            search_bases = [
+                _windows_home(),
+                special.get("desktop", ""),
+                special.get("documents", ""),
+                special.get("downloads", ""),
+            ]
+            for base in search_bases:
+                if not base:
+                    continue
+                candidate_win = base.rstrip("\\") + "\\" + raw
+                candidate_fs  = _fs_path(candidate_win)
+                if candidate_fs.exists():
+                    fs       = candidate_fs
+                    win_path = candidate_win
+                    break
+        if not fs.exists():
+            return ToolResult(success=False, text=f"Not found: {win_path}",
+                              spoken=f"I couldn't find '{raw}'. Does it exist?")
 
     # Safety gate — must be explicitly confirmed before deletion
     if not confirmed:
@@ -2301,28 +2320,50 @@ def _exec_flush_dns(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
 # ── BATTERY & POWER PLANS ─────────────────────────────────────────────────────
 
 def _exec_get_battery_status(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    # Try psutil first (works natively on Windows and some Linux kernels)
     try:
         import psutil
         bat = psutil.sensors_battery()
-        if bat is None:
-            return ToolResult(success=False, text="No battery.",
-                              spoken="No battery detected. This machine is likely desktop or always plugged in.")
-        pct      = round(bat.percent, 1)
-        charging = bat.power_plugged
-        secs     = bat.secsleft if bat.secsleft and bat.secsleft > 0 else None
-        if charging:
-            status = "charging"
-            time_str = (f", fully charged in about {secs//3600}h {(secs%3600)//60}m"
-                        if secs else "")
-        else:
-            status = "discharging"
-            time_str = (f", roughly {secs//3600}h {(secs%3600)//60}m remaining"
-                        if secs else "")
-        spoken = f"Battery is at {pct}% and {status}{time_str}."
-        return ToolResult(success=True, text=spoken, spoken=spoken,
-                          data={"percent": pct, "charging": charging, "secs_left": secs})
+        if bat is not None:
+            pct      = round(bat.percent, 1)
+            charging = bat.power_plugged
+            secs     = bat.secsleft if bat.secsleft and bat.secsleft > 0 else None
+            if charging:
+                status   = "charging"
+                time_str = (f", fully charged in about {secs//3600}h {(secs%3600)//60}m"
+                            if secs else "")
+            else:
+                status   = "discharging"
+                time_str = (f", roughly {secs//3600}h {(secs%3600)//60}m remaining"
+                            if secs else "")
+            spoken = f"Battery is at {pct}% and {status}{time_str}."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"percent": pct, "charging": charging, "secs_left": secs})
+    except Exception:
+        pass
+
+    # PowerShell fallback (required on WSL2 where psutil returns None)
+    try:
+        ps_cmd = (
+            "$b = Get-CimInstance Win32_Battery -ErrorAction Stop; "
+            "if ($b) { '{0}|{1}' -f $b.EstimatedChargeRemaining, $b.BatteryStatus } "
+            "else { 'none' }"
+        )
+        ok, out = _ps(ps_cmd, timeout=8)
+        out = out.strip()
+        if ok and out and out != "none":
+            pct_str, status_code = out.split("|", 1)
+            pct      = float(pct_str.strip())
+            charging = int(status_code.strip()) == 2
+            status   = "charging" if charging else "discharging"
+            spoken   = f"Battery is at {round(pct)}% and {status}."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"percent": pct, "charging": charging})
+        return ToolResult(success=False, text="No battery detected.",
+                          spoken="No battery detected — this machine may not have one.")
     except Exception as exc:
-        return ToolResult(success=False, text=str(exc), spoken="Couldn't read battery status.", error=str(exc))
+        return ToolResult(success=False, text=str(exc),
+                          spoken="Couldn't read battery status.", error=str(exc))
 
 
 _POWER_PLAN_GUIDS: Dict[str, str] = {
@@ -2633,6 +2674,24 @@ def _exec_clear_clipboard(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolRe
     return ToolResult(success=False, text=out, spoken="Couldn't clear clipboard.", error=out)
 
 
+def _exec_get_date_time(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    """Return current local date and time from Windows (correct timezone)."""
+    try:
+        ok, out = _ps("Get-Date -Format 'dddd, MMMM d, yyyy h:mm tt'", timeout=5)
+        if ok and out.strip():
+            spoken = f"It's {out.strip()}."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"datetime": out.strip()})
+    except Exception:
+        pass
+    # Pure-Python fallback (may be UTC in WSL2 but better than nothing)
+    from datetime import datetime as _dt
+    now    = _dt.now()
+    spoken = f"It's {now.strftime('%A, %B %-d, %Y at %I:%M %p')}."
+    return ToolResult(success=True, text=spoken, spoken=spoken,
+                      data={"datetime": now.isoformat()})
+
+
 def _exec_get_uptime(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     try:
         import psutil, time as _t
@@ -2806,6 +2865,12 @@ registry.register(name="flush_dns",
         "description":"Flush the Windows DNS cache. Use for: 'flush DNS', 'clear DNS cache', 'reset DNS'.",
         "parameters":{"type":"object","properties":{},"required":[]}}},
     executor=_exec_flush_dns, risk="low", category="system")
+
+registry.register(name="get_date_time",
+    definition={"type":"function","function":{"name":"get_date_time",
+        "description":"Get the current local date and time. Use for: 'what time is it', 'what's the date', 'what day is it today'.",
+        "parameters":{"type":"object","properties":{},"required":[]}}},
+    executor=_exec_get_date_time, risk="low", category="system")
 
 registry.register(name="get_battery_status",
     definition={"type":"function","function":{"name":"get_battery_status",

@@ -584,6 +584,18 @@ _FLUSH_DNS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Date / time ──────────────────────────────────────────────────────────────
+_DATE_TIME_RE = re.compile(
+    r'\b(?:what(?:\'?s|\s+is)\s+(?:the\s+)?(?:current\s+)?(?:time|date|day)'
+    r'|what\s+(?:time|date|day)\s+is\s+it'
+    r'|(?:tell\s+me\s+(?:the\s+)?(?:time|date|day))'
+    r'|(?:current\s+(?:time|date|day))'
+    r'|(?:today(?:\'?s)?\s+date)'
+    r'|(?:what\s+day\s+(?:is\s+(?:it|today)))'
+    r'|whats\s+the\s+(?:time|date))\b',
+    re.IGNORECASE,
+)
+
 # ── Battery & power ───────────────────────────────────────────────────────────
 _BATTERY_RE = re.compile(
     r'\b(?:(?:how(?:\'?s|\s+is)\s+(?:my\s+)?(?:battery|charge))'
@@ -2300,6 +2312,10 @@ async def respond_stream(body: _RespondStreamBody):
                         tool_name = "get_disk_usage"
                         logger.info("[ROUTE] get_disk_usage")
 
+                    elif _DATE_TIME_RE.search(body.text):
+                        tool_name = "get_date_time"
+                        logger.info("[ROUTE] get_date_time")
+
                     elif _BATTERY_RE.search(body.text):
                         tool_name = "get_battery_status"
                         logger.info("[ROUTE] get_battery_status")
@@ -2640,7 +2656,11 @@ async def respond_stream(body: _RespondStreamBody):
                         tool_name = "flush_dns"
                         logger.info("[ROUTE] flush_dns")
 
-                    # ── LAYER 5n: Battery & power plans ───────────────────────
+                    # ── LAYER 5n: Date/time, battery & power plans ────────────
+                    elif _DATE_TIME_RE.search(body.text):
+                        tool_name = "get_date_time"
+                        logger.info("[ROUTE] get_date_time")
+
                     elif _BATTERY_RE.search(body.text):
                         tool_name = "get_battery_status"
                         logger.info("[ROUTE] get_battery_status")
