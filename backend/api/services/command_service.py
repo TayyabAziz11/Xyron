@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..schemas.command import Command, CommandIntent, CommandStatus
+from ..constants.prompts import CORE_IDENTITY
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,7 @@ def _run_general_skill(text: str) -> str:
     ai = _openai_chat(
         prompt=text,
         system=(
-            "You are Xyron — a professional AI voice assistant for business productivity. "
+            CORE_IDENTITY + "\n\n"
             "Answer the user's request concisely and helpfully. "
             "If you can't do something, say so clearly and suggest an alternative. "
             "Keep responses under 100 words. Speak naturally, no markdown."

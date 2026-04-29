@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict
 
 from .registry import ToolResult, registry
+from ..constants.prompts import CORE_IDENTITY
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +110,7 @@ def _exec_general_query(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResu
         except Exception:
             pass
 
-        system = (
-            "You are Xyron — a professional voice AI assistant."
-            "Answer in 1-3 concise sentences. No markdown."
-        )
+        system = CORE_IDENTITY + "\nAnswer in 1-3 concise sentences. No markdown."
         if mem_ctx:
             system += f"\n\n{mem_ctx}"
 
