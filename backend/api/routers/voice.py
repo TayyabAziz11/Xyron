@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from ..constants.prompts import CORE_IDENTITY
 
 router = APIRouter(prefix="/api/v1/voice", tags=["voice"])
 logger = logging.getLogger(__name__)
@@ -801,6 +802,7 @@ _OLLAMA_URL = "http://localhost:11434/api/generate"
 _OLLAMA_MODEL = "llama3"
 
 _VOICE_SYSTEM_PROMPT = (
+    CORE_IDENTITY + "\n\n"
     "You are Xyron — a sharp, warm voice assistant. Think of yourself as a smart friend who happens to know everything. "
     "You talk like a real person: natural, relaxed, occasionally a touch of humour. Never stiff, never robotic. "
     "\n\nHOW TO RESPOND:"
@@ -961,6 +963,7 @@ def _is_pure_conversation(text: str) -> bool:
 
 
 _CONV_SYSTEM_PROMPT = (
+    CORE_IDENTITY + "\n\n"
     "You are Xyron, a witty and warm AI friend. The user is having casual conversation — "
     "no tasks, just chat. Respond naturally, warmly, with light humour when fitting. "
     "Keep it short: 1-2 sentences max. Be spontaneous and genuine. No markdown, no preamble."

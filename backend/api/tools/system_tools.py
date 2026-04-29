@@ -21,8 +21,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import shutil
+
 from .registry import ToolResult, registry
 from .safety import is_safe_path, is_safe_write
+from utils.path_utils import safe_path, wsl_to_win
 
 logger = logging.getLogger(__name__)
 
@@ -375,16 +378,20 @@ def _exec_create_folder(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResu
     name = re.sub(r'[<>:"|?*]', "", name)
 
     base_path  = resolve_path(base_raw) if base_raw else _windows_home()
-    # Build Windows-style path without os.path.join (which uses / on Linux/WSL)
-    win_target = base_path.rstrip('\\').rstrip('/') + '\\' + name
+    # Build the Windows target path; use the WSL-safe fs path for actual creation
+    win_target = base_path.rstrip('\\').rstrip('/') + '\\' + name.replace('/', '\\')
 
     if not is_safe_path(win_target):
         return ToolResult(success=False, text=f"Cannot create folder here: {win_target}",
                           spoken="That location is restricted for safety.", error="Blocked path")
 
     fs_target = _fs_path(win_target)
+    wsl_target = safe_path(str(fs_target))
     try:
-        fs_target.mkdir(parents=True, exist_ok=True)
+        os.makedirs(wsl_target, exist_ok=True)
+        if not os.path.exists(wsl_target):
+            return ToolResult(success=False, text=f"Creation failed: {wsl_target}",
+                              spoken="Couldn't create the folder.", error="mkdir succeeded but path missing")
         _store_last_action(ctx, "create_folder", params, win_target)
         # Auto-open the newly created folder in Explorer
         ok_open, _ = _open_in_explorer(win_target)
@@ -422,15 +429,18 @@ def _exec_create_subfolders(params: Dict[str, Any], ctx: Dict[str, Any]) -> Tool
 
     created: list[str] = []
     failed:  list[str] = []
+    parent_wsl = safe_path(str(_fs_path(parent_path)))
     for name in names[:20]:
         name = re.sub(r'[<>:"|?*]', "", name).strip()
         if not name:
             continue
-        target = os.path.join(parent_path, name)
-        fs_target = _fs_path(target)
+        wsl_target = parent_wsl.rstrip('/') + '/' + name
         try:
-            fs_target.mkdir(parents=True, exist_ok=True)
-            created.append(name)
+            os.makedirs(wsl_target, exist_ok=True)
+            if os.path.exists(wsl_target):
+                created.append(name)
+            else:
+                failed.append(name)
         except Exception:
             failed.append(name)
 
@@ -1127,11 +1137,10 @@ def _exec_move_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
         return ToolResult(success=False, text=str(exc), spoken="Couldn't move the file.", error=str(exc))
 
 
-# ── Delete file (requires confirmation_confirmed=True in params) ───────────────
+# ── Delete file ───────────────────────────────────────────────────────────────
 
 def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    raw       = params.get("path", "").strip()
-    confirmed = params.get("confirmed", False)
+    raw = params.get("path", "").strip()
 
     if not raw:
         return ToolResult(success=False, text="File path required.", spoken="Which file should I delete?")
@@ -1165,30 +1174,17 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
             return ToolResult(success=False, text=f"Not found: {win_path}",
                               spoken=f"I couldn't find '{raw}'. Does it exist?")
 
-    # Safety gate — must be explicitly confirmed before deletion
-    if not confirmed:
-        prompt = f"I'm about to permanently delete {fs.name}. Say yes to confirm or no to cancel."
-        return ToolResult(
-            success=False,
-            text=f"CONFIRM_REQUIRED: delete {win_path}",
-            spoken=prompt,
-            data={
-                "requires_confirmation": True,
-                "path": win_path,
-                "name": fs.name,
-                "tool": "delete_file",
-                "params": {"path": raw},
-                "prompt": prompt,
-            },
-            error="confirm_required",
-        )
-
+    wsl_path = safe_path(str(fs))
     try:
         if fs.is_dir():
-            import shutil
-            shutil.rmtree(fs)
+            shutil.rmtree(wsl_path)
         else:
-            fs.unlink()
+            os.remove(wsl_path)
+        # Verify deletion actually happened
+        if os.path.exists(wsl_path):
+            return ToolResult(success=False, text=f"Delete failed — still exists: {wsl_path}",
+                              spoken=f"Couldn't delete {fs.name}, it still exists.",
+                              error="path still exists after delete")
         return ToolResult(success=True, text=f"Deleted: {win_path}",
                           spoken=f"Deleted {fs.name}.",
                           data={"path": win_path, "deleted": True})
@@ -1485,12 +1481,18 @@ registry.register(
         "type": "function",
         "function": {
             "name": "create_folder",
-            "description": "Create a new folder/directory. Use for: 'create folder called X in Y'.",
+            "description": (
+                "Create a new folder/directory. Use for: 'create folder X', 'make a folder called X on Y'. "
+                "Extract ONLY the folder name — not the full sentence. "
+                "Examples: 'create folder TestXyron on Desktop' → name='TestXyron', path='Desktop'; "
+                "'make a folder called Projects in D drive' → name='Projects', path='D:\\\\'; "
+                "'create folder Reports' → name='Reports', path omitted (defaults to Desktop)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Folder name to create"},
-                    "path": {"type": "string", "description": "Parent directory path (e.g. 'E:\\\\' or 'Desktop'). Defaults to user home."},
+                    "name": {"type": "string", "description": "Folder name only — a single word or short phrase, NOT the full sentence."},
+                    "path": {"type": "string", "description": "Parent directory (e.g. 'Desktop', 'D:\\\\', 'E:\\\\Projects'). Defaults to Desktop."},
                 },
                 "required": ["name"],
             },
@@ -1801,12 +1803,17 @@ registry.register(
         "type": "function",
         "function": {
             "name": "delete_file",
-            "description": "Permanently delete a file or folder. ALWAYS requires voice confirmation before executing. Use when user says 'delete X', 'remove X file'.",
+            "description": (
+                "Permanently delete a file or folder. Use when user says 'delete X', 'remove X', 'delete folder X'. "
+                "Extract ONLY the file/folder name or path — not the full sentence. "
+                "Examples: 'delete TestXyron' → path='TestXyron'; "
+                "'delete the folder on Desktop named Projects' → path='Desktop\\\\Projects'; "
+                "'remove file report.txt from Downloads' → path='Downloads\\\\report.txt'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path":      {"type": "string", "description": "Path to delete"},
-                    "confirmed": {"type": "boolean", "description": "Must be true to actually delete — set only after user voice-confirms"},
+                    "path": {"type": "string", "description": "File or folder name/path to delete. Extract only the name, not the full sentence."},
                 },
                 "required": ["path"],
             },
