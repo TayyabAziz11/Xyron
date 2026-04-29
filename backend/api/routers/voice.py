@@ -1230,10 +1230,25 @@ _DELETE_FILE_RE = re.compile(
 
 def _extract_delete_target(text: str) -> str:
     """Extract the file/folder name from a delete command."""
-    m = _DELETE_FILE_RE.search(text.strip())
+    # 1. Handle "named X" / "with name X" / "name is X" / "called X" patterns
+    m_named = re.search(
+        r'\b(?:named?|with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+|name\s+is\s+)'
+        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
+        r'(?=\s+(?:in|on|at|inside|and)|$)',
+        text, re.IGNORECASE,
+    )
+    if m_named:
+        return m_named.group(1).strip().strip("'\"").strip()
+    # 2. Standard "delete <type> <name>" — stop at prepositions
+    m = re.search(
+        r'\b(?:delete|remove|erase)\s+(?:(?:the\s+)?(?:folder|directory|file|item)\s+)?'
+        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|from)|$)',
+        text.strip(), re.IGNORECASE,
+    )
     if not m:
         return ""
-    return (m.group("target") or "").strip().strip("'\"").strip()
+    return (m.group(1) or "").strip().strip("'\"").strip()
 
 
 # Matches "inside <folder>", "in folder <name>", "under <folder>" for subfolder support
@@ -1294,9 +1309,11 @@ def _extract_folder_name(text: str) -> str:
         candidate = m2.group(1).strip()
         if candidate.lower() not in ("new", "a", "the", "this", "some", "my"):
             return _clean_folder_name(candidate)
-    # 4. "create folder GAMES" — word immediately after 'folder'
+    # 4. "create folder GAMES" or "create folder Test Xyron" — words after 'folder', stop at preposition
     m3 = re.search(
-        r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?',
+        r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+["\']?'
+        r'([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|for\s+me)|$)',
         text, re.IGNORECASE,
     )
     if m3:
@@ -1871,11 +1888,11 @@ async def respond_stream(body: _RespondStreamBody):
             if _DELETE_FILE_RE.search(body.text.strip()) and not _SYS_CONFIRM_RE.search(body.text.strip()):
                 _del_target = _extract_delete_target(body.text.strip())
                 if _del_target:
-                    memory_service.set_last_action("delete_pending", {"path": _del_target}, "awaiting_confirmation")
-                    _del_confirm = f"I'm about to permanently delete '{_del_target}'. Say 'yes' to confirm or 'no' to cancel."
-                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_confirm})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_confirm})}\n\n"
-                    yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'delete', 'target': _del_target})}\n\n"
+                    from api.tools import registry as _del_reg
+                    _del_res    = _del_reg.execute("delete_file", {"path": _del_target}, {})
+                    _del_spoken = _del_res.spoken or f"Deleted {_del_target}."
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_spoken})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_spoken})}\n\n"
                     return
 
             # ── LAYER 0e8: Sleep / Hibernate / Lock — execute server-side directly ──
