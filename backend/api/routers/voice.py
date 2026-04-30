@@ -1923,7 +1923,12 @@ async def respond_stream(body: _RespondStreamBody):
                 _del_target = _extract_delete_target(body.text.strip())
                 if _del_target:
                     from api.tools import registry as _del_reg
-                    _del_res    = _del_reg.execute("delete_file", {"path": _del_target}, {})
+                    _del_loc  = _extract_folder_location(body.text.strip())
+                    if _del_loc:
+                        _del_path = _del_loc.rstrip("\\") + "\\" + _del_target
+                    else:
+                        _del_path = _del_target
+                    _del_res    = _del_reg.execute("delete_file", {"path": _del_path}, {})
                     _del_spoken = _del_res.spoken or f"Deleted {_del_target}."
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_spoken})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_spoken})}\n\n"
