@@ -835,7 +835,7 @@ _SYSTEM_INFO_KEYWORDS = frozenset([
     "how much ram", "how much memory", "how much storage",
     "what cpu", "which cpu", "what processor", "which processor",
     "hardware", "specifications", "storage left", "space left",
-    "drive space", "c drive", "d drive", "e drive", "disk usage",
+    "drive space", "c drive space", "d drive space", "e drive space", "disk usage",
     "storage info", "system details", "computer info", "laptop info",
     # Broader patterns
     "tell my system", "tell me my system", "tell me about my",
@@ -1230,11 +1230,12 @@ _DELETE_FILE_RE = re.compile(
 
 def _extract_delete_target(text: str) -> str:
     """Extract the file/folder name from a delete command."""
-    # 1. Handle "named X" / "with name X" / "name is X" / "called X" patterns
+    # 1. Handle "name is X" / "name as X" / "named X" / "called X" — specific patterns first
     m_named = re.search(
-        r'\b(?:named?|with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+|name\s+is\s+)'
-        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
-        r'(?=\s+(?:in|on|at|inside|and)|$)',
+        r'\b(?:name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
+        r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+)'
+        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?'
+        r'(?=\s+(?:in|on|at|inside|and)|\Z)',
         text, re.IGNORECASE,
     )
     if m_named:
@@ -1296,6 +1297,16 @@ def _extract_folder_name(text: str) -> str:
     m = _FOLDER_NAME_EXPLICIT_RE.search(text)
     if m:
         return _clean_folder_name(m.group("name").strip())
+    # 1b. "name is X" / "name as X" / "named as X" / "called X" — specific first
+    m_nas = re.search(
+        r'\b(?:name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
+        r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+)'
+        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|for)|\Z)',
+        text, re.IGNORECASE,
+    )
+    if m_nas:
+        return m_nas.group(1).strip()
     # 2. Combined "name it X and create it in Y"
     m_nac = _NAME_AND_CREATE_RE.search(text)
     if m_nac:
@@ -1310,9 +1321,11 @@ def _extract_folder_name(text: str) -> str:
         if candidate.lower() not in ("new", "a", "the", "this", "some", "my"):
             return _clean_folder_name(candidate)
     # 4. "create folder GAMES" or "create folder Test Xyron" — words after 'folder', stop at preposition
+    # Negative lookahead skips if a preposition immediately follows 'folder' (name not here)
     m3 = re.search(
-        r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+["\']?'
-        r'([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
+        r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+'
+        r'(?!(?:in|on|at|inside|under|for|a|the|my)\b)'
+        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
         r'(?=\s+(?:in|on|at|inside|under|for\s+me)|$)',
         text, re.IGNORECASE,
     )
