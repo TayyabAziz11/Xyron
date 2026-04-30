@@ -1239,7 +1239,7 @@ def _extract_delete_target(text: str) -> str:
         text, re.IGNORECASE,
     )
     if m_named:
-        return m_named.group(1).strip().strip("'\"").strip()
+        return _strip_punct(m_named.group(1))
     # 2. Standard "delete <type> <name>" — stop at prepositions
     m = re.search(
         r'\b(?:delete|remove|erase)\s+(?:(?:the\s+)?(?:folder|directory|file|item)\s+)?'
@@ -1249,7 +1249,7 @@ def _extract_delete_target(text: str) -> str:
     )
     if not m:
         return ""
-    return (m.group(1) or "").strip().strip("'\"").strip()
+    return _strip_punct(m.group(1) or "")
 
 
 # Matches "inside <folder>", "in folder <name>", "under <folder>" for subfolder support
@@ -1292,36 +1292,44 @@ def _clean_folder_name(raw: str) -> str:
     return raw.strip()
 
 
+def _strip_punct(s: str) -> str:
+    """Strip trailing/leading sentence punctuation from an extracted name."""
+    return s.strip().strip(".,!?;:'\"").strip()
+
+
+# Unified "name as/is/named/called" pattern — specific alternatives first to avoid
+# "named as X" matching the generic "named" branch and capturing "as X".
+_NAME_AS_PAT = re.compile(
+    r'\b(?:name\s+is\s+|name\s+as\s+|named\s+as\s+|named\s+|'
+    r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+|call\s+it\s+|name\s+it\s+)'
+    r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?'
+    r'(?=\s+(?:in|on|at|inside|under|for|and)|\s*[.,]|\Z)',
+    re.IGNORECASE,
+)
+
+
 def _extract_folder_name(text: str) -> str:
-    # 1. Explicit naming: "name it X", "call it X", "called X", "named X"
-    m = _FOLDER_NAME_EXPLICIT_RE.search(text)
+    # 1. "name as X" / "name is X" / "named as X" / "named X" / "called X" / "name it X"
+    #    Must run BEFORE _FOLDER_NAME_EXPLICIT_RE which also matches "named"/"called"
+    #    but captures "as X" instead of just "X".
+    m = _NAME_AS_PAT.search(text)
     if m:
-        return _clean_folder_name(m.group("name").strip())
-    # 1b. "name is X" / "name as X" / "named as X" / "called X" — specific first
-    m_nas = re.search(
-        r'\b(?:name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
-        r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+)'
-        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?'
-        r'(?=\s+(?:in|on|at|inside|under|for)|\Z)',
-        text, re.IGNORECASE,
-    )
-    if m_nas:
-        return m_nas.group(1).strip()
-    # 2. Combined "name it X and create it in Y"
+        return _strip_punct(m.group(1))
+    # 2. Combined "name it X and create it in Y" / "call it X on desktop"
     m_nac = _NAME_AND_CREATE_RE.search(text)
     if m_nac:
-        return _clean_folder_name(m_nac.group("name").strip())
+        return _strip_punct(_clean_folder_name(m_nac.group("name")))
     # 3. "create [Name] folder" — word immediately before 'folder'
     m2 = re.search(
         r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?\s+(?:folder|directory)\b',
         text, re.IGNORECASE,
     )
     if m2:
-        candidate = m2.group(1).strip()
+        candidate = _strip_punct(m2.group(1))
         if candidate.lower() not in ("new", "a", "the", "this", "some", "my"):
             return _clean_folder_name(candidate)
-    # 4. "create folder GAMES" or "create folder Test Xyron" — words after 'folder', stop at preposition
-    # Negative lookahead skips if a preposition immediately follows 'folder' (name not here)
+    # 4. "create folder NAME" — word(s) after 'folder', stop at preposition
+    #    Negative lookahead skips when a preposition immediately follows 'folder'
     m3 = re.search(
         r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+'
         r'(?!(?:in|on|at|inside|under|for|a|the|my)\b)'
@@ -1330,7 +1338,7 @@ def _extract_folder_name(text: str) -> str:
         text, re.IGNORECASE,
     )
     if m3:
-        candidate = m3.group(1).strip()
+        candidate = _strip_punct(m3.group(1))
         if candidate.lower() not in ("in", "on", "at", "inside", "under", "new", "a", "the"):
             return _clean_folder_name(candidate)
     return ""
