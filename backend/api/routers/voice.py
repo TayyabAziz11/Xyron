@@ -151,6 +151,17 @@ async def transcribe_audio(audio: UploadFile = File(...)):
                 text = (result.text or "").strip()
                 raw_lang = getattr(result, "language", "en") or "en"
                 lang = raw_lang if raw_lang in ("en", "ur") else "en"
+
+                # Whisper hallucination guard: if language was detected as non-English/Urdu
+                # AND the text contains mostly non-Latin script (Cyrillic, CJK, Arabic, etc.),
+                # it's ambient noise being misread as foreign subtitles — drop it.
+                if text and raw_lang not in ("en", "ur"):
+                    _non_latin = sum(1 for c in text if ord(c) > 0x024F)
+                    if _non_latin > len(text) * 0.25:
+                        logger.debug("Whisper hallucination (lang=%s %.0f%% non-Latin) — dropping: %r",
+                                     raw_lang, _non_latin / len(text) * 100, text[:40])
+                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
                 logger.info("OpenAI Whisper: %r lang=%s (%d chars)", text[:60], lang, len(text))
                 return {"success": True, "data": {"text": text, "language": lang, "engine": "openai"}}
             except BadRequestError as bre:
@@ -1984,7 +1995,7 @@ async def respond_stream(body: _RespondStreamBody):
                 yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'restart'})}\n\n"
                 return
 
-            if _DELETE_FILE_RE.search(body.text.strip()) and not _SYS_CONFIRM_RE.search(body.text.strip()):
+            if _DELETE_FILE_RE.search(body.text.strip()):
                 # Try AI structured extraction first
                 _d_ai = _extract_folder_params_ai(body.text.strip(), settings.openai_api_key or "")
                 if _d_ai and _d_ai.get("name"):
