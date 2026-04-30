@@ -82,6 +82,11 @@ def test_extract_folder_name(text, expected):
     # Trailing punctuation
     ("delete the folder PSJF.", "PSJF"),
     ("please delete the folder PSJF", "PSJF"),
+    # Multi-word / Whisper splits hyphen: "s-games" → "s games"
+    ("delete the folder in the drive, name is s-games", "s-games"),
+    ("delete folder in d drive name is s games", "s games"),
+    # Pattern 1 correctly reads "the name is s games" → folder name is "s games"
+    ("no in d drive I say delete the folder the name is s games", "s games"),
 ])
 def test_extract_delete_target(text, expected):
     result = _extract_delete_target(text)

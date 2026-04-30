@@ -1230,21 +1230,29 @@ _DELETE_FILE_RE = re.compile(
 
 def _extract_delete_target(text: str) -> str:
     """Extract the file/folder name from a delete command."""
-    # 1. Handle "name is X" / "name as X" / "named X" / "called X" — specific patterns first
+    # Multi-word name fragment: word(s) with hyphens/underscores, stopping before stop-words.
+    # Handles both "s-games" (hyphen) and "s games" (Whisper splits hyphenated words).
+    _MWORD = (
+        r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*'
+        r'(?:\s+(?!(?:in|on|at|inside|under|for|and|folder|directory|drive|the|a)\b)'
+        r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*)*'
+    )
+    # 1. Handle "name is X" / "name as X" / "named as X" / "named X" / "called X"
     m_named = re.search(
         r'\b(?:name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
         r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+)'
-        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?'
-        r'(?=\s+(?:in|on|at|inside|and)|\Z)',
+        r'["\']?(' + _MWORD + r')["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|and)\b|\s*[.,!?]|\Z)',
         text, re.IGNORECASE,
     )
     if m_named:
         return _strip_punct(m_named.group(1))
-    # 2. Standard "delete <type> <name>" — stop at prepositions
+    # 2. Standard "delete <type> <name>" — skip if next word is an article or "name" keyword
     m = re.search(
         r'\b(?:delete|remove|erase)\s+(?:(?:the\s+)?(?:folder|directory|file|item)\s+)?'
-        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
-        r'(?=\s+(?:in|on|at|inside|under|from)|$)',
+        r'(?!(?:in|on|at|inside|under|from|the|name)\b)'
+        r'["\']?(' + _MWORD + r')["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|from)\b|\s*[.,!?]|$)',
         text.strip(), re.IGNORECASE,
     )
     if not m:
@@ -1299,11 +1307,16 @@ def _strip_punct(s: str) -> str:
 
 # Unified "name as/is/named/called" pattern — specific alternatives first to avoid
 # "named as X" matching the generic "named" branch and capturing "as X".
+# Supports multi-word names (e.g. Whisper splits "s-games" → "s games").
 _NAME_AS_PAT = re.compile(
     r'\b(?:name\s+is\s+|name\s+as\s+|named\s+as\s+|named\s+|'
     r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+|call\s+it\s+|name\s+it\s+)'
-    r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?'
-    r'(?=\s+(?:in|on|at|inside|under|for|and)|\s*[.,]|\Z)',
+    r'["\']?'
+    r'([A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*'
+    r'(?:\s+(?!(?:in|on|at|inside|under|for|and|folder|directory|drive|the|a)\b)'
+    r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*)*)'
+    r'["\']?'
+    r'(?=\s+(?:in|on|at|inside|under|for|and)\b|\s*[.,]|\Z)',
     re.IGNORECASE,
 )
 
