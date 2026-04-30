@@ -1338,20 +1338,29 @@ def _extract_folder_params_ai(text: str, openai_key: str) -> dict | None:
                 {
                     "role": "system",
                     "content": (
-                        "Extract the folder name and location from the voice command. "
-                        "Rules:\n"
-                        "- name: ONLY the folder name (e.g. 'games', 'PSJF', 'My Work'). "
-                        "Remove all articles, prepositions, verbs. If no name is given, return empty string.\n"
-                        "- location: drive or special folder. "
-                        "'D drive' → 'D:\\\\', 'C drive' → 'C:\\\\', 'desktop' → 'desktop', "
-                        "'documents' → 'documents', 'downloads' → 'downloads'. "
-                        "If not specified, return empty string."
+                        "You extract ONLY the folder name and drive location from a voice command.\n\n"
+                        "FOLDER NAME RULES — extract only the bare name word(s), strip everything else:\n"
+                        "  'name is Games'       → name='Games'\n"
+                        "  'The name is Games'   → name='Games'  (NOT 'is Games')\n"
+                        "  'named as PSJF'       → name='PSJF'\n"
+                        "  'named Games'         → name='Games'\n"
+                        "  'call it MyWork'      → name='MyWork'\n"
+                        "  'the name should be Reports' → name='Reports'\n"
+                        "  'create folder in D drive'   → name='' (no name given)\n"
+                        "Strip ALL verbs (is, named, called), articles (the, a), prepositions.\n\n"
+                        "LOCATION RULES:\n"
+                        "  'D drive' or 'D:' → location='D:\\\\'\n"
+                        "  'C drive'         → location='C:\\\\'\n"
+                        "  'desktop'         → location='desktop'\n"
+                        "  'documents'       → location='documents'\n"
+                        "  'downloads'       → location='downloads'\n"
+                        "  not mentioned     → location=''\n"
                     ),
                 },
                 {"role": "user", "content": text},
             ],
             response_format=_FolderParams,
-            max_tokens=60,
+            max_tokens=40,
         )
         parsed = result.choices[0].message.parsed
         return {"name": parsed.name.strip(), "location": parsed.location.strip()}
@@ -1989,6 +1998,24 @@ async def respond_stream(body: _RespondStreamBody):
                     _del_target = _extract_delete_target(body.text.strip())
                     _del_loc    = _extract_folder_location(body.text.strip())
                     logger.info("[REGEX-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
+
+                # No name extracted — check memory for last created/opened folder
+                # (handles "delete this folder", "delete the one you made", etc.)
+                if not _del_target:
+                    try:
+                        _la = memory_service.get_last_action()
+                        if _la and _la.get("tool") in ("create_folder", "open_directory"):
+                            _mem_name = _la.get("params", {}).get("name", "")
+                            _mem_path = _la.get("params", {}).get("path", "")
+                            if _mem_name:
+                                _del_target = _mem_name
+                                if _mem_path and not _del_loc:
+                                    _del_loc = _mem_path
+                                logger.info("[MEMORY] delete using last action name=%r loc=%r",
+                                            _del_target, _del_loc)
+                    except Exception:
+                        pass
+
                 if _del_target:
                     from api.tools import registry as _del_reg
                     if _del_loc:
@@ -1999,6 +2026,12 @@ async def respond_stream(body: _RespondStreamBody):
                     _del_spoken = _del_res.spoken or f"Deleted {_del_target}."
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_spoken})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_spoken})}\n\n"
+                    return
+                else:
+                    # Could not extract name — ask instead of falling through to GPT which lies
+                    _ask = "Which folder should I delete? Please say the name."
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _ask})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _ask})}\n\n"
                     return
 
             # ── LAYER 0e8: Sleep / Hibernate / Lock — execute server-side directly ──
