@@ -1306,6 +1306,59 @@ def _strip_punct(s: str) -> str:
     return s.strip().strip(".,!?;:'\"").strip()
 
 
+# ── LLM-based structured extraction (production path) ────────────────────────
+# Regex is the fallback when no OpenAI key is available.
+# GPT handles every Whisper transcription variation without pattern maintenance.
+
+try:
+    from pydantic import BaseModel as _BM
+    class _FolderParams(_BM):
+        name: str        # folder name only — no articles/prepositions
+        location: str    # e.g. "D:\\" or "desktop" or "" if not specified
+    _PYDANTIC_OK = True
+except ImportError:
+    _PYDANTIC_OK = False
+
+
+def _extract_folder_params_ai(text: str, openai_key: str) -> dict | None:
+    """Use GPT structured output to extract folder name + location from Whisper transcript.
+
+    Handles all phrasings ('name is X', 'named as X', 'the name should be X',
+    'call it X', etc.) and is robust to Whisper transcription variations.
+    Returns {"name": str, "location": str} or None on failure.
+    """
+    if not _PYDANTIC_OK or not openai_key:
+        return None
+    try:
+        from openai import OpenAI as _OAI
+        client = _OAI(api_key=openai_key)
+        result = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract the folder name and location from the voice command. "
+                        "Rules:\n"
+                        "- name: ONLY the folder name (e.g. 'games', 'PSJF', 'My Work'). "
+                        "Remove all articles, prepositions, verbs. If no name is given, return empty string.\n"
+                        "- location: drive or special folder. "
+                        "'D drive' → 'D:\\\\', 'C drive' → 'C:\\\\', 'desktop' → 'desktop', "
+                        "'documents' → 'documents', 'downloads' → 'downloads'. "
+                        "If not specified, return empty string."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            response_format=_FolderParams,
+            max_tokens=60,
+        )
+        parsed = result.choices[0].message.parsed
+        return {"name": parsed.name.strip(), "location": parsed.location.strip()}
+    except Exception:
+        return None
+
+
 # Unified "name as/is/named/called/should be" pattern — specific alternatives first.
 # Covers Pakistani-English variants: "name is X", "name as X", "named as X",
 # "the name should be X", "should be named X".
@@ -1923,10 +1976,21 @@ async def respond_stream(body: _RespondStreamBody):
                 return
 
             if _DELETE_FILE_RE.search(body.text.strip()) and not _SYS_CONFIRM_RE.search(body.text.strip()):
-                _del_target = _extract_delete_target(body.text.strip())
+                # Try AI structured extraction first
+                _d_ai = _extract_folder_params_ai(body.text.strip(), settings.openai_api_key or "")
+                if _d_ai and _d_ai.get("name"):
+                    _del_target = _d_ai["name"]
+                    _d_ai_loc   = _d_ai.get("location", "")
+                    if _d_ai_loc and not _d_ai_loc.endswith("\\") and len(_d_ai_loc) == 1:
+                        _d_ai_loc = _d_ai_loc.upper() + ":\\"
+                    _del_loc = _d_ai_loc or _extract_folder_location(body.text.strip())
+                    logger.info("[AI-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
+                else:
+                    _del_target = _extract_delete_target(body.text.strip())
+                    _del_loc    = _extract_folder_location(body.text.strip())
+                    logger.info("[REGEX-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
                 if _del_target:
                     from api.tools import registry as _del_reg
-                    _del_loc  = _extract_folder_location(body.text.strip())
                     if _del_loc:
                         _del_path = _del_loc.rstrip("\\") + "\\" + _del_target
                     else:
@@ -2321,11 +2385,24 @@ async def respond_stream(body: _RespondStreamBody):
 
                     # ── LAYER 1b: Create folder ───────────────────────────────
                     elif _CREATE_FOLDER_RE.search(body.text) or _NAME_AND_CREATE_RE.search(body.text):
-                        _floc   = _extract_folder_location(body.text)
-                        _fname  = _extract_folder_name(body.text)
+                        # Try AI structured extraction first — handles all Whisper
+                        # transcription variants without pattern maintenance.
+                        _ai_fp = _extract_folder_params_ai(body.text, ctx.get("openai_key", ""))
+                        if _ai_fp and _ai_fp.get("name"):
+                            _fname  = _ai_fp["name"]
+                            _ai_loc = _ai_fp.get("location", "")
+                            # Normalise AI location to Windows path
+                            if _ai_loc and not _ai_loc.endswith("\\") and len(_ai_loc) == 1:
+                                _ai_loc = _ai_loc.upper() + ":\\"
+                            _floc = _ai_loc or _extract_folder_location(body.text)
+                            logger.info("[AI-EXTRACT] create name=%r loc=%r", _fname, _floc)
+                        else:
+                            # Fallback to regex extraction
+                            _floc  = _extract_folder_location(body.text)
+                            _fname = _extract_folder_name(body.text)
+                            logger.info("[REGEX-EXTRACT] create name=%r loc=%r", _fname, _floc)
                         _parent = _extract_parent_folder(body.text)
                         # Subfolder: "create folder games inside projects in c drive"
-                        # → path = C:\projects, name = games
                         if _parent and _floc:
                             _floc = _floc.rstrip("\\") + "\\" + _parent
                         elif _parent:
