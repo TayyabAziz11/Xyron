@@ -1237,9 +1237,10 @@ def _extract_delete_target(text: str) -> str:
         r'(?:\s+(?!(?:in|on|at|inside|under|for|and|folder|directory|drive|the|a)\b)'
         r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*)*'
     )
-    # 1. Handle "name is X" / "name as X" / "named as X" / "named X" / "called X"
+    # 1. Handle "name is X" / "name as X" / "named as X" / "the name should be X"
     m_named = re.search(
-        r'\b(?:name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
+        r'\b(?:(?:the\s+)?name\s+should\s+be\s+|should\s+be\s+named\s+|'
+        r'name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
         r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+)'
         r'["\']?(' + _MWORD + r')["\']?'
         r'(?=\s+(?:in|on|at|inside|under|and)\b|\s*[.,!?]|\Z)',
@@ -1305,11 +1306,13 @@ def _strip_punct(s: str) -> str:
     return s.strip().strip(".,!?;:'\"").strip()
 
 
-# Unified "name as/is/named/called" pattern — specific alternatives first to avoid
-# "named as X" matching the generic "named" branch and capturing "as X".
+# Unified "name as/is/named/called/should be" pattern — specific alternatives first.
+# Covers Pakistani-English variants: "name is X", "name as X", "named as X",
+# "the name should be X", "should be named X".
 # Supports multi-word names (e.g. Whisper splits "s-games" → "s games").
 _NAME_AS_PAT = re.compile(
-    r'\b(?:name\s+is\s+|name\s+as\s+|named\s+as\s+|named\s+|'
+    r'\b(?:(?:the\s+)?name\s+should\s+be\s+|should\s+be\s+named\s+|'
+    r'name\s+is\s+|name\s+as\s+|named\s+as\s+|named\s+|'
     r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+|call\s+it\s+|name\s+it\s+)'
     r'["\']?'
     r'([A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*'

@@ -53,6 +53,10 @@ def test_strip_punct_clean_name_unchanged():
     ("create folder PSJF", "PSJF"),
     # Multi-word name
     ("create folder Test Xyron on Desktop", "Test Xyron"),
+    # "the name should be X" — common Pakistani English pattern
+    ("create a folder in desktop the name should be psjf", "psjf"),
+    ("ok now create a folder in desktop the name should be psjf", "psjf"),
+    ("create folder in d drive name should be Reports", "Reports"),
     # Location-only (no name) — should return empty
     ("create a folder in D drive", ""),
     ("create a folder on desktop", ""),
