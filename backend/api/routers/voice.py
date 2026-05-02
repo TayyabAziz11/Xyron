@@ -2428,7 +2428,8 @@ async def respond_stream(body: _RespondStreamBody):
                         pass
 
                 if _del_target:
-                    memory_service.set_last_action("delete_pending", {"path": _del_target}, "awaiting_confirmation")
+                    _del_full_path = (_del_loc.rstrip("\\") + "\\" + _del_target) if _del_loc else _del_target
+                    memory_service.set_last_action("delete_pending", {"path": _del_full_path}, "awaiting_confirmation")
                     _del_confirm = f"I'm about to permanently delete '{_del_target}'. Say 'yes' to confirm or 'no' to cancel."
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_confirm})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_confirm})}\n\n"

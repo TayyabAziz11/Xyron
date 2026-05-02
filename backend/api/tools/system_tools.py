@@ -527,6 +527,16 @@ def _exec_create_subfolders(params: Dict[str, Any], ctx: Dict[str, Any]) -> Tool
     # Resolve parent to WSL path
     parent_wsl = resolve_wsl_path(parent_raw)
     if parent_wsl is None:
+        # Bare folder name — try FolderMemory before giving up
+        try:
+            from ..services.history_service import history_service as _hs_early
+            _fm_early = _hs_early.lookup_folder(parent_raw.lower().strip())
+            if _fm_early and _fm_early.get("full_wsl"):
+                parent_wsl = _fm_early["full_wsl"]
+                logger.info("FolderMemory early lookup: %r → %r", parent_raw, parent_wsl)
+        except Exception:
+            pass
+    if parent_wsl is None:
         return ToolResult(success=False, text=f"Unknown parent location: {parent_raw!r}",
                           spoken="I couldn't find that folder. Please tell me where to put the subfolders.")
 
@@ -1295,46 +1305,46 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
     logger.info("[delete_file] raw=%r  win_path=%r  fs=%r  fs.exists=%s",
                 raw, win_path, str(fs), fs.exists())
     if not fs.exists():
-        # Determine parent dir and target name for scanning.
-        # resolve_path() expands named dirs: "Desktop" → "C:\\Users\\...\\Desktop"
-        parent_win = resolve_path(str(Path(win_path).parent))
-        target_name = Path(win_path).name
+        # Use WSL2 fs path for parent/name — Path() on Linux can't parse Windows backslashes.
+        target_name = fs.name if (fs.name and fs.name != str(fs)) else Path(raw.replace("\\", "/")).name
+        fs_parent   = fs.parent if str(fs.parent) != "." else None
 
-        logger.info("[delete_file] SCAN: parent_win=%r  target_name=%r", parent_win, target_name)
+        logger.info("[delete_file] SCAN: fs_parent=%r  target_name=%r", str(fs_parent), target_name)
 
-        # If no path separators — search common locations too
+        # If no path separators in raw — also search common locations
         if not any(c in raw for c in ('\\', '/', ':')):
             special = _get_win_special()
-            extra_bases = [
+            extra_bases_win = [
                 _windows_home(),
                 special.get("desktop", ""),
                 special.get("documents", ""),
                 special.get("downloads", ""),
             ]
+            extra_bases = [_fs_path(b) for b in extra_bases_win if b]
         else:
             extra_bases = []
 
-        # Build list of parent directories to scan
-        scan_parents = [parent_win] + extra_bases
-        logger.info("[delete_file] scan_parents=%r", scan_parents)
+        # Build deduped list of parent directories to scan (WSL2 Path objects)
+        scan_parents = ([fs_parent] if fs_parent else []) + extra_bases
+        seen: set[str] = set()
+        scan_parents = [p for p in scan_parents if str(p) not in seen and not seen.add(str(p))]
+        logger.info("[delete_file] scan_parents=%r", [str(p) for p in scan_parents])
 
-        for base in scan_parents:
-            if not base:
-                continue
-            base_fs = _fs_path(base.rstrip("\\"))
-            if not base_fs.is_dir():
+
+        for base_fs in scan_parents:
+            if not base_fs or not base_fs.is_dir():
                 continue
             try:
                 children = [c.name for c in base_fs.iterdir()]
             except PermissionError:
                 continue
             logger.info("[delete_file] scanning base=%r  found %d items: %r",
-                        base, len(children), children[:20])
+                        str(base_fs), len(children), children[:20])
             # 1. Case-insensitive exact match
             for child in children:
                 if child.lower() == target_name.lower():
                     fs       = base_fs / child
-                    win_path = base.rstrip("\\") + "\\" + child
+                    win_path = wsl_to_win(str(fs))
                     break
             if fs.exists():
                 break
@@ -1345,11 +1355,10 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
                 n=1, cutoff=0.6,
             )
             if matches:
-                # Recover original-case child name
                 matched_lower = matches[0]
                 child = next(c for c in children if c.lower() == matched_lower)
                 fs       = base_fs / child
-                win_path = base.rstrip("\\") + "\\" + child
+                win_path = wsl_to_win(str(fs))
                 break
 
         if not fs.exists():
