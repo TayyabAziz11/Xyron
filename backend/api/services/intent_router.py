@@ -47,6 +47,7 @@ _TOOL_DESCS: dict[str, str] = {
     "volume_control":         "set increase decrease adjust volume audio sound louder quieter turn volume up down",
     "mute_unmute":            "mute unmute toggle mute silence audio sound",
     "get_volume":             "current volume level what is volume how loud",
+    "media_control":          "play pause resume stop music song track next previous skip go back rewind media spotify youtube vlc",
     "get_battery_status":     "battery percentage charge charging remaining time power level how much battery left",
     "system_info":            "computer specs hardware cpu processor ram memory operating system version info",
     "system_health":          "cpu usage ram memory usage disk usage system performance health status live",
@@ -148,7 +149,7 @@ class IntentRouter:
             "volume_control", lambda m: {"action": "increase", "steps": 2})
         add(r'\bvolume\s+(?:down|lower|quieter|softer|decrease)',
             "volume_control", lambda m: {"action": "decrease", "steps": 2})
-        add(r'\b(?:turn\s+(?:the\s+)?(?:volume|sound)\s+(?:up|down|higher|lower))',
+        add(r'\b(?:turn\s+(?:the\s+)?(?:volume|sound)\s+(?:up|down|higher|lower)|turn\s+(?:up|down)\s+(?:the\s+)?(?:volume|sound))',
             "volume_control", lambda m: {
                 "action": "increase" if any(w in m.group(0).lower() for w in ("up", "higher")) else "decrease",
                 "steps": 2,
@@ -157,6 +158,22 @@ class IntentRouter:
         add(r'\b(?:mute|unmute)\b', "mute_unmute",
             lambda m: {"action": m.group(0).lower().strip()})
         add(r'\btoggle\s+(?:the\s+)?mute\b', "mute_unmute", lambda m: {"action": "toggle"})
+
+        # ── Media controls ───────────────────────────────────────────────────
+        add(r'\b(?:play|resume)\s*(?:music|song|audio|video|it|that)?\b',
+            "media_control", lambda m: {"action": "play_pause"})
+        add(r'\bpause\s*(?:music|song|audio|video|it|that)?\b',
+            "media_control", lambda m: {"action": "play_pause"})
+        add(r'\btoggle\s+(?:play(?:back)?|music|audio)\b',
+            "media_control", lambda m: {"action": "play_pause"})
+        add(r'\b(?:next|skip)\s*(?:song|track|video|one)?\b',
+            "media_control", lambda m: {"action": "next"})
+        add(r'\b(?:previous|prev|go\s+back|last\s+(?:song|track))\s*(?:song|track|video|one)?\b',
+            "media_control", lambda m: {"action": "prev"})
+        add(r'\bgo\s+back\b',
+            "media_control", lambda m: {"action": "prev"})
+        add(r'\bstop\s+(?:music|song|audio|playback|playing)\b',
+            "media_control", lambda m: {"action": "stop"})
 
         # ── Brightness ──────────────────────────────────────────────────────
         add(r'\b(?:set|put|change)\s+brightness\s+(?:to\s+)?(\d+)',
@@ -188,6 +205,34 @@ class IntentRouter:
         # ── Screenshots ──────────────────────────────────────────────────────
         add(r'\b(?:take\s+(?:a\s+)?)?screenshot\b|\bcapture\s+(?:the\s+)?screen\b', "take_screenshot")
         add(r'\bwhat.?s\s+(?:on|showing\s+on)\s+(?:my\s+)?screen\b|\bread\s+(?:the\s+)?screen\b', "read_screen")
+
+        # ── Known system folders (must be before open_application catch-all) ───
+        _FOLDERS = r'(?:downloads?|documents?|desktop|pictures?|photos?|music|videos?|temp(?:orary)?|home|appdata)'
+        # "open downloads folder", "open my downloads", "open the downloads folder"
+        add(
+            r'\b(?:open|show|go\s+to|browse|navigate\s+to)\s+(?:my\s+|the\s+)?(' + _FOLDERS + r')\s*(?:folder|directory)?\b',
+            "open_directory",
+            lambda m: {"path": m.group(1).lower()},
+        )
+        # "open folder downloads", "open the downloads directory"
+        add(
+            r'\b(?:open|show|go\s+to|browse)\s+(?:the\s+)?(?:folder|directory)\s+(' + _FOLDERS + r')\b',
+            "open_directory",
+            lambda m: {"path": m.group(1).lower()},
+        )
+
+        # ── Open / close application ──────────────────────────────────────────
+        add(r'\b(?:open|launch|start|run|fire\s+up|pull\s+up)\s+(.+)',
+            "open_application",
+            lambda m: {"app_name": m.group(1).strip().rstrip(".,!?")})
+        add(r'\b(?:close|quit|exit|kill)\s+(?!window|tab)(.+)',
+            "kill_app",
+            lambda m: {"app_name": m.group(1).strip().rstrip(".,!?")})
+
+        # ── Open file ────────────────────────────────────────────────────────
+        add(r'\b(?:open|show)\s+(?:the\s+)?(?:file|document|pdf)\s+(.+)',
+            "open_file",
+            lambda m: {"path": m.group(1).strip().rstrip(".,!?")})
 
         # ── Apps / processes ─────────────────────────────────────────────────
         add(r'\bwhat\s+(?:apps?|programs?|applications?)\s+(?:are\s+)?(?:running|open|active)\b', "get_running_apps")
@@ -233,8 +278,10 @@ class IntentRouter:
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
             import numpy as np
-            logger.info("[IntentRouter] Loading sentence-transformers model…")
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            import torch as _torch
+            _device = "cuda" if _torch.cuda.is_available() else "cpu"
+            logger.info("[IntentRouter] Loading sentence-transformers on %s…", _device)
+            model = SentenceTransformer("all-MiniLM-L6-v2", device=_device)
             names = list(_TOOL_DESCS.keys())
             embs  = model.encode(list(_TOOL_DESCS.values()), show_progress_bar=False, batch_size=64)
             self._model = model
@@ -253,7 +300,7 @@ class IntentRouter:
             return RouteResult(None, {}, 4, 0.0)
         try:
             np = self._np
-            q = self._model.encode(text, show_progress_bar=False)  # type: ignore
+            q = self._model.encode(text, show_progress_bar=False, convert_to_numpy=True)  # type: ignore
             best_name, best_score = None, -1.0
             for name, emb in self._embeddings.items():
                 score = float(np.dot(q, emb) / (np.linalg.norm(q) * np.linalg.norm(emb) + 1e-9))

@@ -171,10 +171,102 @@ def _check_file_written(params: dict, result_text: str) -> tuple[bool, str]:
 
 @_validator("clear_temp_files", "empty_recycle_bin")
 def _check_cleanup(params: dict, result_text: str) -> tuple[bool, str]:
-    # These are best-effort — check that result_text mentions bytes/files freed
+    # Best-effort: check result mentions some numeric indication of work done.
     if result_text and re.search(r'\d+', result_text):
         return True, ""
-    return True, ""  # pass through; can't easily validate without re-scanning
+    return True, ""
+
+
+# Apps whose process name doesn't match the app key (URI launches, UWP, aliases)
+_PROC_ALIASES: dict[str, list[str]] = {
+    "settings":    ["systemsettings", "windows.immersivecontrolpanel", "applicationframehost"],
+    "calculator":  ["calculator", "calculatorapp"],
+    "taskmanager": ["taskmgr"],
+    "terminal":    ["windowsterminal", "wt"],
+    "explorer":    ["explorer"],
+    "powershell":  ["powershell", "pwsh"],
+    "cmd":         ["cmd"],
+    "notepad":     ["notepad"],
+    "paint":       ["mspaint"],
+}
+
+
+@_validator("open_application")
+def _check_app_launched(params: dict, result_text: str) -> tuple[bool, str]:
+    """Verify that the target process appeared in the process list."""
+    app = (params.get("app_name") or params.get("app") or "").lower().strip()
+    if not app:
+        return True, ""
+
+    # Known apps (those in _APP_MAP) are launched via defined commands — trust them.
+    # UWP/URI-scheme apps (ms-settings:, etc.) won't show up in psutil from WSL.
+    try:
+        from api.tools.system_tools import _APP_MAP, _normalise_app
+        if _normalise_app(app) in _APP_MAP:
+            return True, f"known app '{app}' launched"
+    except Exception:
+        pass
+
+    try:
+        import psutil
+        app_stem = re.sub(r'\.exe$', '', app.split("\\")[-1].split("/")[-1]).lower()
+        stems = {app_stem} | set(_PROC_ALIASES.get(app_stem, []))
+        for proc in psutil.process_iter(["name"]):
+            name = re.sub(r'\.exe$', '', (proc.info.get("name") or "").lower())
+            for stem in stems:
+                if stem and (stem in name or name.startswith(stem)):
+                    return True, f"process '{name}' running"
+        return False, f"no process matching '{app_stem}' found"
+    except Exception as exc:
+        logger.debug("open_application validator error: %s", exc)
+        return True, ""  # psutil unavailable → trust the tool
+
+
+@_validator("wifi_connect")
+def _check_wifi_connected(params: dict, result_text: str) -> tuple[bool, str]:
+    """Verify the WiFi connected to the requested SSID via netsh."""
+    ssid = (params.get("ssid") or params.get("network") or "").strip()
+    if not ssid:
+        return True, ""
+    try:
+        ps = _find_powershell_path()
+        if not ps:
+            return True, ""
+        r = subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-Command",
+             "(netsh wlan show interfaces) -match 'SSID'"],
+            capture_output=True, text=True, timeout=6, errors="ignore",
+        )
+        out = (r.stdout or "").strip().lower()
+        connected = ssid.lower() in out
+        return connected, (f"connected to {ssid}" if connected else f"SSID '{ssid}' not active")
+    except Exception as exc:
+        logger.debug("wifi_connect validator error: %s", exc)
+        return True, ""
+
+
+@_validator("get_battery_status")
+def _check_battery_range(params: dict, result_text: str) -> tuple[bool, str]:
+    """Sanity-check: result should contain a numeric percentage 0–100."""
+    m = re.search(r'(\d{1,3})\s*%', result_text or "")
+    if m:
+        pct = int(m.group(1))
+        if 0 <= pct <= 100:
+            return True, f"battery={pct}%"
+        return False, f"battery % out of range: {pct}"
+    return True, ""  # no percentage in output — trust the tool
+
+
+def _find_powershell_path() -> str | None:
+    """Return a PowerShell executable path (extracted to avoid circular import)."""
+    for p in [
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
+    ]:
+        from pathlib import Path as _Path
+        if _Path(p).exists():
+            return p
+    return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

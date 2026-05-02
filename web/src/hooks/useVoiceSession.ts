@@ -13,8 +13,6 @@ import {
   detectSystemAction,
   resolveLocation,
   stripMarkdown,
-  cleanForSpeech,
-  speakBrowser,
   getApiBase,
   AudioQueue,
   streamAndSpeak,
@@ -254,7 +252,7 @@ export function useVoiceSession() {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const ctrl    = new AbortController()
-        const timeout = setTimeout(() => ctrl.abort(), 30_000)
+        const timeout = setTimeout(() => ctrl.abort(), 7_000)
         let resp: Response
         try {
           resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
@@ -277,7 +275,7 @@ export function useVoiceSession() {
         }
       } catch { /* retry */ }
     }
-    await speakBrowser(cleanForSpeech(raw))
+    // TTS failed — text is shown on screen; skip browser speech synthesis to avoid robotic fallback voice
   }, [])
 
   // ── Main listen function — ref-based so it's always fresh ────────────────
@@ -1165,16 +1163,6 @@ export function useVoiceSession() {
         mediaSessionRef.current = { platform: 'spotify', isOpen: true, tabRef: tab, lastQuery: null }
     }
 
-    // ── Wikipedia quick-facts ─────────────────────────────────────────────
-    if (sysAction.wikiTopic) {
-      const dataFetch = fetch(`${API_BASE}/api/v1/system/wiki?topic=${encodeURIComponent(sysAction.wikiTopic)}`)
-        .then(r => r.json()).catch(() => null)
-      const d = await _holdAndFetch(dataFetch)
-      const spoken = d?.spoken || `I couldn't find anything on Wikipedia for ${sysAction.wikiTopic}.`
-      await _finish(spoken)
-      return
-    }
-
     // ── Clipboard read ────────────────────────────────────────────────────
     if (sysAction.readClipboard) {
       const dataFetch = fetch(`${API_BASE}/api/v1/system/clipboard`)
@@ -1348,7 +1336,7 @@ export function useVoiceSession() {
     try {
       await Promise.race([
         speakResponse(GREETING),
-        new Promise<void>((r) => setTimeout(r, 12_000)),
+        new Promise<void>((r) => setTimeout(r, 5_000)),
       ])
     } catch { /* ok */ }
     if (!activeRef.current) return  // stopped during greeting

@@ -53,6 +53,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = ""
+    onnx_provider: str = ""          # e.g. "CUDAExecutionProvider" — empty = let kokoro_onnx decide
 
     @field_validator("cors_origins", mode="before")
     @classmethod

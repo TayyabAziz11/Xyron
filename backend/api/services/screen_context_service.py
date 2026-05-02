@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import subprocess
 import tempfile
 import threading
@@ -17,9 +18,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_CAPTURE_INTERVAL = 10      # seconds between captures
-_MAX_HISTORY      = 3       # rolling buffer size
-_STALE_AFTER      = 60      # seconds before context is considered stale
+# OFF by default — costs ~$0.10+/day in GPT-4o-mini vision API calls.
+# Set SCREEN_CONTEXT_ENABLED=true in backend/.env to enable.
+_ENABLED          = os.getenv("SCREEN_CONTEXT_ENABLED", "false").lower() == "true"
+_CAPTURE_INTERVAL = int(os.getenv("SCREEN_CONTEXT_INTERVAL", "300"))  # default 5 min
+_MAX_HISTORY      = 3
+_STALE_AFTER      = _CAPTURE_INTERVAL + 60
 
 
 def _is_wsl() -> bool:
@@ -114,7 +118,10 @@ class ScreenContextService:
         self._openai_key  = ""
 
     def start(self, openai_key: str) -> None:
-        """Start the background capture thread."""
+        """Start the background capture thread (no-op unless SCREEN_CONTEXT_ENABLED=true)."""
+        if not _ENABLED:
+            logger.info("ScreenContextService disabled (set SCREEN_CONTEXT_ENABLED=true to enable)")
+            return
         if self._running:
             return
         self._openai_key = openai_key

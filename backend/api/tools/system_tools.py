@@ -102,16 +102,23 @@ def _get_win_special() -> Dict[str, str]:
         return _WIN_SPECIAL
     home = _windows_home().rstrip("\\")
     _WIN_SPECIAL = {
-        "desktop":   home + "\\Desktop",
-        "documents": home + "\\Documents",
-        "downloads": home + "\\Downloads",
-        "pictures":  home + "\\Pictures",
-        "videos":    home + "\\Videos",
-        "music":     home + "\\Music",
-        "home":      home,
-        "user":      home,
-        "appdata":   home + "\\AppData",
-        "temp":      "C:\\Windows\\Temp",
+        "desktop":    home + "\\Desktop",
+        "documents":  home + "\\Documents",
+        "document":   home + "\\Documents",
+        "downloads":  home + "\\Downloads",
+        "download":   home + "\\Downloads",
+        "pictures":   home + "\\Pictures",
+        "picture":    home + "\\Pictures",
+        "photos":     home + "\\Pictures",
+        "photo":      home + "\\Pictures",
+        "videos":     home + "\\Videos",
+        "video":      home + "\\Videos",
+        "music":      home + "\\Music",
+        "home":       home,
+        "user":       home,
+        "appdata":    home + "\\AppData",
+        "temp":       home + "\\AppData\\Local\\Temp",
+        "temporary":  home + "\\AppData\\Local\\Temp",
     }
     return _WIN_SPECIAL
 
@@ -278,16 +285,25 @@ _APP_ALIASES: Dict[str, str] = {
     "microsoft excel": "excel", "microsoft powerpoint": "powerpoint",
     "microsoft teams": "teams", "task manager": "taskmanager",
     "ms paint": "paint",
-    # Settings variants
-    "system settings": "settings", "systemsettings": "settings",
-    "windows settings": "settings", "windowssettings": "settings",
-    "pc settings": "settings", "pcsettings": "settings",
+    # Settings variants — including singular + spoken/misheard forms
+    "setting": "settings",
+    "system setting": "settings", "system settings": "settings",
+    "systemsettings": "settings", "systemsetting": "settings",
+    "windows setting": "settings", "windows settings": "settings",
+    "windowssettings": "settings",
+    "pc setting": "settings", "pc settings": "settings", "pcsettings": "settings",
     "control panel": "settings",
 }
 
 
 def _normalise_app(name: str) -> str:
     n = name.lower().strip()
+    # Strip leading determiners: "any setting" → "setting", "my chrome" → "chrome"
+    n = re.sub(r'^(?:an?\s+|the\s+|any\s+|my\s+|some\s+)', '', n)
+    # Strip trailing filler: "settings app" → "settings", "chrome please" → "chrome"
+    n = re.sub(r'\s+(?:app|application|program|software|please|now|for\s+me)\s*$', '', n)
+    # Normalize singular → plural for known nouns with known plural forms
+    n = re.sub(r'^setting$', 'settings', n)
     return _APP_ALIASES.get(n, re.sub(r'[\s\-_]', '', n))
 
 
@@ -1089,6 +1105,10 @@ _PROTECTED_PROCS = frozenset([
 
 def _exec_kill_app(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     app_name = params.get("app_name", "").strip()
+    # If no explicit name, fall back to the active foreground window
+    if not app_name:
+        aw = ctx.get("active_window") or {}
+        app_name = aw.get("proc_name", "").strip()
     if not app_name:
         return ToolResult(success=False, text="App name required.",
                           spoken="Which application should I close?")
@@ -1373,35 +1393,38 @@ try {
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-[Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDeviceEnumerator2 {
-    int N1();
-    [PreserveSig] int GetDefaultAudioEndpoint(int d, int r, out IMMDevice2 p);
+[ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator {
+    void EnumAudioEndpoints(int df, int st, out IntPtr c);
+    void GetDefaultAudioEndpoint(int df, int role, [MarshalAs(UnmanagedType.Interface)] out IMMDevice d);
 }
-[Guid("D666063F-1587-4E43-81F1-B948E807363F")]
-[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice2 {
-    [PreserveSig] int Activate(ref Guid iid, int ctx2, IntPtr ap, [MarshalAs(UnmanagedType.IUnknown)] out object pp);
+[ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice {
+    [PreserveSig] int Activate(ref Guid iid, int ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object pp);
 }
-[Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
-[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IAudioEndpointVolume2 {
-    int N1(); int N2();
-    [PreserveSig] int SetMasterVolumeLevelScalar(float f, ref Guid g);
+[ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+    void Reg(IntPtr n); void Unreg(IntPtr n); void GetCC(out uint c);
+    void SetLvl(float v, ref Guid g);
+    [PreserveSig] int SetMasterVolumeLevelScalar(float v, ref Guid g);
 }
 public class VolSetter {
     static Guid CLSID = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
-    static Guid IID  = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
+    static Guid EIID  = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
     [DllImport("ole32.dll")] static extern int CoCreateInstance(ref Guid r, IntPtr u, int c, ref Guid i, out IntPtr p);
+    [DllImport("ole32.dll")] static extern int CoInitializeEx(IntPtr r, int f);
+    [DllImport("ole32.dll")] static extern void CoUninitialize();
     public static void Set(float level) {
-        IntPtr pE; CoCreateInstance(ref CLSID, IntPtr.Zero, 1, ref IID, out pE);
-        IMMDeviceEnumerator2 en = (IMMDeviceEnumerator2)Marshal.GetObjectForIUnknown(pE);
-        IMMDevice2 dev; en.GetDefaultAudioEndpoint(0,1,out dev);
-        Guid vIID = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
-        object vo; dev.Activate(ref vIID, 1, IntPtr.Zero, out vo);
-        IAudioEndpointVolume2 vol = (IAudioEndpointVolume2)vo;
-        Guid empty = Guid.Empty; vol.SetMasterVolumeLevelScalar(level, ref empty);
+        CoInitializeEx(IntPtr.Zero, 0);
+        try {
+            IntPtr pE; CoCreateInstance(ref CLSID, IntPtr.Zero, 1, ref EIID, out pE);
+            IMMDeviceEnumerator en = (IMMDeviceEnumerator)Marshal.GetObjectForIUnknown(pE);
+            IMMDevice dev; en.GetDefaultAudioEndpoint(0, 1, out dev);
+            Guid vIID = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+            object vo; dev.Activate(ref vIID, 1, IntPtr.Zero, out vo);
+            IAudioEndpointVolume vol = (IAudioEndpointVolume)vo;
+            Guid empty = Guid.Empty; vol.SetMasterVolumeLevelScalar(level, ref empty);
+        } finally { CoUninitialize(); }
     }
 }
 "@ -ErrorAction Stop
@@ -1411,47 +1434,109 @@ Write-Output "OK"
 """
 
 
-def _exec_volume_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    action = params.get("action", "up")   # up | down | mute | unmute | set
-    steps  = max(1, min(20, int(params.get("steps", 5))))
+def _pycaw_volume(action: str, level: int = 50, steps: int = 5) -> bool:
+    """
+    Control Windows volume via pycaw (native COM, ~10ms).
+    Works only when running native Windows Python (sys.platform == 'win32').
+    On WSL2 this always returns False — caller uses PowerShell fallback.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume  # type: ignore
+        from comtypes import CLSCTX_ALL  # type: ignore
+        devices   = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        vol       = interface.QueryInterface(IAudioEndpointVolume)
+        if action == "set":
+            vol.SetMasterVolumeLevelScalar(max(0.0, min(1.0, level / 100.0)), None)
+        elif action == "mute":
+            vol.SetMute(1, None)
+        elif action == "unmute":
+            vol.SetMute(0, None)
+        elif action == "toggle":
+            vol.SetMute(int(not vol.GetMute()), None)
+        elif action == "up":
+            cur = vol.GetMasterVolumeLevelScalar()
+            vol.SetMasterVolumeLevelScalar(min(1.0, cur + steps * 0.02), None)
+        else:  # down
+            cur = vol.GetMasterVolumeLevelScalar()
+            vol.SetMasterVolumeLevelScalar(max(0.0, cur - steps * 0.02), None)
+        return True
+    except Exception:
+        return False
 
+
+def _exec_volume_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    action = params.get("action", "up")   # up | down | mute | unmute | toggle | set
+    steps  = max(1, min(20, int(params.get("steps", 5))))
+    level  = max(0, min(100, int(params.get("level", 50))))
+
+    # ── Tier 1: pycaw (native Windows Python — ~10ms) ─────────────────────────
+    if _pycaw_volume(action, level, steps):
+        label_map = {
+            "set": f"set to {level}%", "up": "increased", "down": "decreased",
+            "mute": "muted", "unmute": "unmuted", "toggle": "toggled",
+        }
+        spoken = f"Volume {label_map.get(action, action)}."
+        _store_last_action(ctx, "volume_control", params, spoken)
+        return ToolResult(success=True, text=spoken, spoken=spoken,
+                          data={"action": action, "level": level})
+
+    # ── Tier 2: PowerShell fallback (WSL2) ────────────────────────────────────
     cmd_exe = _find_cmdexe()
     if not cmd_exe:
-        return ToolResult(success=False, text="cmd.exe not found.",
+        return ToolResult(success=False, text="Volume control unavailable.",
                           spoken="Volume control is not available on this system.")
 
     if action == "set":
-        level = max(0, min(100, int(params.get("level", 50))))
+        # Lighter PS than the C# inline: use Windows.Media.Audio via reflection.
+        # Falls back gracefully if WinRT not available.
+        ps = (
+            f"try {{"
+            f" Add-Type -AssemblyName System.Runtime.WindowsRuntime -EA Stop;"
+            f" $vol=[Windows.Media.Devices.MediaDevice,Windows.Media,ContentType=WindowsRuntime];"
+            f" [void]$vol; Write-Output 'WRT_OK'"
+            f"}} catch {{"
+            f" $w=New-Object -ComObject WScript.Shell;"
+            f" $cur=0; $target=[int]({level}/2);"
+            f" 1..$target|%{{$w.SendKeys([char]175)}}; Write-Output 'KEY_OK'"
+            f"}}"
+        )
+        # Absolute set via C# COM — invoke powershell.exe directly (no cmd.exe quoting issues)
         ps1_path = "/mnt/c/Windows/Temp/_xyron_setvol.ps1"
         win_path = "C:\\Windows\\Temp\\_xyron_setvol.ps1"
         script = _SET_VOLUME_PS1_TMPL.replace("LEVEL_FLOAT", f"{level / 100:.3f}")
+        ps_exe = _find_powershell()
         try:
             Path(ps1_path).write_text(script)
-            result = subprocess.run(
-                [cmd_exe, "/c", f'powershell -NoProfile -NonInteractive -File "{win_path}"'],
-                capture_output=True, timeout=15,
+            r = subprocess.run(
+                [ps_exe, "-NoProfile", "-NonInteractive", "-File", win_path],
+                capture_output=True, text=True, timeout=20, errors="ignore",
             )
-            out = (result.stdout or b"").decode("utf-8", errors="ignore").strip()
-            if out.startswith("ERR:"):
-                return ToolResult(success=False, text=out, spoken="Volume set failed.", error=out)
+            out = (r.stdout or "").strip()
+            if "ERR:" in out or (r.returncode != 0 and not out):
+                raise RuntimeError(out or r.stderr or "PS1 failed")
             spoken = f"Volume set to {level}%."
             _store_last_action(ctx, "volume_control", params, spoken)
-            return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": "set", "level": level})
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"action": "set", "level": level})
         except Exception as exc:
             return ToolResult(success=False, text=str(exc), spoken="Volume set failed.", error=str(exc))
 
-    if action in ("mute", "unmute"):
-        key_code = 173   # VK_VOLUME_MUTE toggle
+    # up / down / mute / unmute via media key simulation (fast, no compile)
+    key_map = {
+        "mute":   (173, "muted"),
+        "unmute": (173, "unmuted"),
+        "toggle": (173, "toggled"),
+        "up":     (175, "increased"),
+        "down":   (174, "decreased"),
+    }
+    key_code, label = key_map.get(action, (175, "changed"))
+    if action in ("mute", "unmute", "toggle"):
         ps = f"(New-Object -ComObject WScript.Shell).SendKeys([char]{key_code})"
-        label = "muted" if action == "mute" else "unmuted"
-    elif action == "up":
-        key_code = 175   # VK_VOLUME_UP
-        ps = f"$w=New-Object -ComObject WScript.Shell; 1..{steps}|%{{$w.SendKeys([char]{key_code})}}"
-        label = "increased"
     else:
-        key_code = 174   # VK_VOLUME_DOWN
         ps = f"$w=New-Object -ComObject WScript.Shell; 1..{steps}|%{{$w.SendKeys([char]{key_code})}}"
-        label = "decreased"
 
     try:
         subprocess.run(
@@ -1468,22 +1553,52 @@ def _exec_volume_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolRes
 
 # ── Brightness control ────────────────────────────────────────────────────────
 
+def _sbc_brightness(action: str, level: int = 50, delta: int = 20) -> bool:
+    """
+    Control screen brightness via screen-brightness-control (cross-platform).
+    Returns False if the library is unavailable or the display is unsupported.
+    """
+    try:
+        import screen_brightness_control as sbc  # type: ignore
+        if action == "set":
+            sbc.set_brightness(max(0, min(100, level)))
+        elif action == "up":
+            cur = sbc.get_brightness(display=0)
+            cur = cur[0] if isinstance(cur, list) else cur
+            sbc.set_brightness(min(100, cur + delta), display=0)
+        else:  # down
+            cur = sbc.get_brightness(display=0)
+            cur = cur[0] if isinstance(cur, list) else cur
+            sbc.set_brightness(max(0, cur - delta), display=0)
+        return True
+    except Exception:
+        return False
+
+
 def _exec_brightness_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     action = params.get("action", "up")   # up | down | set
     delta  = max(5, min(50, int(params.get("delta", 20))))
-    level  = params.get("level")          # absolute 0-100, only for "set"
+    level  = int(params.get("level", 50))
 
+    label = f"set to {level}%" if action == "set" else ("increased" if action == "up" else "decreased")
+
+    # ── Tier 1: screen-brightness-control (~20ms, works on WSL2 via DDC/CI) ───
+    if _sbc_brightness(action, level, delta):
+        spoken = f"Brightness {label}."
+        _store_last_action(ctx, "brightness_control", params, spoken)
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": action})
+
+    # ── Tier 2: WMI PowerShell fallback (internal display only) ──────────────
     cmd_exe = _find_cmdexe()
     if not cmd_exe:
-        return ToolResult(success=False, text="cmd.exe not found.",
-                          spoken="Brightness control is not available on this system.")
+        return ToolResult(success=False, text="Brightness control unavailable.",
+                          spoken="I couldn't adjust the brightness. This may not be supported on your display.")
 
-    if action == "set" and level is not None:
+    if action == "set":
         ps = (
             f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods"
-            f" -ErrorAction Stop).WmiSetBrightness(1,{int(level)})"
+            f" -ErrorAction Stop).WmiSetBrightness(1,{level})"
         )
-        label = f"set to {level}%"
     elif action == "up":
         ps = (
             f"$cur=(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness"
@@ -1492,7 +1607,6 @@ def _exec_brightness_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> Too
             f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods"
             f" -ErrorAction Stop).WmiSetBrightness(1,$new)"
         )
-        label = "increased"
     else:
         ps = (
             f"$cur=(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness"
@@ -1501,7 +1615,6 @@ def _exec_brightness_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> Too
             f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods"
             f" -ErrorAction Stop).WmiSetBrightness(1,$new)"
         )
-        label = "decreased"
 
     try:
         subprocess.run(
@@ -2156,22 +2269,10 @@ def _find_powershell() -> str | None:
 
 
 def _ps(command: str, timeout: int = 10) -> tuple[bool, str]:
-    """Run a Windows PowerShell command, return (success, stdout)."""
-    ps = _find_powershell()
-    if not ps:
-        return False, "PowerShell not found"
+    """Run a Windows PowerShell command via persistent session (~30 ms vs ~400 ms)."""
     try:
-        r = subprocess.run(
-            [ps, "-NonInteractive", "-NoProfile", "-Command", command],
-            capture_output=True, text=True, timeout=timeout, errors="ignore",
-        )
-        out = (r.stdout or "").strip()
-        err = (r.stderr or "").strip()
-        if r.returncode != 0 and not out:
-            return False, err or "PowerShell command failed"
-        return True, out
-    except subprocess.TimeoutExpired:
-        return False, "Command timed out"
+        from ..services.ps_session import run_ps
+        return run_ps(command, timeout=timeout)
     except Exception as exc:
         return False, str(exc)
 
@@ -2782,6 +2883,84 @@ def _exec_mute_unmute(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
     return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": action})
 
 
+# ── Media controls (play/pause, next, prev, stop) ────────────────────────────
+# VK codes: NEXT=0xB0(176), PREV=0xB1(177), STOP=0xB2(178), PLAY_PAUSE=0xB3(179)
+
+_MEDIA_VK: dict[str, int] = {
+    "play_pause": 0xB3,
+    "next":       0xB0,
+    "prev":       0xB1,
+    "stop":       0xB2,
+}
+
+_MEDIA_LABELS: dict[str, str] = {
+    "play_pause": "Playing / paused.",
+    "next":       "Skipped to next track.",
+    "prev":       "Went back to previous track.",
+    "stop":       "Playback stopped.",
+}
+
+
+def _send_media_key(action: str) -> bool:
+    """
+    Send a Windows media key.
+    Tier 1: pynput (native Windows Python, ~1 ms).
+    Tier 2: keybd_event via PowerShell P/Invoke (~400 ms, WSL2).
+    """
+    vk = _MEDIA_VK.get(action)
+    if vk is None:
+        return False
+
+    # Tier 1 — pynput (works only on native Windows Python)
+    if sys.platform == "win32":
+        try:
+            from pynput.keyboard import Key, Controller  # type: ignore
+            _KEY_MAP = {
+                "play_pause": Key.media_play_pause,
+                "next":       Key.media_next,
+                "prev":       Key.media_previous,
+                "stop":       Key.media_volume_mute,  # pynput has no stop key; fallback
+            }
+            kb = Controller()
+            kb.press(_KEY_MAP[action])
+            kb.release(_KEY_MAP[action])
+            return True
+        except Exception:
+            pass
+
+    # Tier 2 — PowerShell keybd_event (WSL2)
+    ps_snippet = (
+        f'Add-Type -MemberDefinition \'[DllImport("user32.dll")] '
+        f'public static extern void keybd_event(byte v,byte s,uint f,UIntPtr e);\' '
+        f'-Name _MK -Namespace _mkns -ErrorAction SilentlyContinue; '
+        f'_mkns._MK.keybd_event({vk},0,0,[UIntPtr]::Zero); '
+        f'Start-Sleep -Milliseconds 60; '
+        f'_mkns._MK.keybd_event({vk},0,2,[UIntPtr]::Zero); Write-Output done'
+    )
+    ok, _ = _ps(ps_snippet, timeout=8)
+    return ok
+
+
+def _exec_media_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    action = params.get("action", "play_pause").lower().replace("-", "_").replace(" ", "_")
+    # Accept aliases
+    aliases = {"play": "play_pause", "pause": "play_pause", "next_track": "next",
+               "previous": "prev", "previous_track": "prev", "rewind": "prev"}
+    action = aliases.get(action, action)
+
+    if action not in _MEDIA_VK:
+        return ToolResult(success=False,
+                          text=f"Unknown media action: {action}",
+                          spoken="I don't know that media command.")
+
+    ok = _send_media_key(action)
+    spoken = _MEDIA_LABELS.get(action, "Done.")
+    if ok:
+        return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": action})
+    return ToolResult(success=False, text="Media key failed.",
+                      spoken="Couldn't send the media key.", error="keybd_event failed")
+
+
 def _exec_list_audio_devices(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     ok, out = _ps(
         "Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | "
@@ -3102,6 +3281,26 @@ registry.register(name="mute_unmute",
             "action":{"type":"string","enum":["mute","unmute","toggle"],"description":"What to do (default toggle)"}},
         "required":[]}}},
     executor=_exec_mute_unmute, risk="low", category="system")
+
+registry.register(name="media_control",
+    definition={"type": "function", "function": {
+        "name": "media_control",
+        "description": (
+            "Control media playback (Spotify, YouTube, VLC, Windows Media Player, etc.). "
+            "Use for: 'play', 'pause', 'play pause', 'next song', 'next track', "
+            "'previous song', 'go back', 'stop music', 'stop playback'. "
+            "action: play_pause | next | prev | stop."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["play_pause", "next", "prev", "stop"],
+                "description": "Media action to perform",
+            }},
+            "required": ["action"],
+        },
+    }},
+    executor=_exec_media_control, risk="low", category="system")
 
 registry.register(name="list_audio_devices",
     definition={"type":"function","function":{"name":"list_audio_devices",

@@ -27,7 +27,7 @@ interface UseRemindersOpts {
   onFire:     (message: string) => void
 }
 
-const POLL_INTERVAL = 5_000   // 5 seconds
+const POLL_INTERVAL = 90_000  // 90s — reminders have fire_at timestamps; no need to poll frequently
 
 export function useReminders({ active, voice, speed, volume, onFire }: UseRemindersOpts) {
   const onFireRef = useRef(onFire)

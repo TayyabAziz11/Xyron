@@ -127,12 +127,11 @@ def _clean_for_speech(text: str, max_chars: int = 300) -> str:
     return t.strip()
 
 
-# ── Urdu → English translation for command routing ────────────────────────────
+# ── Urdu → English translation (used in local whisper path when lang=="ur") ──
 
 def _translate_urdu_command(text: str, openai_key: str) -> str:
     """Translate an Urdu voice command to English using GPT-4o-mini.
 
-    Used so that the English-only routing regexes can match Urdu commands.
     Returns the original text on any failure (safe fallback).
     """
     try:
@@ -145,8 +144,7 @@ def _translate_urdu_command(text: str, openai_key: str) -> str:
                     "role": "system",
                     "content": (
                         "You are a voice command translator for a PC assistant. "
-                        "Translate the Urdu command to English, preserving the exact intent "
-                        "(create folder, delete file, open app, subfolder, drive name, etc.). "
+                        "Translate the Urdu command to English, preserving the exact intent. "
                         "Return ONLY the English translation — no explanation, no extra words."
                     ),
                 },
@@ -162,18 +160,11 @@ def _translate_urdu_command(text: str, openai_key: str) -> str:
         return text
 
 
-# ── Whisper local model cache (avoids 2-3s cold-start on first transcription) ─
-_local_whisper_model = None
-
-
+# ── Local Whisper — delegates to voice/whisper_service.py (GPU-aware, configurable) ──
 def _get_local_whisper_model():
-    global _local_whisper_model
-    if _local_whisper_model is None:
-        from faster_whisper import WhisperModel
-        logger.info("Loading local Whisper 'base' model...")
-        _local_whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-        logger.info("Local Whisper model ready.")
-    return _local_whisper_model
+    """Return the shared faster-whisper model instance (GPU if available)."""
+    from voice.whisper_service import _get_model
+    return _get_model()
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
@@ -210,174 +201,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         logger.debug("Audio below RMS threshold — treating as silence (%.0f bytes)", len(audio_bytes))
         return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
 
-    # ── 1. OpenAI Whisper API ─────────────────────────────────────────────────
-    try:
-        from ..config import settings
-        _ensure_paths()
-        if settings.openai_api_key and settings.openai_api_key.startswith("sk-"):
-            from openai import OpenAI, BadRequestError
-            client = OpenAI(api_key=settings.openai_api_key)
-
-            ct     = (audio.content_type or "").lower()
-            suffix = (
-                ".webm" if "webm" in ct else
-                ".mp3"  if "mp3"  in ct else
-                ".ogg"  if "ogg"  in ct else
-                ".wav"
-            )
-
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(audio_bytes)
-                tmp_path = Path(tmp.name)
-
-            try:
-                with open(tmp_path, "rb") as f:
-                    result = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        response_format="verbose_json",
-                        # Prompt biases Whisper toward command-style English/Urdu speech,
-                        # reducing hallucinations from silence or background noise.
-                        prompt="Xyron assistant.",
-                    )
-                text = (result.text or "").strip()
-                raw_lang = getattr(result, "language", "en") or "en"
-                # Whisper sometimes returns full names ("english") not ISO codes ("en")
-                _LANG_MAP = {"english": "en", "urdu": "ur", "hindi": "hi", "arabic": "ar"}
-                raw_lang = _LANG_MAP.get(raw_lang.lower(), raw_lang)
-                lang = raw_lang if raw_lang in ("en", "ur") else "en"
-
-                # Hallucination guard 1: no_speech_prob from verbose_json segments.
-                # If Whisper itself says there's no speech (avg > 0.7), drop the transcript.
-                # This catches the "vaccine text / subtitles from silence" class of hallucinations.
-                _segments = getattr(result, "segments", None) or []
-                if _segments:
-                    _avg_nsp     = sum(getattr(s, "no_speech_prob", 0.0) for s in _segments) / len(_segments)
-                    _avg_logprob = sum(getattr(s, "avg_logprob", -1.0)   for s in _segments) / len(_segments)
-
-                    # no_speech_prob > 0.4 AND logprob also bad: pure silence/noise.
-                    # Threshold -0.90: Pakistani-accented English/Urdu commands typically land
-                    # between -0.78 and -0.87; pure noise/silence falls below -0.90.
-                    if _avg_nsp > 0.4 and _avg_logprob < -0.90:
-                        logger.info("Whisper hallucination (nsp=%.2f, logprob=%.2f) — dropping: %r",
-                                    _avg_nsp, _avg_logprob, text[:60])
-                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
-
-                    # avg_logprob < -0.90: no-speech audio with nothing recoverable.
-                    # Real commands (even accented) hit above -0.87; below -0.90 is
-                    # fan/hum/electrical noise generating garbage tokens.
-                    if _avg_logprob < -0.90:
-                        logger.info("Whisper low-confidence (avg_logprob=%.2f) — dropping: %r",
-                                    _avg_logprob, text[:60])
-                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
-
-                    # compression_ratio > 2.4: Whisper is looping on repeated tokens.
-                    # "and and or or or or or or" / "the the the" from fan/electrical hum.
-                    # Whisper's own source uses this threshold to detect stuck decoders.
-                    _avg_cr = sum(getattr(s, "compression_ratio", 1.0) for s in _segments) / len(_segments)
-                    if _avg_cr > 2.4:
-                        logger.info("Whisper token-loop (compression_ratio=%.2f) — dropping: %r",
-                                    _avg_cr, text[:60])
-                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
-
-                # Hallucination guard 2: unexpected language.
-                # This assistant only processes English and Urdu.
-                # Indonesian, Malay, Spanish, etc. are always Whisper hallucinations from silence.
-                # "latin" is Whisper's common misclassification of formal/capitalized English
-                # (e.g. "Create A Folder In D Drive") — remap to English, never drop.
-                if raw_lang == "latin":
-                    raw_lang = "en"
-                    lang = "en"
-
-                # Pakistani-accented English is frequently misclassified as "sindhi", "punjabi",
-                # or other South Asian languages even when the transcribed text is pure English.
-                # Two-step check: (1) 85%+ ASCII Latin chars, (2) at least one English command
-                # word is present — prevents Malay/Spanish from being reclassified as English.
-                _EN_CMD_WORDS = frozenset({
-                    "create","make","open","close","folder","file","play","stop","search",
-                    "find","show","tell","turn","volume","mute","pause","new","delete",
-                    "copy","move","rename","download","screenshot","screen","click","type",
-                    "press","write","read","edit","save","check","get","set","my","your",
-                    "desktop","drive","directory","subfolder","window","tab","browser",
-                    "remind","schedule","email","whatsapp","spotify","youtube","github",
-                })
-                if text and raw_lang not in ("en", "ur"):
-                    _alpha_chars = [c for c in text if c.isalpha()]
-                    if _alpha_chars:
-                        _latin_ratio = sum(1 for c in _alpha_chars if c.isascii()) / len(_alpha_chars)
-                        _text_words  = set(re.findall(r'[a-z]+', text.lower()))
-                        if _latin_ratio >= 0.85 and (_text_words & _EN_CMD_WORDS):
-                            logger.info(
-                                "Whisper accent reclassify %s→en (%.0f%% latin): %r",
-                                raw_lang, _latin_ratio * 100, text[:60],
-                            )
-                            raw_lang = "en"
-                            lang = "en"
-
-                # Non-Latin transcript (Devanagari/Bengali etc.) from a non-Urdu language
-                # is almost certainly a mis-transcription of Pakistani-accented English.
-                # Retry once with language="en" to get the correct Latin transcription.
-                if text and raw_lang not in ("en", "ur"):
-                    _alpha_chars = [c for c in text if c.isalpha()]
-                    _latin_ratio = (
-                        sum(1 for c in _alpha_chars if c.isascii()) / len(_alpha_chars)
-                        if _alpha_chars else 1.0
-                    )
-                    if _latin_ratio < 0.5:
-                        # text is mostly non-Latin → retry forcing English
-                        logger.info(
-                            "Whisper mis-script (%s, %.0f%% latin) — retrying with language=en: %r",
-                            raw_lang, _latin_ratio * 100, text[:60],
-                        )
-                        try:
-                            with open(tmp_path, "rb") as _f2:
-                                _r2 = client.audio.transcriptions.create(
-                                    model="whisper-1",
-                                    file=_f2,
-                                    response_format="verbose_json",
-                                    language="en",
-                                    prompt="Xyron assistant.",
-                                )
-                            _t2 = (_r2.text or "").strip()
-                            if _t2:
-                                logger.info("Whisper retry en: %r", _t2[:60])
-                                text = _t2
-                                raw_lang = "en"
-                                lang = "en"
-                        except Exception as _e2:
-                            logger.debug("Whisper retry failed: %s", _e2)
-
-                if text and raw_lang not in ("en", "ur"):
-                    logger.info("Whisper hallucination (lang=%s) — dropping: %r", raw_lang, text[:60])
-                    return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
-
-                # Urdu → English translation so routing regexes (English-only) can match.
-                # Without this, Urdu commands fall through to GPT which says "Done" without
-                # ever calling a tool. Translation adds ~200ms but fixes command execution.
-                if raw_lang == "ur" and text:
-                    _translated = _translate_urdu_command(text, settings.openai_api_key)
-                    if _translated and _translated != text:
-                        logger.info("Urdu→English: %r → %r", text[:60], _translated[:60])
-                        text = _translated
-                        lang = "en"
-
-                logger.info("OpenAI Whisper: %r lang=%s (%d chars)", text[:60], lang, len(text))
-                return {"success": True, "data": {"text": text, "language": lang, "engine": "openai"}}
-            except BadRequestError as bre:
-                # 'audio_too_short' or similar API-level validation errors
-                # are not real failures — just silence or a mic blip.
-                err_code = getattr(bre, "code", "") or ""
-                if "too_short" in str(err_code) or "too_short" in str(bre).lower():
-                    logger.debug("Whisper: audio too short (%d bytes) — treating as silence", len(audio_bytes))
-                    return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
-                logger.warning("OpenAI Whisper API error: %s", bre)
-            finally:
-                tmp_path.unlink(missing_ok=True)
-
-    except Exception as exc:
-        logger.warning("OpenAI Whisper failed: %s", exc)
-
-    # ── 2. faster-whisper local (optional) ───────────────────────────────────
+    # ── Local faster-whisper (always — never use paid whisper-1 API for STT) ──
     try:
         suffix = ".webm" if "webm" in (audio.content_type or "") else ".wav"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -407,18 +231,194 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
 
 
+# ── Wake word detection ───────────────────────────────────────────────────────
+
+@router.post("/wake-detect")
+async def wake_detect(audio: UploadFile = File(...)):
+    """
+    Lightweight wake word detection endpoint.
+
+    Accepts the same audio formats as /transcribe (WebM, WAV, OGG).
+    Returns immediately — designed for short clips (400–600ms).
+
+    Detection priority:
+      1. OpenWakeWord (if installed) — ~5ms on CPU per 80ms frame
+      2. Local faster-whisper + phrase matching — ~200ms on GPU, ~800ms on CPU
+
+    Returns:
+        {"triggered": bool, "confidence": float, "method": "oww"|"whisper_text"|"none"}
+    """
+    import time as _time
+    t0 = _time.perf_counter()
+    audio_bytes = await audio.read()
+
+    # Reject obviously empty/header-only clips (< 2 KB)
+    if len(audio_bytes) < 2000:
+        return {"triggered": False, "confidence": 0.0, "method": "none", "text": ""}
+
+    try:
+        _ensure_paths()
+        from voice.wake_word_service import wake_word_service
+        content_type = audio.content_type or ""
+        triggered, confidence, method, transcript = wake_word_service.detect_from_bytes(
+            audio_bytes, content_type
+        )
+        elapsed_ms = round((_time.perf_counter() - t0) * 1000)
+        logger.info(
+            "[WakeDetect] triggered=%s conf=%.2f method=%s text=%r bytes=%d e2e=%dms",
+            triggered, confidence, method, transcript, len(audio_bytes), elapsed_ms,
+        )
+        return {
+            "triggered": triggered,
+            "confidence": round(confidence, 3),
+            "method": method,
+            "text": transcript,
+            "latency_ms": elapsed_ms,
+        }
+    except Exception as exc:
+        logger.error("[WakeDetect] error: %s", exc)
+        return {"triggered": False, "confidence": 0.0, "method": "none", "text": ""}
+
+
+# ── Streaming pipeline ───────────────────────────────────────────────────────
+
+@router.post("/pipeline")
+async def voice_pipeline_endpoint(audio: UploadFile = File(...), request: Request = None):
+    """
+    Full end-to-end streaming voice pipeline.
+
+    Accepts a raw audio clip (WebM/WAV), runs STT → normalize → route → tool →
+    generate → TTS in one request, streaming JSON chunks as they complete:
+
+      {"type": "interim",    "text": "On it..."}
+      {"type": "transcript", "text": "<speech>", "stt_ms": 240}
+      {"type": "tool",       "tool": "<name>", "params": {...}}
+      {"type": "response",   "text": "<reply>"}
+      {"type": "audio",      "data": "<base64>", "mime": "audio/wav"}
+      {"type": "done"}
+      {"type": "error",      "message": "<reason>"}
+
+    Each chunk is a newline-terminated JSON object (text/event-stream).
+    """
+    from ..config import settings
+    audio_bytes  = await audio.read()
+    content_type = audio.content_type or ""
+    openai_key   = settings.openai_api_key or ""
+
+    from api.services.pipeline import voice_pipeline
+    return StreamingResponse(
+        voice_pipeline(audio_bytes, content_type, openai_key),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
 # ── Synthesis ─────────────────────────────────────────────────────────────────
+
+# Kokoro voice mapping: OpenAI voice names → Kokoro voice IDs
+_KOKORO_VOICE_MAP: dict[str, str] = {
+    "nova":    "af_nova",      # warm American female
+    "alloy":   "am_echo",      # American male
+    "echo":    "am_echo",      # American male
+    "onyx":    "am_onyx",      # deep American male
+    "fable":   "bm_fable",     # British male
+    "shimmer": "af_sarah",     # American female
+}
+_KOKORO_MODELS_DIR = "/home/tayyab/.xyron/models"
+_kokoro_instance = None        # module-level singleton, lazy-loaded once
+_kokoro_lock = __import__("threading").Lock()
+
+
+def _get_kokoro():
+    """Return the singleton Kokoro instance, loading it once on first call."""
+    global _kokoro_instance
+    if _kokoro_instance is not None:
+        return _kokoro_instance
+    with _kokoro_lock:
+        if _kokoro_instance is not None:
+            return _kokoro_instance
+        import os
+        model_path  = os.path.join(_KOKORO_MODELS_DIR, "kokoro-v1.0.onnx")
+        voices_path = os.path.join(_KOKORO_MODELS_DIR, "voices-v1.0.bin")
+        if not (os.path.exists(model_path) and os.path.exists(voices_path)):
+            return None
+        try:
+            from kokoro_onnx import Kokoro  # type: ignore
+            # Propagate ONNX_PROVIDER from settings into os.environ so kokoro_onnx picks it up
+            _provider = os.getenv("ONNX_PROVIDER", "")
+            if not _provider:
+                try:
+                    from ..config import settings as _s
+                    _provider = getattr(_s, "onnx_provider", "") or ""
+                except Exception:
+                    pass
+            if _provider:
+                os.environ["ONNX_PROVIDER"] = _provider
+            _kokoro_instance = Kokoro(model_path, voices_path)
+            _active_provider = os.getenv("ONNX_PROVIDER", "CPU")
+            logger.info("[TTS] Kokoro loaded on %s — %d voices",
+                        _active_provider, len(list(_kokoro_instance.get_voices())))
+        except Exception as exc:
+            logger.warning("[TTS] Kokoro load failed: %s", exc)
+        return _kokoro_instance
+
+
+def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
+    """Generate WAV via Kokoro (local, offline, ~100-400ms after warm-up)."""
+    import io, wave, numpy as np
+    k = _get_kokoro()
+    if k is None:
+        return None
+    kokoro_voice = _KOKORO_VOICE_MAP.get(voice, "af_nova")
+    samples, sample_rate = k.create(text, voice=kokoro_voice, speed=speed, lang="en-us")
+    # Convert float32 samples → 16-bit PCM WAV bytes
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+# edge-tts voice mapping: OpenAI names → Microsoft Neural voices
+_EDGE_VOICE_MAP: dict[str, str] = {
+    "nova":    "en-US-AvaNeural",
+    "alloy":   "en-US-AndrewNeural",
+    "echo":    "en-US-BrianNeural",
+    "onyx":    "en-US-AndrewNeural",
+    "fable":   "en-US-EmmaNeural",
+    "shimmer": "en-US-EmmaNeural",
+}
+
+
+async def _edge_tts_mp3(text: str, voice: str, speed: float) -> bytes:
+    """Generate MP3 via edge-tts (Microsoft Neural TTS, free, ~200-400ms)."""
+    import edge_tts  # type: ignore
+    edge_voice = _EDGE_VOICE_MAP.get(voice, "en-US-AvaNeural")
+    pct = int(round((speed - 1.0) * 100))
+    rate_str = f"+{pct}%" if pct >= 0 else f"{pct}%"
+    communicate = edge_tts.Communicate(text, voice=edge_voice, rate=rate_str)
+    chunks: list[bytes] = []
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            chunks.append(chunk["data"])
+    return b"".join(chunks)
+
 
 @router.post("/synthesize")
 async def synthesize_text(request: Request):
     """Convert text to speech audio.
 
     Priority:
-      1. OpenAI TTS API (tts-1, nova voice) — real-time model, low latency, MP3
-      2. pyttsx3 / espeak-ng               — offline fallback, WAV
+      1. Kokoro  (local offline, ~100-400ms after warm-up, no API needed)
+      2. edge-tts (Microsoft Neural, free, ~200-400ms, requires internet)
+      3. OpenAI TTS (cloud, requires OPENAI_API_KEY)
+      4. pyttsx3 / espeak-ng (offline, robotic, last resort)
 
-    Body:   {"text": "...", "rate": 165, "volume": 0.9, "voice": "nova"}
-    Returns: audio/mpeg or audio/wav binary
+    Body:   {"text": "...", "speed": 1.0, "voice": "nova"}
+    Returns: audio/wav (Kokoro/pyttsx3) or audio/mpeg (edge-tts/OpenAI)
     """
     _ensure_paths()
     body   = await request.json()
@@ -434,34 +434,63 @@ async def synthesize_text(request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="text is empty after cleaning")
 
-    # ── 1. OpenAI TTS (natural quality) ──────────────────────────────────────
+    import asyncio as _asyncio
+
+    # ── 1. Kokoro — local offline, ~850ms CPU / ~80ms GPU ────────────────────
+    try:
+        wav_bytes = await _asyncio.get_event_loop().run_in_executor(
+            None, _kokoro_to_wav, text, voice, speed
+        )
+        if wav_bytes:
+            logger.info("[TTS] Kokoro (%s): %d chars → %d bytes",
+                        _KOKORO_VOICE_MAP.get(voice, "af_nova"), len(text), len(wav_bytes))
+            return Response(
+                content=wav_bytes,
+                media_type="audio/wav",
+                headers={"Cache-Control": "no-cache", "X-TTS-Engine": "kokoro"},
+            )
+    except Exception as exc:
+        logger.warning("[TTS] Kokoro failed, trying edge-tts: %s", exc)
+
+    # ── 2. edge-tts — free, natural quality, requires internet ───────────────
+    try:
+        mp3_bytes = await _edge_tts_mp3(text, voice, speed)
+        if mp3_bytes:
+            logger.info("[TTS] edge-tts (%s): %d chars → %d bytes",
+                        _EDGE_VOICE_MAP.get(voice, "en-US-AvaNeural"), len(text), len(mp3_bytes))
+            return Response(
+                content=mp3_bytes,
+                media_type="audio/mpeg",
+                headers={"Cache-Control": "no-cache", "X-TTS-Engine": "edge-tts"},
+            )
+    except Exception as exc:
+        logger.warning("[TTS] edge-tts failed, trying OpenAI: %s", exc)
+
+    # ── 3. OpenAI TTS fallback ────────────────────────────────────────────────
     try:
         from ..config import settings
         if settings.openai_api_key and settings.openai_api_key.startswith("sk-"):
             from openai import OpenAI
             client = OpenAI(api_key=settings.openai_api_key)
-
-            # Clamp speed to OpenAI's supported range
-            speed = max(0.25, min(4.0, speed))
-
+            speed_clamped = max(0.25, min(4.0, speed))
             tts_resp = client.audio.speech.create(
-                model="tts-1",  # Real-time model: lower latency, near-identical quality for voice assistant
+                model="tts-1",
                 voice=voice,
                 input=text,
                 response_format="mp3",
-                speed=speed,
+                speed=speed_clamped,
             )
             mp3_bytes = tts_resp.content
-            logger.info("OpenAI TTS (%s): %d chars → %d bytes", voice, len(text), len(mp3_bytes))
+            logger.info("[TTS] OpenAI (%s): %d chars → %d bytes", voice, len(text), len(mp3_bytes))
             return Response(
                 content=mp3_bytes,
                 media_type="audio/mpeg",
                 headers={"Cache-Control": "no-cache", "X-TTS-Engine": "openai"},
             )
     except Exception as exc:
-        logger.warning("OpenAI TTS failed, falling back to pyttsx3: %s", exc)
+        logger.warning("[TTS] OpenAI TTS failed: %s", exc)
 
-    # ── 2. pyttsx3 / espeak-ng fallback ──────────────────────────────────────
+    # ── 4. pyttsx3 / espeak-ng last resort ───────────────────────────────────
     try:
         from voice.tts_service import synthesize_speech, is_tts_available
     except ImportError as exc:
@@ -470,7 +499,7 @@ async def synthesize_text(request: Request):
     if not is_tts_available():
         raise HTTPException(
             status_code=503,
-            detail="TTS unavailable. Set OPENAI_API_KEY for quality voice, or: sudo apt-get install espeak-ng",
+            detail="TTS unavailable — install espeak-ng: sudo apt-get install espeak-ng",
         )
 
     rate       = int(body.get("rate", 165))
@@ -1122,6 +1151,47 @@ _DIRECT_SPOKEN_TOOLS = frozenset({
     # system info
     "get_running_apps",
 })
+
+
+def _early_ack(tool_name: str, params: dict) -> str:
+    """Return a short spoken acknowledgment to stream immediately before a tool runs."""
+    app = params.get("app_name") or params.get("name") or params.get("query") or ""
+    path = params.get("path", "")
+    action = params.get("action", "")
+    if tool_name == "open_application":
+        return f"Opening {app}." if app else "On it."
+    if tool_name in ("open_directory", "open_file"):
+        label = (path.rstrip("/\\").split("/")[-1].split("\\")[-1] or path).strip()
+        return f"Opening {label}." if label else "Opening that."
+    if tool_name == "smart_open":
+        return f"Looking for {app}." if app else "On it."
+    if tool_name == "volume_control":
+        if action == "increase":  return "Turning it up."
+        if action == "decrease":  return "Turning it down."
+        if action == "set":       return f"Setting volume to {params.get('steps', '')}."
+        return "Adjusting volume."
+    if tool_name == "mute_unmute":             return "Done."
+    if tool_name == "brightness_control":      return "Adjusting brightness."
+    if tool_name == "take_screenshot":         return "Screenshot taken."
+    if tool_name == "get_battery_status":      return "Checking battery."
+    if tool_name == "system_info":             return "Checking system info."
+    if tool_name == "system_health":           return "Running diagnostics."
+    if tool_name in ("shutdown_system",):      return "Shutting down."
+    if tool_name in ("restart_system",):       return "Restarting."
+    if tool_name in ("lock_system",):          return "Locking the screen."
+    if tool_name == "create_folder":           return "Creating that folder."
+    if tool_name == "delete_file":             return "Deleting."
+    if tool_name in ("get_disk_usage", "clear_temp_files", "empty_recycle_bin"):
+        return "On it."
+    if tool_name == "network_speed_test":      return "Running speed test — give me a moment."
+    if tool_name == "write_clipboard":         return "Copied."
+    if tool_name == "type_text":               return "Typing."
+    if tool_name == "open_system_settings":    return "Opening settings."
+    if tool_name in ("minimize_window", "maximize_window", "close_window"):
+        return "Done."
+    # Generic fallback for all other direct tools
+    return "On it."
+
 
 # ── Retry + fallback config ───────────────────────────────────────────────────
 
@@ -1949,6 +2019,25 @@ async def respond_stream(body: _RespondStreamBody):
     _ensure_paths()
     turn_id = str(uuid.uuid4())
 
+    # Normalize raw utterance (wake-word strip, synonyms, filler removal)
+    # before context resolver so pronouns resolve against clean text.
+    try:
+        from ..services.normalizer import normalize as _normalize_utt
+        _norm = _normalize_utt(body.text)
+        if _norm and _norm != body.text:
+            body = body.model_copy(update={"text": _norm})
+    except Exception:
+        pass
+
+    # Capture active foreground window before context resolution.
+    # Stored in a request-local var so the _generate closure can inject it into ctx.
+    _active_window: dict | None = None
+    try:
+        from ..services.window_context import window_context as _wc
+        _active_window = _wc.get_active_window()
+    except Exception:
+        pass
+
     # Resolve vague pronouns ("it", "that", "the file") → concrete entity
     # Must happen before _generate closure captures body, so body.text is clean.
     try:
@@ -2008,7 +2097,7 @@ async def respond_stream(body: _RespondStreamBody):
 
             # Build message list — use last 20 turns (up from 6)
             msgs: list[dict] = [{"role": "system", "content": system_content}]
-            for t in body.history[-20:]:
+            for t in body.history[-5:]:  # 5 turns max — 20 was ~4000 tokens/request
                 if t.role in ("user", "assistant") and t.text.strip():
                     msgs.append({"role": t.role, "content": t.text})
             msgs.append({"role": "user", "content": body.text})
@@ -2320,23 +2409,11 @@ async def respond_stream(body: _RespondStreamBody):
                 yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'restart'})}\n\n"
                 return
 
-            if _DELETE_FILE_RE.search(body.text.strip()):
-                # Try AI structured extraction first
-                _d_ai = _extract_folder_params_ai(body.text.strip(), settings.openai_api_key or "")
-                if _d_ai and _d_ai.get("name"):
-                    _del_target = _d_ai["name"]
-                    _d_ai_loc   = _d_ai.get("location", "")
-                    if _d_ai_loc and not _d_ai_loc.endswith("\\") and len(_d_ai_loc) == 1:
-                        _d_ai_loc = _d_ai_loc.upper() + ":\\"
-                    _del_loc = _d_ai_loc or _extract_folder_location(body.text.strip())
-                    logger.info("[AI-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
-                else:
-                    _del_target = _extract_delete_target(body.text.strip())
-                    _del_loc    = _extract_folder_location(body.text.strip())
-                    logger.info("[REGEX-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
+            if _DELETE_FILE_RE.search(body.text.strip()) and not _SYS_CONFIRM_RE.search(body.text.strip()):
+                _del_target = _extract_delete_target(body.text.strip())
+                _del_loc    = _extract_folder_location(body.text.strip())
 
                 # No name extracted — check memory for last created/opened folder
-                # (handles "delete this folder", "delete the one you made", etc.)
                 if not _del_target:
                     try:
                         _la = memory_service.get_last_action()
@@ -2347,24 +2424,17 @@ async def respond_stream(body: _RespondStreamBody):
                                 _del_target = _mem_name
                                 if _mem_path and not _del_loc:
                                     _del_loc = _mem_path
-                                logger.info("[MEMORY] delete using last action name=%r loc=%r",
-                                            _del_target, _del_loc)
                     except Exception:
                         pass
 
                 if _del_target:
-                    from api.tools import registry as _del_reg
-                    if _del_loc:
-                        _del_path = _del_loc.rstrip("\\") + "\\" + _del_target
-                    else:
-                        _del_path = _del_target
-                    _del_res    = _del_reg.execute("delete_file", {"path": _del_path}, {})
-                    _del_spoken = _del_res.spoken or f"Deleted {_del_target}."
-                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_spoken})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_spoken})}\n\n"
+                    memory_service.set_last_action("delete_pending", {"path": _del_target}, "awaiting_confirmation")
+                    _del_confirm = f"I'm about to permanently delete '{_del_target}'. Say 'yes' to confirm or 'no' to cancel."
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_confirm})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_confirm})}\n\n"
+                    yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'delete', 'target': _del_target})}\n\n"
                     return
                 else:
-                    # Could not extract name — ask instead of falling through to GPT which lies
                     _ask = "Which folder should I delete? Please say the name."
                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _ask})}\n\n"
                     yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _ask})}\n\n"
@@ -2528,7 +2598,8 @@ async def respond_stream(body: _RespondStreamBody):
                     from api.tools import registry
                     import json as _json
 
-                    ctx       = {"openai_key": settings.openai_api_key}
+                    ctx       = {"openai_key": settings.openai_api_key,
+                                "active_window": _active_window}
                     tool_name: str | None = None
                     tool_params: dict     = {}
                     user_lower = body.text.lower().strip()
@@ -2584,9 +2655,20 @@ async def respond_stream(body: _RespondStreamBody):
                         _onf2 = _OPEN_NAMED_FOLDER_RE.search(body.text)
                         _q2   = (_onf2.group(1) or "").strip()
                         if _q2:
-                            tool_name   = "smart_open"
-                            tool_params = {"query": _q2, "type": "folder"}
-                            logger.info("[ROUTE] smart_open (folder pre-workflow) → %r", _q2)
+                            _q2_clean = re.sub(r'^(?:my|the|a)\s+', '', _q2.lower()).strip()
+                            _KNOWN_SYS = {
+                                "downloads","download","documents","document","desktop",
+                                "pictures","picture","photos","photo","videos","video",
+                                "music","temp","temporary","home","appdata",
+                            }
+                            if _q2_clean in _KNOWN_SYS:
+                                tool_name   = "open_directory"
+                                tool_params = {"path": _q2_clean}
+                                logger.info("[ROUTE] open_directory (sys folder L-1) → %r", _q2_clean)
+                            else:
+                                tool_name   = "smart_open"
+                                tool_params = {"query": _q2, "type": "folder"}
+                                logger.info("[ROUTE] smart_open (folder pre-workflow) → %r", _q2)
                     elif _OPEN_NAMED_FILE_RE.search(body.text):
                         _of2  = _OPEN_NAMED_FILE_RE.search(body.text)
                         _q2   = (_of2.group(1) or "").strip()
@@ -2711,16 +2793,27 @@ async def respond_stream(body: _RespondStreamBody):
                             tool_params = {"query": _q, "type": _tp}
                             logger.info("[ROUTE] smart_open (%s) → %r", _tp, _q)
 
-                    elif _OPEN_NAMED_FOLDER_RE.search(body.text):
+                    elif not tool_name and _OPEN_NAMED_FOLDER_RE.search(body.text):
                         _onf = _OPEN_NAMED_FOLDER_RE.search(body.text)
                         _q   = (_onf.group(1) or "").strip()
                         if _q:
-                            tool_name   = "smart_open"
-                            tool_params = {"query": _q, "type": "folder"}
-                            logger.info("[ROUTE] smart_open (folder) → %r", _q)
+                            _q_clean = re.sub(r'^(?:my|the|a)\s+', '', _q.lower()).strip()
+                            _KNOWN_SYS2 = {
+                                "downloads","download","documents","document","desktop",
+                                "pictures","picture","photos","photo","videos","video",
+                                "music","temp","temporary","home","appdata",
+                            }
+                            if _q_clean in _KNOWN_SYS2:
+                                tool_name   = "open_directory"
+                                tool_params = {"path": _q_clean}
+                                logger.info("[ROUTE] open_directory (sys folder L0.95) → %r", _q_clean)
+                            else:
+                                tool_name   = "smart_open"
+                                tool_params = {"query": _q, "type": "folder"}
+                                logger.info("[ROUTE] smart_open (folder) → %r", _q)
 
                     # ── LAYER 1: Open/launch/start <app or path> ──────────────
-                    elif _is_open_command(body.text):
+                    elif not tool_name and _is_open_command(body.text):
                         drive_path = _extract_drive_path(body.text)
                         if drive_path:
                             tool_name   = "open_directory"
@@ -2762,22 +2855,10 @@ async def respond_stream(body: _RespondStreamBody):
 
                     # ── LAYER 1c: Create folder ───────────────────────────────
                     elif _CREATE_FOLDER_RE.search(body.text) or _NAME_AND_CREATE_RE.search(body.text):
-                        # Try AI structured extraction first — handles all Whisper
-                        # transcription variants without pattern maintenance.
-                        _ai_fp = _extract_folder_params_ai(body.text, ctx.get("openai_key", ""))
-                        if _ai_fp and _ai_fp.get("name"):
-                            _fname  = _ai_fp["name"]
-                            _ai_loc = _ai_fp.get("location", "")
-                            # Normalise AI location to Windows path
-                            if _ai_loc and not _ai_loc.endswith("\\") and len(_ai_loc) == 1:
-                                _ai_loc = _ai_loc.upper() + ":\\"
-                            _floc = _ai_loc or _extract_folder_location(body.text)
-                            logger.info("[AI-EXTRACT] create name=%r loc=%r", _fname, _floc)
-                        else:
-                            # Fallback to regex extraction
-                            _floc  = _extract_folder_location(body.text)
-                            _fname = _extract_folder_name(body.text)
-                            logger.info("[REGEX-EXTRACT] create name=%r loc=%r", _fname, _floc)
+                        # Regex extraction — handles Pakistani English patterns without API cost.
+                        _floc  = _extract_folder_location(body.text)
+                        _fname = _extract_folder_name(body.text)
+                        logger.info("[REGEX-EXTRACT] create name=%r loc=%r", _fname, _floc)
                         _parent = _extract_parent_folder(body.text)
                         # FolderMemory: resolve bare parent name to its full recorded path.
                         if _parent and "\\" not in _parent and not re.match(r'^[a-zA-Z]:$', _parent):
@@ -2921,13 +3002,6 @@ async def respond_stream(body: _RespondStreamBody):
                     elif _SPEED_TEST_RE.search(body.text):
                         tool_name = "network_speed_test"
                         logger.info("[ROUTE] network_speed_test (priority)")
-
-                    # ── LAYER 5a: Wikipedia quick-facts ──────────────────────
-                    elif _extract_wiki_topic(body.text):
-                        topic = _extract_wiki_topic(body.text)
-                        tool_name   = "wiki_summary"
-                        tool_params = {"topic": topic}
-                        logger.info("[ROUTE] wiki_summary → %r", topic)
 
                     # ── LAYER 5b: Clipboard ───────────────────────────────────
                     elif _CLIPBOARD_READ_RE.search(body.text):
@@ -3355,6 +3429,16 @@ async def respond_stream(body: _RespondStreamBody):
                         t_tool_start = __import__("time").perf_counter()
                         logger.info("[TOOL] executing %s params=%r", tool_name, tool_params)
 
+                        # ── Early acknowledgment ("On it" pattern) ────────────
+                        # Stream an instant spoken ack BEFORE the tool runs so
+                        # the user hears something while the tool executes.
+                        # Only for direct-spoken tools (the ones with clear intent).
+                        if tool_name in _DIRECT_SPOKEN_TOOLS:
+                            _ack = _early_ack(tool_name, tool_params)
+                            if _ack:
+                                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _ack})}\n\n"
+                                logger.info("[TTS] early ack → %r", _ack)
+
                         # Retry once on transient failure (network, subprocess timeout)
                         result = registry.execute(tool_name, tool_params, ctx)
                         if not result.success and _RETRYABLE_TOOLS.get(tool_name):
@@ -3404,6 +3488,10 @@ async def respond_stream(body: _RespondStreamBody):
                         # Store spoken text as fallback if GPT narration fails
                         _tool_spoken = result.spoken or result.text or ""
 
+                        # Determine if an early ack was already streamed (index 0 used)
+                        _had_early_ack = tool_name in _DIRECT_SPOKEN_TOOLS
+                        _result_idx    = 1 if _had_early_ack else 0
+
                         # If tool itself failed with a spoken message, return it directly
                         # (e.g. screen reading with no API key — avoid double GPT call)
                         if not result.success and _tool_spoken:
@@ -3411,7 +3499,7 @@ async def respond_stream(body: _RespondStreamBody):
                                 _epi_mem.save(body.session_id or turn_id, "assistant", _tool_spoken)
                             except Exception:
                                 pass
-                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _tool_spoken})}\n\n"
+                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': _result_idx, 'text': _tool_spoken})}\n\n"
                             yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _tool_spoken})}\n\n"
                             return
 
@@ -3424,7 +3512,7 @@ async def respond_stream(body: _RespondStreamBody):
                                 _epi_mem.save(body.session_id or turn_id, "assistant", _tool_spoken)
                             except Exception:
                                 pass
-                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _tool_spoken})}\n\n"
+                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': _result_idx, 'text': _tool_spoken})}\n\n"
                             yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _tool_spoken})}\n\n"
                             return
 
@@ -3583,13 +3671,7 @@ async def respond_stream(body: _RespondStreamBody):
             except Exception:
                 pass
 
-            # ── Feature #3: Smart follow-up suggestion ────────────────────────
-            try:
-                _follow_up = await _suggest_follow_up(body.text, full_text, settings.openai_api_key)
-                if _follow_up:
-                    yield f"data: {json.dumps({'type': 'follow_up', 'turn_id': turn_id, 'suggestion': _follow_up})}\n\n"
-            except Exception:
-                pass
+            # Follow-up suggestion disabled — was making an extra GPT call after every response.
 
         except Exception as exc:
             # ── Feature #8: Ollama local LLM fallback ────────────────────────
@@ -3623,3 +3705,58 @@ async def respond_stream(body: _RespondStreamBody):
             "Connection":        "keep-alive",
         },
     )
+
+
+# ── Cached ACK phrases ────────────────────────────────────────────────────────
+
+_ACK_CACHE_DIR = "/tmp/xyron-ack"
+_ACK_PHRASES   = {"on_it", "opening", "done", "got_it"}
+
+
+@router.get("/cached-ack/{phrase}")
+async def cached_ack(phrase: str):
+    """
+    Return pre-generated WAV for instant acknowledgement playback.
+    Phrases: on_it | opening | done | got_it
+    Generated at startup by the warmup thread (no cold-start latency).
+    """
+    import asyncio as _asyncio
+
+    if phrase not in _ACK_PHRASES:
+        raise HTTPException(status_code=404, detail=f"Unknown phrase '{phrase}'")
+
+    cache_path = f"{_ACK_CACHE_DIR}/{phrase}.wav"
+
+    # Serve from disk cache (generated at startup)
+    try:
+        import aiofiles  # type: ignore
+        async with aiofiles.open(cache_path, "rb") as f:
+            wav_bytes = await f.read()
+        return Response(content=wav_bytes, media_type="audio/wav",
+                        headers={"Cache-Control": "public, max-age=3600"})
+    except FileNotFoundError:
+        pass
+    except ImportError:
+        # aiofiles not installed — synchronous fallback
+        import pathlib
+        p = pathlib.Path(cache_path)
+        if p.exists():
+            return Response(content=p.read_bytes(), media_type="audio/wav",
+                            headers={"Cache-Control": "public, max-age=3600"})
+
+    # Cache miss — generate on the fly and save for next time
+    _text_map = {"on_it": "On it.", "opening": "Opening.", "done": "Done.", "got_it": "Got it."}
+    text = _text_map[phrase]
+    try:
+        wav_bytes = await _asyncio.get_event_loop().run_in_executor(
+            None, _kokoro_to_wav, text, "nova", 1.1
+        )
+        if wav_bytes:
+            import pathlib, asyncio
+            pathlib.Path(_ACK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+            pathlib.Path(cache_path).write_bytes(wav_bytes)
+            return Response(content=wav_bytes, media_type="audio/wav")
+    except Exception as exc:
+        logger.warning("[ACK] Kokoro failed for '%s': %s", phrase, exc)
+
+    raise HTTPException(status_code=503, detail="TTS unavailable")

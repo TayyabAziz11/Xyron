@@ -13,6 +13,58 @@ import logging
 import re
 from typing import Optional
 
+
+def generate_response(
+    text: str,
+    tool_name: Optional[str] = None,
+    tool_output: Optional[str] = None,
+) -> str:
+    """
+    Entry point for the voice pipeline's _generate_response helper.
+    Uses model_router to pick the right model, then openai_client to call it.
+    Falls back to template strings if the API is unavailable.
+    """
+    try:
+        from api.services.model_router import select_model
+        from api.services.openai_client import openai_client
+
+        tool_matched = bool(tool_name and tool_name not in ("general_query",))
+        model_choice = select_model(text, tool_matched=tool_matched)
+
+        # Local / tool result — narrate briefly without extra AI call
+        if model_choice == "local" or not openai_client.available:
+            if tool_output:
+                return tool_output[:150]
+            if tool_name:
+                return f"Done — {tool_name.replace('_', ' ')}."
+            return "Sure, done."
+
+        user_content = (
+            f"User said: '{text}'\nResult: {(tool_output or '')[:300]}\n\n"
+            "Summarise in 1-2 natural spoken sentences."
+        ) if tool_output else text
+
+        messages = [
+            {"role": "system", "content": (
+                "You are Xyron, a voice AI built by Tayyab Aziz. "
+                "Reply in English only. Keep replies under 2 sentences. No markdown."
+            )},
+            {"role": "user", "content": user_content},
+        ]
+        model = model_choice if model_choice in ("gpt-4o", "gpt-4o-mini") else "gpt-4o-mini"
+        reply = openai_client.generate(messages, model=model, max_tokens=100)  # type: ignore[arg-type]
+        if reply:
+            return reply
+    except Exception as exc:
+        logging.getLogger(__name__).debug("generate_response AI path failed: %s", exc)
+
+    # Template fallback
+    if tool_output:
+        return tool_output[:150]
+    if tool_name:
+        return f"Done — {tool_name.replace('_', ' ')}."
+    return "Sure, done."
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
@@ -103,6 +155,22 @@ def _openai_spoken_response(command: str, result: str, agent: str, session_id: O
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_content})
+
+        # Use singleton client + model router instead of recreating per request
+        try:
+            from api.services.openai_client import openai_client as _oc
+            from api.services.model_router import select_model as _sm
+            _model = _sm(command)  # "gpt-4o-mini" or "gpt-4o"
+            if _model not in ("gpt-4o", "gpt-4o-mini"):
+                _model = "gpt-4o-mini"
+            _raw = _oc.generate(messages, model=_model, max_tokens=80, temperature=0.7)  # type: ignore[arg-type]
+            if _raw:
+                reply = _raw
+                if reply and len(reply) < 200:
+                    return reply
+                reply = ""
+        except Exception:
+            pass
 
         client = OpenAI(api_key=key)
         resp = client.chat.completions.create(

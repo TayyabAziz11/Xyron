@@ -48,30 +48,48 @@ class MemoryService:
         self._sessions: dict[str, deque] = defaultdict(lambda: deque(maxlen=_MAX_TURNS))
         # long-term: {key → value}  — loaded from disk at startup
         self._facts: dict[str, str] = {}
-        # Last executed action — for "do it again" / "open it" resolution
+        # Last executed action — for "do it again" / "open it" resolution (legacy, kept for compat)
         self._last_action: dict | None = None
+        # Multi-slot context — typed slots for precise pronoun resolution
+        # Each slot: None or a small dict with entity-specific fields.
+        self._context: dict[str, dict | None] = {
+            "last_app":    None,   # {"name": str, "pid": int|None}
+            "last_file":   None,   # {"path": str, "name": str}
+            "last_folder": None,   # {"path": str, "name": str}
+            "last_url":    None,   # {"url": str, "title": str}
+        }
+        # Per-session routing state (model used, complexity scores, depth)
+        self._routing: dict[str, dict] = {}
         # Load persisted facts from disk
         self._load_facts()
 
     # ── Disk persistence ──────────────────────────────────────────────────────
 
     def _load_facts(self) -> None:
-        """Load persisted facts from ~/.ai-operator/memory.json."""
+        """Load persisted facts + context slots from ~/.ai-operator/memory.json."""
         try:
             if _MEMORY_FILE.exists():
                 data = json.loads(_MEMORY_FILE.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    # Support both old format (flat dict) and new format (with _context key)
+                    if "_context" in data:
+                        self._context.update({
+                            k: v for k, v in data.pop("_context", {}).items()
+                            if k in self._context
+                        })
                     self._facts = data
                     logger.info("Memory loaded: %d facts from %s", len(self._facts), _MEMORY_FILE)
         except Exception as exc:
             logger.warning("Could not load memory file: %s", exc)
 
     def _save_facts(self) -> None:
-        """Persist current facts to ~/.ai-operator/memory.json (called on every write)."""
+        """Persist current facts + context slots to ~/.ai-operator/memory.json."""
         try:
             _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            payload = dict(self._facts)
+            payload["_context"] = self._context
             _MEMORY_FILE.write_text(
-                json.dumps(self._facts, ensure_ascii=False, indent=2),
+                json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception as exc:
@@ -121,13 +139,89 @@ class MemoryService:
     # ── Last action tracking ──────────────────────────────────────────────────
 
     def set_last_action(self, tool: str, params: dict, result: str) -> None:
-        """Store the most recently executed tool for context-aware follow-ups."""
+        """Store most recently executed tool (legacy single-slot — kept for compatibility)."""
         with self._lock:
             self._last_action = {"tool": tool, "params": dict(params), "result": result}
+        # Also populate the appropriate typed slot automatically
+        self._update_context_from_tool(tool, params)
 
     def get_last_action(self) -> dict | None:
         with self._lock:
             return dict(self._last_action) if self._last_action else None
+
+    # ── Multi-slot context API ────────────────────────────────────────────────
+
+    # Maps tool names to their context slot
+    _TOOL_SLOT: dict[str, str] = {
+        "open_application": "last_app",
+        "kill_app":         "last_app",
+        "kill_process":     "last_app",
+        "open_file":        "last_file",
+        "write_file":       "last_file",
+        "delete_file":      "last_file",
+        "move_file":        "last_file",
+        "open_directory":   "last_folder",
+        "create_folder":    "last_folder",
+        "smart_open":       "last_file",   # refined by params at runtime
+        "open_url":         "last_url",
+        "search_web":       "last_url",
+        "search_youtube":   "last_url",
+    }
+
+    def _update_context_from_tool(self, tool: str, params: dict) -> None:
+        """Populate the right typed slot based on which tool just ran."""
+        slot = self._TOOL_SLOT.get(tool)
+        if not slot:
+            return
+        try:
+            data: dict = {}
+
+            def _basename(p: str) -> str:
+                # Works for both Windows backslash and Unix slash paths
+                return p.replace("\\", "/").rstrip("/").split("/")[-1]
+
+            if slot == "last_app":
+                name = (params.get("app_name") or params.get("app") or
+                        params.get("process_name") or params.get("name") or "")
+                data = {"name": str(name), "pid": params.get("pid")}
+            elif slot == "last_file":
+                # smart_open may target a folder — let the type param decide
+                if tool == "smart_open":
+                    ftype = params.get("type", "file")
+                    if ftype in ("folder", "directory"):
+                        slot = "last_folder"
+                path = str(params.get("path") or params.get("query") or "")
+                data = {"path": path, "name": _basename(path) if path else ""}
+            elif slot == "last_folder":
+                path = str(params.get("path") or params.get("name") or
+                           params.get("folder_path") or "")
+                data = {"path": path, "name": _basename(path) if path else ""}
+            elif slot == "last_url":
+                url = str(params.get("url") or params.get("query") or params.get("site") or "")
+                data = {"url": url, "title": ""}
+            if data:
+                self.set_context_slot(slot, data)
+        except Exception:
+            pass
+
+    def set_context_slot(self, slot: str, data: dict) -> None:
+        """Update a typed context slot. slot ∈ {last_app, last_file, last_folder, last_url}."""
+        if slot not in self._context:
+            return
+        with self._lock:
+            self._context[slot] = dict(data)
+        self._save_facts()
+
+    def get_context_slot(self, slot: str) -> dict | None:
+        """Return the current value of a typed context slot."""
+        with self._lock:
+            val = self._context.get(slot)
+            return dict(val) if val else None
+
+    def get_context(self) -> dict[str, dict | None]:
+        """Return all context slots as a snapshot."""
+        with self._lock:
+            return {k: dict(v) if v else None for k, v in self._context.items()}
 
     def remember_explicit(self, text: str) -> None:
         """Store an explicit user-stated fact ("remember that X").
@@ -298,6 +392,45 @@ class MemoryService:
 
         except Exception:
             pass  # never crash on memory extraction
+
+    # ── Routing state (per-session, in-memory only) ───────────────────────────
+    # Keeps track of which model was last used, conversation depth, and a
+    # rolling window of complexity scores — fed into model_router.RouteContext.
+
+    def update_routing(
+        self,
+        session_id: str,
+        model:      str,
+        score:      float,
+        intent:     str = "",
+    ) -> None:
+        """Record routing decision after each turn."""
+        with self._lock:
+            r = self._routing.setdefault(session_id, {
+                "last_model":    None,
+                "conv_depth":    0,
+                "recent_scores": [],   # capped at 20
+                "last_intent":   None,
+            })
+            r["last_model"]  = model
+            r["last_intent"] = intent or r["last_intent"]
+            r["conv_depth"]  = r["conv_depth"] + 1
+            scores = r["recent_scores"]
+            scores.append(round(score, 3))
+            if len(scores) > 20:
+                scores.pop(0)
+
+    def get_routing_context(self, session_id: str) -> "RouteContext":
+        """Return a RouteContext for model_router.select_model()."""
+        from api.services.model_router import RouteContext
+        with self._lock:
+            r = self._routing.get(session_id, {})
+        return RouteContext(
+            last_model    = r.get("last_model"),
+            conv_depth    = r.get("conv_depth", 0),
+            recent_scores = list(r.get("recent_scores", [])),
+            last_intent   = r.get("last_intent"),
+        )
 
 
 memory_service = MemoryService()

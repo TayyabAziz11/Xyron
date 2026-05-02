@@ -411,7 +411,13 @@ class CommandService:
 
     def submit(self, text: str) -> Command:
         """Create, classify intent, queue and kick off background execution."""
-        intent = classify_intent(text)   # fast keyword pre-classify for instant response
+        try:
+            from .normalizer import normalize as _normalize
+            normalized = _normalize(text)
+        except Exception:
+            normalized = text
+
+        intent = classify_intent(normalized)
         cmd    = Command(text=text, status=CommandStatus.queued, intent=intent)
 
         with self._lock:
@@ -419,7 +425,7 @@ class CommandService:
             while len(self._store) > self._MAX_SIZE:
                 self._store.popitem(last=False)
 
-        _executor.submit(self._execute, cmd.id, text, intent)
+        _executor.submit(self._execute, cmd.id, normalized, intent)
         return cmd
 
     def _execute(self, command_id: str, text: str, intent: CommandIntent) -> None:
@@ -443,11 +449,28 @@ class CommandService:
                 from api.tools import registry
 
                 if _cfg.openai_api_key and _cfg.openai_api_key.startswith("sk-"):
-                    tool_name, tool_params = classify_intent_ai(text, _cfg.openai_api_key)
+                    # ── Fast path: IntentRouter (0–80 ms, no API cost) ────────
+                    # Tries cache → regex → semantic before paying for OpenAI.
+                    try:
+                        from api.services.intent_router import intent_router as _ir
+                        _route = _ir.route(text)
+                        if _route.tool_name and _route.confidence >= 0.55 and _route.tool_name in registry:
+                            tool_name   = _route.tool_name
+                            tool_params = dict(_route.params)
+                            logger.info("[ROUTE] IntentRouter tier=%d → %s (%.2f)",
+                                        _route.tier, tool_name, _route.confidence)
+                        # classify_intent_ai disabled — was making a GPT call on every unmatched command
+                    except Exception:
+                        pass  # IntentRouter failed → fall through to keyword dispatch below
 
                     # Special non-registry intents handled by legacy path
                     if tool_name not in ("confirm_draft", "reject_draft") and tool_name in registry:
-                        ctx    = {"openai_key": _cfg.openai_api_key}
+                        try:
+                            from api.services.window_context import window_context as _wctx
+                            _aw = _wctx.get_active_window()
+                        except Exception:
+                            _aw = None
+                        ctx    = {"openai_key": _cfg.openai_api_key, "active_window": _aw}
                         result = registry.execute(tool_name, tool_params, ctx)
 
                         action_url  = result.action_url

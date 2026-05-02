@@ -175,7 +175,6 @@ export interface SystemAction {
   rememberFact?:   string   // user said "remember that X" → store in backend
   queryMemory?:    boolean  // user said "what do you remember" → fetch + speak
   // ── New capabilities ────────────────────────────────────────────────────
-  wikiTopic?:      string   // "what is X" / "who is Y" → Wikipedia lookup
   readClipboard?:  boolean  // "what's on my clipboard"
   writeClipboard?: string   // "copy this to clipboard: X"
   readScreen?:     boolean  // "what's on my screen" → vision
@@ -507,21 +506,6 @@ export function detectSystemAction(text: string): SystemAction | null {
     const q = gSearch[1].replace(/\??$/, '').trim()
     if (q && q.length > 1 && !/(play|youtube|open\s+\w+|launch|news)/i.test(q))
       return { response: `Searching Google for "${q}"`, url: `https://google.com/search?q=${encodeURIComponent(q)}` }
-  }
-
-  // ── Wikipedia quick facts ─────────────────────────────────────────────────
-  // "what is X", "who is Y", "tell me about Z", "define X"
-  // Guard: skip conversational / personal / dynamic queries
-  const wikiExclude = /\b(?:weather|news|today|latest|current|price|stock|rate|bitcoin|crypto|my\s+name|your\s+name|you|doing|feel|think|want|time|date)\b/i
-  const wikiM =
-    t.match(/^what(?:'?s|\s+is)\s+(?:a\s+|an\s+|the\s+)?(.{3,60})\??$/i)
-    ?? t.match(/^who(?:'?s|\s+is)\s+(.{3,60})\??$/i)
-    ?? t.match(/^tell\s+me\s+about\s+(?:the\s+)?(.{3,60})\??$/i)
-    ?? t.match(/^(?:define|explain)\s+(.{3,60})\??$/i)
-  if (wikiM && !wikiExclude.test(t)) {
-    const topic = wikiM[1].trim().replace(/[?!.,;]+$/, '').trim()
-    if (topic.length > 1)
-      return { response: `Looking that up for you…`, wikiTopic: topic }
   }
 
   // ── Clipboard ────────────────────────────────────────────────────────────
