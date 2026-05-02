@@ -4,13 +4,16 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import difflib
 import tempfile
 import uuid
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from ..constants.prompts import CORE_IDENTITY
 
 router = APIRouter(prefix="/api/v1/voice", tags=["voice"])
 logger = logging.getLogger(__name__)
@@ -46,6 +49,51 @@ def _ensure_paths() -> None:
             sys.path.insert(0, p)
 
 
+# ── RMS silence detection ─────────────────────────────────────────────────────
+
+def _is_silent_audio(audio_bytes: bytes, content_type: str = "audio/webm") -> bool:
+    """Return True if audio is below speech energy threshold (saves Whisper API cost).
+
+    Uses ffmpeg to decode container audio → raw 16kHz mono PCM, then numpy RMS.
+    Returns False (don't skip) if ffmpeg is not installed or decoding fails.
+    """
+    try:
+        import numpy as np
+
+        suffix = (
+            ".webm" if "webm" in content_type else
+            ".ogg"  if "ogg"  in content_type else
+            ".mp3"  if "mp3"  in content_type else
+            ".wav"
+        )
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_path,
+                 "-f", "s16le", "-ar", "16000", "-ac", "1", "-"],
+                capture_output=True,
+                timeout=5,
+            )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        if proc.returncode != 0 or len(proc.stdout) < 100:
+            return False
+
+        audio_np = np.frombuffer(proc.stdout, dtype=np.int16)
+        rms = float(np.sqrt(np.mean(audio_np.astype(np.float32) ** 2)))
+        logger.debug("Audio RMS energy: %.1f", rms)
+        return rms < 300  # ~-43 dBFS — ambient noise threshold
+
+    except FileNotFoundError:
+        return False  # ffmpeg not installed — let Whisper decide
+    except (subprocess.TimeoutExpired, ImportError, Exception):
+        return False
+
+
 # ── Text cleaning for speech ──────────────────────────────────────────────────
 
 def _clean_for_speech(text: str, max_chars: int = 300) -> str:
@@ -77,6 +125,41 @@ def _clean_for_speech(text: str, max_chars: int = 300) -> str:
         cut = t[:max_chars].rfind(".")
         t   = t[:cut + 1] if cut > max_chars // 3 else t[:max_chars]
     return t.strip()
+
+
+# ── Urdu → English translation for command routing ────────────────────────────
+
+def _translate_urdu_command(text: str, openai_key: str) -> str:
+    """Translate an Urdu voice command to English using GPT-4o-mini.
+
+    Used so that the English-only routing regexes can match Urdu commands.
+    Returns the original text on any failure (safe fallback).
+    """
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a voice command translator for a PC assistant. "
+                        "Translate the Urdu command to English, preserving the exact intent "
+                        "(create folder, delete file, open app, subfolder, drive name, etc.). "
+                        "Return ONLY the English translation — no explanation, no extra words."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            max_tokens=100,
+            temperature=0.0,
+        )
+        translated = (resp.choices[0].message.content or "").strip()
+        return translated if translated else text
+    except Exception as exc:
+        logger.warning("Urdu→English translation failed: %s", exc)
+        return text
 
 
 # ── Whisper local model cache (avoids 2-3s cold-start on first transcription) ─
@@ -120,6 +203,13 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         logger.debug("Audio clip too small (%d bytes) — skipping transcription", len(audio_bytes))
         return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
 
+    # ── RMS energy gate (silence detection) ──────────────────────────────────
+    # Runs only when ffmpeg is present; skipped otherwise (no-op fallback).
+    ct_for_rms = (audio.content_type or "audio/webm").lower()
+    if _is_silent_audio(audio_bytes, ct_for_rms):
+        logger.debug("Audio below RMS threshold — treating as silence (%.0f bytes)", len(audio_bytes))
+        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
     # ── 1. OpenAI Whisper API ─────────────────────────────────────────────────
     try:
         from ..config import settings
@@ -146,10 +236,131 @@ async def transcribe_audio(audio: UploadFile = File(...)):
                         model="whisper-1",
                         file=f,
                         response_format="verbose_json",
+                        # Prompt biases Whisper toward command-style English/Urdu speech,
+                        # reducing hallucinations from silence or background noise.
+                        prompt="Xyron assistant.",
                     )
                 text = (result.text or "").strip()
                 raw_lang = getattr(result, "language", "en") or "en"
+                # Whisper sometimes returns full names ("english") not ISO codes ("en")
+                _LANG_MAP = {"english": "en", "urdu": "ur", "hindi": "hi", "arabic": "ar"}
+                raw_lang = _LANG_MAP.get(raw_lang.lower(), raw_lang)
                 lang = raw_lang if raw_lang in ("en", "ur") else "en"
+
+                # Hallucination guard 1: no_speech_prob from verbose_json segments.
+                # If Whisper itself says there's no speech (avg > 0.7), drop the transcript.
+                # This catches the "vaccine text / subtitles from silence" class of hallucinations.
+                _segments = getattr(result, "segments", None) or []
+                if _segments:
+                    _avg_nsp     = sum(getattr(s, "no_speech_prob", 0.0) for s in _segments) / len(_segments)
+                    _avg_logprob = sum(getattr(s, "avg_logprob", -1.0)   for s in _segments) / len(_segments)
+
+                    # no_speech_prob > 0.4 AND logprob also bad: pure silence/noise.
+                    # Threshold -0.90: Pakistani-accented English/Urdu commands typically land
+                    # between -0.78 and -0.87; pure noise/silence falls below -0.90.
+                    if _avg_nsp > 0.4 and _avg_logprob < -0.90:
+                        logger.info("Whisper hallucination (nsp=%.2f, logprob=%.2f) — dropping: %r",
+                                    _avg_nsp, _avg_logprob, text[:60])
+                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
+                    # avg_logprob < -0.90: no-speech audio with nothing recoverable.
+                    # Real commands (even accented) hit above -0.87; below -0.90 is
+                    # fan/hum/electrical noise generating garbage tokens.
+                    if _avg_logprob < -0.90:
+                        logger.info("Whisper low-confidence (avg_logprob=%.2f) — dropping: %r",
+                                    _avg_logprob, text[:60])
+                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
+                    # compression_ratio > 2.4: Whisper is looping on repeated tokens.
+                    # "and and or or or or or or" / "the the the" from fan/electrical hum.
+                    # Whisper's own source uses this threshold to detect stuck decoders.
+                    _avg_cr = sum(getattr(s, "compression_ratio", 1.0) for s in _segments) / len(_segments)
+                    if _avg_cr > 2.4:
+                        logger.info("Whisper token-loop (compression_ratio=%.2f) — dropping: %r",
+                                    _avg_cr, text[:60])
+                        return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
+                # Hallucination guard 2: unexpected language.
+                # This assistant only processes English and Urdu.
+                # Indonesian, Malay, Spanish, etc. are always Whisper hallucinations from silence.
+                # "latin" is Whisper's common misclassification of formal/capitalized English
+                # (e.g. "Create A Folder In D Drive") — remap to English, never drop.
+                if raw_lang == "latin":
+                    raw_lang = "en"
+                    lang = "en"
+
+                # Pakistani-accented English is frequently misclassified as "sindhi", "punjabi",
+                # or other South Asian languages even when the transcribed text is pure English.
+                # Two-step check: (1) 85%+ ASCII Latin chars, (2) at least one English command
+                # word is present — prevents Malay/Spanish from being reclassified as English.
+                _EN_CMD_WORDS = frozenset({
+                    "create","make","open","close","folder","file","play","stop","search",
+                    "find","show","tell","turn","volume","mute","pause","new","delete",
+                    "copy","move","rename","download","screenshot","screen","click","type",
+                    "press","write","read","edit","save","check","get","set","my","your",
+                    "desktop","drive","directory","subfolder","window","tab","browser",
+                    "remind","schedule","email","whatsapp","spotify","youtube","github",
+                })
+                if text and raw_lang not in ("en", "ur"):
+                    _alpha_chars = [c for c in text if c.isalpha()]
+                    if _alpha_chars:
+                        _latin_ratio = sum(1 for c in _alpha_chars if c.isascii()) / len(_alpha_chars)
+                        _text_words  = set(re.findall(r'[a-z]+', text.lower()))
+                        if _latin_ratio >= 0.85 and (_text_words & _EN_CMD_WORDS):
+                            logger.info(
+                                "Whisper accent reclassify %s→en (%.0f%% latin): %r",
+                                raw_lang, _latin_ratio * 100, text[:60],
+                            )
+                            raw_lang = "en"
+                            lang = "en"
+
+                # Non-Latin transcript (Devanagari/Bengali etc.) from a non-Urdu language
+                # is almost certainly a mis-transcription of Pakistani-accented English.
+                # Retry once with language="en" to get the correct Latin transcription.
+                if text and raw_lang not in ("en", "ur"):
+                    _alpha_chars = [c for c in text if c.isalpha()]
+                    _latin_ratio = (
+                        sum(1 for c in _alpha_chars if c.isascii()) / len(_alpha_chars)
+                        if _alpha_chars else 1.0
+                    )
+                    if _latin_ratio < 0.5:
+                        # text is mostly non-Latin → retry forcing English
+                        logger.info(
+                            "Whisper mis-script (%s, %.0f%% latin) — retrying with language=en: %r",
+                            raw_lang, _latin_ratio * 100, text[:60],
+                        )
+                        try:
+                            with open(tmp_path, "rb") as _f2:
+                                _r2 = client.audio.transcriptions.create(
+                                    model="whisper-1",
+                                    file=_f2,
+                                    response_format="verbose_json",
+                                    language="en",
+                                    prompt="Xyron assistant.",
+                                )
+                            _t2 = (_r2.text or "").strip()
+                            if _t2:
+                                logger.info("Whisper retry en: %r", _t2[:60])
+                                text = _t2
+                                raw_lang = "en"
+                                lang = "en"
+                        except Exception as _e2:
+                            logger.debug("Whisper retry failed: %s", _e2)
+
+                if text and raw_lang not in ("en", "ur"):
+                    logger.info("Whisper hallucination (lang=%s) — dropping: %r", raw_lang, text[:60])
+                    return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
+                # Urdu → English translation so routing regexes (English-only) can match.
+                # Without this, Urdu commands fall through to GPT which says "Done" without
+                # ever calling a tool. Translation adds ~200ms but fixes command execution.
+                if raw_lang == "ur" and text:
+                    _translated = _translate_urdu_command(text, settings.openai_api_key)
+                    if _translated and _translated != text:
+                        logger.info("Urdu→English: %r → %r", text[:60], _translated[:60])
+                        text = _translated
+                        lang = "en"
+
                 logger.info("OpenAI Whisper: %r lang=%s (%d chars)", text[:60], lang, len(text))
                 return {"success": True, "data": {"text": text, "language": lang, "engine": "openai"}}
             except BadRequestError as bre:
@@ -212,7 +423,7 @@ async def synthesize_text(request: Request):
     _ensure_paths()
     body   = await request.json()
     text   = body.get("text", "").strip()
-    voice  = body.get("voice", "nova")   # OpenAI voice name
+    voice  = body.get("voice", "onyx")   # OpenAI voice name
     speed  = float(body.get("speed", 1.0))
 
     if not text:
@@ -429,7 +640,7 @@ _PROFILE_VOICES: dict[str, str] = {
     "boss":         "onyx",
     "friendly":     "nova",
     "professional": "alloy",
-    "assistant":    "nova",
+    "assistant":    "onyx",      # onyx is the global default
 }
 
 # ── Profile switch voice commands (Feature #4) ────────────────────────────────
@@ -801,6 +1012,7 @@ _OLLAMA_URL = "http://localhost:11434/api/generate"
 _OLLAMA_MODEL = "llama3"
 
 _VOICE_SYSTEM_PROMPT = (
+    CORE_IDENTITY + "\n\n"
     "You are Xyron — a sharp, warm voice assistant. Think of yourself as a smart friend who happens to know everything. "
     "You talk like a real person: natural, relaxed, occasionally a touch of humour. Never stiff, never robotic. "
     "\n\nHOW TO RESPOND:"
@@ -833,7 +1045,7 @@ _SYSTEM_INFO_KEYWORDS = frozenset([
     "how much ram", "how much memory", "how much storage",
     "what cpu", "which cpu", "what processor", "which processor",
     "hardware", "specifications", "storage left", "space left",
-    "drive space", "c drive", "d drive", "e drive", "disk usage",
+    "drive space", "c drive space", "d drive space", "e drive space", "disk usage",
     "storage info", "system details", "computer info", "laptop info",
     # Broader patterns
     "tell my system", "tell me my system", "tell me about my",
@@ -961,6 +1173,7 @@ def _is_pure_conversation(text: str) -> bool:
 
 
 _CONV_SYSTEM_PROMPT = (
+    CORE_IDENTITY + "\n\n"
     "You are Xyron, a witty and warm AI friend. The user is having casual conversation — "
     "no tasks, just chat. Respond naturally, warmly, with light humour when fitting. "
     "Keep it short: 1-2 sentences max. Be spontaneous and genuine. No markdown, no preamble."
@@ -1179,12 +1392,13 @@ def _extract_search_query(text: str) -> str:
 # ── Folder / directory routing ────────────────────────────────────────────────
 
 _CREATE_FOLDER_RE = re.compile(
-    r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\b',
+    # "great folder" = Pakistani-accent mishearing of "create folder" by Whisper
+    r'\b(?:create|make|add|great)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:folder|directory)\b',
     re.IGNORECASE,
 )
 
 _SUBFOLDER_RE = re.compile(
-    r'\b(?:create|make|add)\s+(?:(?P<count>\d+)\s+)?sub\s*folders?\b',
+    r'\b(?:create|make|add)\s+(?:a\s+|an\s+|(?P<count>\d+)\s+)?(?:in\s+)?sub\s*folders?\b',
     re.IGNORECASE,
 )
 
@@ -1194,9 +1408,15 @@ _OPEN_THIS_RE = re.compile(
 )
 
 _FOLDER_LOC_RE = re.compile(
-    r'\b(?:in|on|at|inside|under)\s+(?:the\s+)?'
-    r'(?:(?P<drive>[a-e])\s*(?:\s+drive|\s+disk|:)|'
-    r'(?P<special>desktop|documents?|downloads?|pictures?))\b',
+    r'\b(?:in|on|at|inside|under)\s+'
+    r'(?:'
+    # "D drive", "D:", "the D drive", "my D drive" (space between my and letter)
+    r'(?:(?:the|my)\s+)?(?P<drive>[a-z])(?:\s+(?:drive|disk)\b|:)'
+    # "myd drive" — Whisper merges "my" + drive letter into one token, no space
+    r'|my\s*(?P<drivemy>[a-z])\s+(?:drive|disk)\b'
+    # named special folders, with optional "my"/"the" prefix
+    r'|(?:(?:my|the)\s+)?(?P<special>desktop\b|documents?\b|downloads?\b|pictures?\b)'
+    r')',
     re.IGNORECASE,
 )
 
@@ -1227,16 +1447,41 @@ _DELETE_FILE_RE = re.compile(
 
 def _extract_delete_target(text: str) -> str:
     """Extract the file/folder name from a delete command."""
-    m = _DELETE_FILE_RE.search(text.strip())
+    # Multi-word name fragment: word(s) with hyphens/underscores, stopping before stop-words.
+    # Handles both "s-games" (hyphen) and "s games" (Whisper splits hyphenated words).
+    _MWORD = (
+        r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*'
+        r'(?:\s+(?!(?:in|on|at|inside|under|for|and|folder|directory|drive|the|a)\b)'
+        r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*)*'
+    )
+    # 1. Handle "name is X" / "name as X" / "named as X" / "the name should be X"
+    m_named = re.search(
+        r'\b(?:(?:the\s+)?name\s+should\s+be\s+|should\s+be\s+named\s+|'
+        r'name\s+is\s+|name\s+as\s+|named\s+(?:as\s+)?|'
+        r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+)'
+        r'["\']?(' + _MWORD + r')["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|and)\b|\s*[.,!?]|\Z)',
+        text, re.IGNORECASE,
+    )
+    if m_named:
+        return _strip_punct(m_named.group(1))
+    # 2. Standard "delete <type> <name>" — skip if next word is an article or "name" keyword
+    m = re.search(
+        r'\b(?:delete|remove|erase)\s+(?:(?:the\s+)?(?:folder|directory|file|item)\s+)?'
+        r'(?!(?:in|on|at|inside|under|from|the|name)\b)'
+        r'["\']?(' + _MWORD + r')["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|from)\b|\s*[.,!?]|$)',
+        text.strip(), re.IGNORECASE,
+    )
     if not m:
         return ""
-    return (m.group("target") or "").strip().strip("'\"").strip()
+    return _strip_punct(m.group(1) or "")
 
 
 # Matches "inside <folder>", "in folder <name>", "under <folder>" for subfolder support
 _PARENT_FOLDER_RE = re.compile(
-    r'\b(?:inside|in\s+(?:the\s+)?folder|under)\s+["\']?(?P<parent>[a-zA-Z0-9_\-\.]+)["\']?'
-    r'(?=\s|$)',
+    r'\b(?:inside|in\s+(?:the\s+)?folder|under)\s+(?:a\s+|an\s+|the\s+)?'
+    r'["\']?(?P<parent>[a-zA-Z0-9_\-\.]+)["\']?(?=\s|$)',
     re.IGNORECASE,
 )
 
@@ -1245,7 +1490,8 @@ def _extract_folder_location(text: str) -> str:
     m = _FOLDER_LOC_RE.search(text)
     if not m:
         return ""
-    drive = m.group("drive")
+    # "drivemy" catches "myd drive" (Whisper-merged token), "drive" catches normal "d drive"
+    drive = m.group("drive") or m.group("drivemy")
     special = m.group("special")
     if drive:
         return f"{drive.upper()}:\\"
@@ -1253,11 +1499,21 @@ def _extract_folder_location(text: str) -> str:
 
 
 def _extract_parent_folder(text: str) -> str:
-    """Extract parent folder name from 'inside X' / 'in folder X' / 'under X'."""
-    m = _PARENT_FOLDER_RE.search(text)
-    if not m:
+    """Extract parent folder path from 'inside X inside Y' / 'in folder X' / 'under X'.
+
+    Multiple levels: 'inside Projects inside Games' → 'Games\\Projects'
+    (sentence order is inner-first, so we reverse to build outer→inner path).
+    """
+    matches = list(re.finditer(
+        r'\b(?:inside|in\s+(?:the\s+)?folder|under)\s+(?:a\s+|an\s+|the\s+)?'
+        r'["\']?([a-zA-Z0-9_\-\.]+)["\']?(?=\s|$)',
+        text, re.IGNORECASE,
+    ))
+    if not matches:
         return ""
-    return m.group("parent").strip()
+    names = [m.group(1).strip() for m in matches]
+    names.reverse()  # sentence: "inside Projects inside Games" → outer=Games, inner=Projects
+    return "\\".join(names)
 
 
 def _clean_folder_name(raw: str) -> str:
@@ -1273,31 +1529,125 @@ def _clean_folder_name(raw: str) -> str:
     return raw.strip()
 
 
+def _strip_punct(s: str) -> str:
+    """Strip trailing/leading sentence punctuation from an extracted name."""
+    return s.strip().strip(".,!?;:'\"").strip()
+
+
+# ── LLM-based structured extraction (production path) ────────────────────────
+# Regex is the fallback when no OpenAI key is available.
+# GPT handles every Whisper transcription variation without pattern maintenance.
+
+try:
+    from pydantic import BaseModel as _BM
+    class _FolderParams(_BM):
+        name: str        # folder name only — no articles/prepositions
+        location: str    # e.g. "D:\\" or "desktop" or "" if not specified
+    _PYDANTIC_OK = True
+except ImportError:
+    _PYDANTIC_OK = False
+
+
+def _extract_folder_params_ai(text: str, openai_key: str) -> dict | None:
+    """Use GPT structured output to extract folder name + location from Whisper transcript.
+
+    Handles all phrasings ('name is X', 'named as X', 'the name should be X',
+    'call it X', etc.) and is robust to Whisper transcription variations.
+    Returns {"name": str, "location": str} or None on failure.
+    """
+    if not _PYDANTIC_OK or not openai_key:
+        return None
+    try:
+        from openai import OpenAI as _OAI
+        client = _OAI(api_key=openai_key)
+        result = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract ONLY the folder name and drive location from a voice command.\n\n"
+                        "FOLDER NAME RULES — extract only the bare name word(s), strip everything else:\n"
+                        "  'name is Games'       → name='Games'\n"
+                        "  'The name is Games'   → name='Games'  (NOT 'is Games')\n"
+                        "  'named as PSJF'       → name='PSJF'\n"
+                        "  'named Games'         → name='Games'\n"
+                        "  'call it MyWork'      → name='MyWork'\n"
+                        "  'the name should be Reports' → name='Reports'\n"
+                        "  'create folder in D drive'   → name='' (no name given)\n"
+                        "Strip ALL verbs (is, named, called), articles (the, a), prepositions.\n\n"
+                        "LOCATION RULES:\n"
+                        "  'D drive' or 'D:' or 'myd drive' or 'my d drive' → location='D:\\\\'\n"
+                        "  'C drive'         → location='C:\\\\'\n"
+                        "  'E drive'         → location='E:\\\\'\n"
+                        "  'desktop'         → location='desktop'\n"
+                        "  'documents'       → location='documents'\n"
+                        "  'downloads'       → location='downloads'\n"
+                        "  not mentioned     → location=''\n"
+                        "NOTE: 'myd drive' means D drive (Whisper speech-to-text merges 'my d' into 'myd').\n"
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            response_format=_FolderParams,
+            max_tokens=40,
+        )
+        parsed = result.choices[0].message.parsed
+        return {"name": parsed.name.strip(), "location": parsed.location.strip()}
+    except Exception:
+        return None
+
+
+# Unified "name as/is/named/called/should be" pattern — specific alternatives first.
+# Covers Pakistani-English variants: "name is X", "name as X", "named as X",
+# "the name should be X", "should be named X".
+# Supports multi-word names (e.g. Whisper splits "s-games" → "s games").
+_NAME_AS_PAT = re.compile(
+    r'\b(?:(?:the\s+)?name\s+should\s+be\s+|should\s+be\s+named\s+|'
+    r'name\s+is\s+|name\s+as\s+|named\s+as\s+|named\s+|'
+    r'with\s+(?:the\s+)?name\s+(?:of\s+)?|called\s+|call\s+it\s+|name\s+it\s+|'
+    r'name\s+(?!(?:it|as|is|of|should|the)\b))'
+    r'["\']?'
+    r'([A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*'
+    r'(?:\s+(?!(?:in|on|at|inside|under|for|and|folder|directory|drive|the|a)\b)'
+    r'[A-Za-z0-9]+(?:[-_\.][A-Za-z0-9]+)*)*)'
+    r'["\']?'
+    r'(?=\s+(?:in|on|at|inside|under|for|and)\b|\s*[.,]|\Z)',
+    re.IGNORECASE,
+)
+
+
 def _extract_folder_name(text: str) -> str:
-    # 1. Explicit naming: "name it X", "call it X", "called X", "named X"
-    m = _FOLDER_NAME_EXPLICIT_RE.search(text)
+    # 1. "name as X" / "name is X" / "named as X" / "named X" / "called X" / "name it X"
+    #    Must run BEFORE _FOLDER_NAME_EXPLICIT_RE which also matches "named"/"called"
+    #    but captures "as X" instead of just "X".
+    m = _NAME_AS_PAT.search(text)
     if m:
-        return _clean_folder_name(m.group("name").strip())
-    # 2. Combined "name it X and create it in Y"
+        return _strip_punct(m.group(1))
+    # 2. Combined "name it X and create it in Y" / "call it X on desktop"
     m_nac = _NAME_AND_CREATE_RE.search(text)
     if m_nac:
-        return _clean_folder_name(m_nac.group("name").strip())
+        return _strip_punct(_clean_folder_name(m_nac.group("name")))
     # 3. "create [Name] folder" — word immediately before 'folder'
     m2 = re.search(
         r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?\s+(?:folder|directory)\b',
         text, re.IGNORECASE,
     )
     if m2:
-        candidate = m2.group(1).strip()
+        candidate = _strip_punct(m2.group(1))
         if candidate.lower() not in ("new", "a", "the", "this", "some", "my"):
             return _clean_folder_name(candidate)
-    # 4. "create folder GAMES" — word immediately after 'folder'
+    # 4. "create folder NAME" — word(s) after 'folder', stop at preposition
+    #    Negative lookahead skips when a preposition immediately follows 'folder'
     m3 = re.search(
-        r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+["\']?([A-Za-z0-9][a-zA-Z0-9_\-\.]{0,50})["\']?',
+        r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+'
+        r'(?!(?:in|on|at|inside|under|for|a|the|my)\b)'
+        r'["\']?([A-Za-z0-9][a-zA-Z0-9_\-\. ]{0,50}?)["\']?'
+        r'(?=\s+(?:in|on|at|inside|under|for\s+me)|$)',
         text, re.IGNORECASE,
     )
     if m3:
-        candidate = m3.group(1).strip()
+        candidate = _strip_punct(m3.group(1))
         if candidate.lower() not in ("in", "on", "at", "inside", "under", "new", "a", "the"):
             return _clean_folder_name(candidate)
     return ""
@@ -1305,22 +1655,118 @@ def _extract_folder_name(text: str) -> str:
 
 def _extract_subfolder_params(text: str, last_action: dict | None) -> dict:
     """Extract parent, count, and names for subfolder creation."""
-    m_count = re.search(r'(?:create|make|add)\s+(\d+)\s+sub', text, re.IGNORECASE)
+    m_count = re.search(r'(?:create|make|add)\s+(?:a\s+)?(\d+)\s+sub', text, re.IGNORECASE)
     count = int(m_count.group(1)) if m_count else 0
 
     # "named X Y Z"  OR  "create subfolders X Y Z inside..."
     m_names = re.search(r'\b(?:named?|called)\s+(.+?)(?:\s+in\s+|\s+inside\s+|\s*$)', text, re.IGNORECASE)
     if not m_names:
-        m_names = re.search(r'\bsub\s*folders?\s+([A-Za-z0-9][A-Za-z0-9 ,]+?)(?:\s+in\s+|\s+inside\s+|\s+on\s+|\s*$)', text, re.IGNORECASE)
+        # Negative lookahead prevents "in D drive" from being captured as names
+        m_names = re.search(
+            r'\bsub\s*folders?\s+(?!in\b|on\b|at\b|inside\b|under\b|the\b)'
+            r'([A-Za-z0-9][A-Za-z0-9 ,]+?)(?:\s+in\s+|\s+inside\s+|\s+on\s+|\s*$)',
+            text, re.IGNORECASE,
+        )
     names: list[str] = []
     if m_names:
         raw = m_names.group(1).strip()
-        names = [n.strip() for n in re.split(r'[,\s]+', raw) if n.strip() and len(n.strip()) > 1]
+        # Split only on commas — "gta vice city" stays as one name;
+        # comma-separated lists like "Alpha, Beta" still produce multiple names.
+        names = [_strip_punct(n.strip()) for n in re.split(r',\s*', raw)
+                 if n.strip() and len(n.strip()) >= 1]
 
-    parent = _extract_folder_location(text)
-    if not parent and last_action and last_action.get("tool") in ("create_folder", "open_directory"):
+    # Combine location ("desktop", "D:\\") + inner folder ("inside Games") into full parent
+    _floc  = _extract_folder_location(text)
+    _inner = _extract_parent_folder(text)  # e.g. "Games" from "inside Games on Desktop"
+
+    # FolderMemory: if _inner is a bare name (no backslash), resolve to its recorded full path.
+    # This fixes "inside project in d drive" → D:\workspace\project (not D:\project).
+    _inner_full = ""
+    if _inner and "\\" not in _inner and not re.match(r'^[a-zA-Z]:$', _inner):
+        try:
+            from ..services.history_service import history_service as _hs
+            _fm = _hs.lookup_folder(_inner.lower())
+            if _fm:
+                _inner_full = _fm["full_win"]
+                logger.info("FolderMemory subfolder lookup: %r → %r", _inner, _inner_full)
+        except Exception:
+            pass
+
+    # Also try "in X" (bare word, not caught by _extract_parent_folder which only handles "inside/in folder/under")
+    if not _inner and not _floc:
+        _in_m = re.search(
+            r'\bin\s+(?:the\s+)?(?![a-z](?:\s+(?:drive|disk)|:)\b)'
+            r'(?!(?:desktop|documents?|downloads?|pictures?|music|videos?)\b)'
+            r'([A-Za-z0-9][A-Za-z0-9_\-]{1,40})',
+            text, re.IGNORECASE,
+        )
+        if _in_m:
+            _bare = _in_m.group(1).strip()
+            try:
+                from ..services.history_service import history_service as _hs
+                _fm2 = _hs.lookup_folder(_bare.lower())
+                if _fm2:
+                    _inner_full = _fm2["full_win"]
+                    logger.info("FolderMemory bare-in lookup: %r → %r", _bare, _inner_full)
+            except Exception:
+                pass
+
+    if _inner_full:
+        parent = _inner_full
+    elif _inner and _floc:
+        parent = _floc.rstrip("\\") + "\\" + _inner
+    elif _inner:
+        parent = _inner
+    else:
+        parent = _floc
+
+    def _la_full_path(lp: dict) -> str:
+        """Build full Windows path from last_action params without os.path.join (Linux-safe).
+        Handles both create_folder shape {path, name} and create_subfolders shape {parent, names}."""
+        _p = (lp.get("path") or lp.get("parent") or "").rstrip("\\")
+        _n = lp.get("name") or ""
+        if not _n:
+            ns = lp.get("names") or []
+            _n = ns[0] if ns else ""
+        return (_p + "\\" + _n) if (_p and _n) else (_p or _n)
+
+    if not parent and last_action and last_action.get("tool") in ("create_folder", "open_directory", "create_subfolders"):
         lp = last_action.get("params", {})
-        parent = os.path.join(lp.get("path", ""), lp.get("name", "")).rstrip("\\") or lp.get("path", "")
+        parent = _la_full_path(lp) or lp.get("path", "")
+
+    # If parent is a bare folder name (no backslash, no drive letter) and >= 3 chars,
+    # fuzzy-match it against last_action to resolve the full path.
+    # Handles Whisper mishearing: "inside teyip" → "inside tie-up" (last created folder).
+    elif (parent and len(parent) >= 3 and "\\" not in parent and not parent.endswith(":")
+          and last_action and last_action.get("tool") in ("create_folder", "open_directory", "create_subfolders")):
+        lp = last_action.get("params", {})
+        la_name = lp.get("name", "").lower()
+        # Collect all candidate names from last_action (folder name + any subfolder names)
+        candidates = [la_name] if la_name else []
+        for _n in (lp.get("names") or []):
+            if _n and _n.lower() not in candidates:
+                candidates.append(_n.lower())
+        _parent_lower = parent.lower()
+        matched = False
+        for cand in candidates:
+            if not cand or len(cand) < 2:
+                continue
+            # Exact substring match first
+            if _parent_lower in cand or cand in _parent_lower:
+                matched = True
+                break
+            # Fuzzy match: short names need a lower threshold (Whisper phonetic mishearings
+            # like "teyip"→"tie-up" score ~0.55; longer names stay at 0.65).
+            _thresh = 0.52 if max(len(_parent_lower), len(cand)) <= 6 else 0.65
+            ratio = difflib.SequenceMatcher(None, _parent_lower, cand).ratio()
+            if ratio >= _thresh:
+                logger.info("Fuzzy subfolder match: %r ~ %r (ratio=%.2f)", parent, cand, ratio)
+                matched = True
+                break
+        if matched:
+            _full = _la_full_path(lp)
+            if _full:
+                parent = _full
 
     return {"parent": parent, "names": names, "count": count}
 
@@ -1539,6 +1985,15 @@ async def respond_stream(body: _RespondStreamBody):
                 system_content += "\n\nLANGUAGE OVERRIDE: The user is speaking Urdu. You MUST reply entirely in Urdu script (e.g. آپ کیسے ہیں؟). Do not use English or transliteration."
             if mem_context:
                 system_content += f"\n\n{mem_context}"
+
+            # Inject known folder hierarchy so LLM resolves paths correctly
+            try:
+                from ..services.history_service import history_service as _hs
+                _folder_ctx = _hs.get_folders_context()
+                if _folder_ctx:
+                    system_content += f"\n\n{_folder_ctx}"
+            except Exception:
+                pass
 
             # Inject usage habit context from episodic memory
             try:
@@ -1865,14 +2320,54 @@ async def respond_stream(body: _RespondStreamBody):
                 yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'restart'})}\n\n"
                 return
 
-            if _DELETE_FILE_RE.search(body.text.strip()) and not _SYS_CONFIRM_RE.search(body.text.strip()):
-                _del_target = _extract_delete_target(body.text.strip())
+            if _DELETE_FILE_RE.search(body.text.strip()):
+                # Try AI structured extraction first
+                _d_ai = _extract_folder_params_ai(body.text.strip(), settings.openai_api_key or "")
+                if _d_ai and _d_ai.get("name"):
+                    _del_target = _d_ai["name"]
+                    _d_ai_loc   = _d_ai.get("location", "")
+                    if _d_ai_loc and not _d_ai_loc.endswith("\\") and len(_d_ai_loc) == 1:
+                        _d_ai_loc = _d_ai_loc.upper() + ":\\"
+                    _del_loc = _d_ai_loc or _extract_folder_location(body.text.strip())
+                    logger.info("[AI-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
+                else:
+                    _del_target = _extract_delete_target(body.text.strip())
+                    _del_loc    = _extract_folder_location(body.text.strip())
+                    logger.info("[REGEX-EXTRACT] delete name=%r loc=%r", _del_target, _del_loc)
+
+                # No name extracted — check memory for last created/opened folder
+                # (handles "delete this folder", "delete the one you made", etc.)
+                if not _del_target:
+                    try:
+                        _la = memory_service.get_last_action()
+                        if _la and _la.get("tool") in ("create_folder", "open_directory"):
+                            _mem_name = _la.get("params", {}).get("name", "")
+                            _mem_path = _la.get("params", {}).get("path", "")
+                            if _mem_name:
+                                _del_target = _mem_name
+                                if _mem_path and not _del_loc:
+                                    _del_loc = _mem_path
+                                logger.info("[MEMORY] delete using last action name=%r loc=%r",
+                                            _del_target, _del_loc)
+                    except Exception:
+                        pass
+
                 if _del_target:
-                    memory_service.set_last_action("delete_pending", {"path": _del_target}, "awaiting_confirmation")
-                    _del_confirm = f"I'm about to permanently delete '{_del_target}'. Say 'yes' to confirm or 'no' to cancel."
-                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_confirm})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_confirm})}\n\n"
-                    yield f"data: {json.dumps({'type': 'confirmation_required', 'action': 'delete', 'target': _del_target})}\n\n"
+                    from api.tools import registry as _del_reg
+                    if _del_loc:
+                        _del_path = _del_loc.rstrip("\\") + "\\" + _del_target
+                    else:
+                        _del_path = _del_target
+                    _del_res    = _del_reg.execute("delete_file", {"path": _del_path}, {})
+                    _del_spoken = _del_res.spoken or f"Deleted {_del_target}."
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _del_spoken})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _del_spoken})}\n\n"
+                    return
+                else:
+                    # Could not extract name — ask instead of falling through to GPT which lies
+                    _ask = "Which folder should I delete? Please say the name."
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _ask})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': _ask})}\n\n"
                     return
 
             # ── LAYER 0e8: Sleep / Hibernate / Lock — execute server-side directly ──
@@ -2257,13 +2752,45 @@ async def respond_stream(body: _RespondStreamBody):
                                     tool_params = {"app_name": app}
                                     logger.info("[ROUTE] open_application → %r", app)
 
-                    # ── LAYER 1b: Create folder ───────────────────────────────
+                    # ── LAYER 1b: Create subfolders (must come before create_folder) ──
+                    elif _SUBFOLDER_RE.search(body.text):
+                        _last_for_sf = memory_service.get_last_action()
+                        _sp = _extract_subfolder_params(body.text, _last_for_sf)
+                        tool_name   = "create_subfolders"
+                        tool_params = _sp
+                        logger.info("[ROUTE] create_subfolders params=%r", _sp)
+
+                    # ── LAYER 1c: Create folder ───────────────────────────────
                     elif _CREATE_FOLDER_RE.search(body.text) or _NAME_AND_CREATE_RE.search(body.text):
-                        _floc   = _extract_folder_location(body.text)
-                        _fname  = _extract_folder_name(body.text)
+                        # Try AI structured extraction first — handles all Whisper
+                        # transcription variants without pattern maintenance.
+                        _ai_fp = _extract_folder_params_ai(body.text, ctx.get("openai_key", ""))
+                        if _ai_fp and _ai_fp.get("name"):
+                            _fname  = _ai_fp["name"]
+                            _ai_loc = _ai_fp.get("location", "")
+                            # Normalise AI location to Windows path
+                            if _ai_loc and not _ai_loc.endswith("\\") and len(_ai_loc) == 1:
+                                _ai_loc = _ai_loc.upper() + ":\\"
+                            _floc = _ai_loc or _extract_folder_location(body.text)
+                            logger.info("[AI-EXTRACT] create name=%r loc=%r", _fname, _floc)
+                        else:
+                            # Fallback to regex extraction
+                            _floc  = _extract_folder_location(body.text)
+                            _fname = _extract_folder_name(body.text)
+                            logger.info("[REGEX-EXTRACT] create name=%r loc=%r", _fname, _floc)
                         _parent = _extract_parent_folder(body.text)
+                        # FolderMemory: resolve bare parent name to its full recorded path.
+                        if _parent and "\\" not in _parent and not re.match(r'^[a-zA-Z]:$', _parent):
+                            try:
+                                from ..services.history_service import history_service as _hs
+                                _fm_p = _hs.lookup_folder(_parent.lower())
+                                if _fm_p:
+                                    logger.info("FolderMemory create_folder parent: %r → %r", _parent, _fm_p["full_win"])
+                                    _floc = _fm_p["full_win"]
+                                    _parent = ""
+                            except Exception:
+                                pass
                         # Subfolder: "create folder games inside projects in c drive"
-                        # → path = C:\projects, name = games
                         if _parent and _floc:
                             _floc = _floc.rstrip("\\") + "\\" + _parent
                         elif _parent:
@@ -2281,14 +2808,6 @@ async def respond_stream(body: _RespondStreamBody):
                         tool_name   = "create_folder"
                         tool_params = {"path": _floc, "name": _fname}
                         logger.info("[ROUTE] create_folder path=%r name=%r parent=%r", _floc, _fname, _parent)
-
-                    # ── LAYER 1c: Create subfolders ───────────────────────────
-                    elif _SUBFOLDER_RE.search(body.text):
-                        _last_for_sf = memory_service.get_last_action()
-                        _sp = _extract_subfolder_params(body.text, _last_for_sf)
-                        tool_name   = "create_subfolders"
-                        tool_params = _sp
-                        logger.info("[ROUTE] create_subfolders params=%r", _sp)
 
                     # ── LAYER 1d: Browser navigate ("go to X.com") ────────────
                     elif _BROWSER_GOTO_RE.match(body.text.strip()):
@@ -2897,9 +3416,10 @@ async def respond_stream(body: _RespondStreamBody):
                             return
 
                         # Tools with pre-built spoken output skip GPT narration entirely.
-                        # This fixes "AI stream unavailable" for system_info, create_folder,
-                        # open commands, etc. — they work even without an OpenAI API key.
-                        if result.success and _tool_spoken and tool_name in _DIRECT_SPOKEN_TOOLS:
+                        # This saves API cost for all system tool calls (create_folder,
+                        # delete_file, open_application, etc.) even when spoken text is empty.
+                        if result.success and tool_name in _DIRECT_SPOKEN_TOOLS:
+                            _tool_spoken = _tool_spoken or "Done."
                             try:
                                 _epi_mem.save(body.session_id or turn_id, "assistant", _tool_spoken)
                             except Exception:

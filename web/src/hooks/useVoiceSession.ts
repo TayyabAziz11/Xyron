@@ -1,16 +1,17 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { useMicVAD } from '@ricky0123/vad-react'
 import { readAssistantSettings, buildGreeting } from '@/hooks/useAssistantSettings'
 import {
   type SessionState,
   type ConvMessage,
   type HistoryEntry,
   type SystemAction,
-  VAD,
   isStopPhrase,
   checkIdentityResponse,
   detectSystemAction,
+  resolveLocation,
   stripMarkdown,
   cleanForSpeech,
   speakBrowser,
@@ -18,8 +19,26 @@ import {
   AudioQueue,
   streamAndSpeak,
 } from '@/lib/voice-core'
-// Interrupt monitor has been permanently removed — it caused race conditions.
-// Listening is triggered ONLY by explicit user action (mic click / wake word).
+
+// ── Audio utility: Float32Array (16kHz mono) → WAV Blob ────────────────────────
+// Silero VAD gives us raw PCM; Whisper accepts WAV. Standard 16-bit PCM encoding.
+function float32ToWav(samples: Float32Array, sampleRate: number): Blob {
+  const buf  = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buf)
+  const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)) }
+  writeStr(0, 'RIFF');  view.setUint32(4,  36 + samples.length * 2, true)
+  writeStr(8, 'WAVE');  writeStr(12, 'fmt ')
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true);  view.setUint16(34, 16, true)
+  writeStr(36, 'data'); view.setUint32(40, samples.length * 2, true)
+  let off = 44
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(off, s < 0 ? s * 32768 : s * 32767, true); off += 2
+  }
+  return new Blob([buf], { type: 'audio/wav' })
+}
 
 export type { SessionState, ConvMessage }
 
@@ -84,15 +103,11 @@ export function useVoiceSession() {
   /** True while the SSE stream is open. Prevents onEmpty firing before stream ends. */
   const isStreamingRef = useRef(false)
 
-  // ── Recording + VAD refs ───────────────────────────────────────────────────
-
-  const mediaRecRef    = useRef<MediaRecorder | null>(null)
-  const chunksRef      = useRef<Blob[]>([])
-  const audioCtxRef    = useRef<AudioContext | null>(null)
-  const silenceTimRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const noSpeechTimRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const maxRecTimRef   = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const rafRef         = useRef<ReturnType<typeof setInterval> | null>(null)
+  // ── Silero VAD audio ref ───────────────────────────────────────────────────
+  // Receives Float32Array from Silero VAD; stored here for the process callback.
+  const _vadAudioCallbackRef = useRef<(audio: Float32Array) => void>(() => {})
+  /** Counts consecutive turns with no usable transcript. Resets on real speech. */
+  const silentTurnsRef = useRef(0)
 
   // ── Voice confirmation flow ────────────────────────────────────────────────
   // When a high-risk action (e.g. delete_file) needs user confirmation,
@@ -112,9 +127,40 @@ export function useVoiceSession() {
   const lastActionRef = useRef<{ intent: string; action: SystemAction; transcript: string } | null>(null)
   // ── Folder creation context ───────────────────────────────────────────────
   const lastCreatedFolderRef = useRef<{ name: string; path: string } | null>(null)
+  // Maps every created folder name (lowercase) → full Windows path, for resolving
+  // "inside tayyab" references across nested creations (e.g. games/tayyab/gta).
+  const folderMapRef = useRef<Map<string, string>>(new Map())
   const pendingFolderRef = useRef<
     { stage: 'name'; knownPath?: string } | { stage: 'path'; name: string } | null
   >(null)
+
+  // ── Silero VAD (neural model — replaces hand-written RMS VAD) ────────────
+  //
+  // positiveSpeechThreshold=0.5 / negativeSpeechThreshold=0.35 are the Silero
+  // defaults, tuned on 40+ languages. preSpeechPadFrames=3 keeps the first
+  // syllable (prevents "reate folder" instead of "Create folder").
+  // workletOptions.url must point to the asset we copied to public/.
+
+  const vad = useMicVAD({
+    startOnLoad:   false,
+    model:         'v5',
+    baseAssetPath: '/',        // serves silero_vad_v5.onnx + vad.worklet.bundle.min.js from public/
+    onnxWASMBasePath: '/',     // serves ort-wasm-simd-threaded.wasm from public/
+    positiveSpeechThreshold: 0.70,  // raised from 0.5 — filters background room noise
+    negativeSpeechThreshold: 0.35,
+    redemptionMs: 1500,             // require 1500ms of silence before closing segment — gives user time to pause mid-sentence
+    minSpeechMs:    400,  // need 400ms of speech — avoids noise bursts and breaths
+    preSpeechPadMs: 150,  // capture 150ms before detection fires (avoids clipping "Cr-eate")
+    onSpeechStart: () => {
+      console.log('[SILERO VAD] speech start')
+    },
+    onSpeechEnd: (audio) => {
+      _vadAudioCallbackRef.current(audio)
+    },
+    onVADMisfire: () => {
+      console.log('[SILERO VAD] misfire — too short, ignoring')
+    },
+  })
 
   // ── Session + history ─────────────────────────────────────────────────────
 
@@ -179,18 +225,11 @@ export function useVoiceSession() {
     })
   }, [])
 
-  // ── Stop recording + VAD ──────────────────────────────────────────────────
+  // ── Stop VAD (pause Silero — mic stream stays open for instant resume) ────
 
   const stopMedia = useCallback(() => {
-    if (rafRef.current)         { clearInterval(rafRef.current); rafRef.current = null }
-    if (silenceTimRef.current)  { clearTimeout(silenceTimRef.current);  silenceTimRef.current = null }
-    if (noSpeechTimRef.current) { clearTimeout(noSpeechTimRef.current); noSpeechTimRef.current = null }
-    if (maxRecTimRef.current)   { clearTimeout(maxRecTimRef.current);   maxRecTimRef.current = null }
-    const mr = mediaRecRef.current
-    if (mr && mr.state !== 'inactive') {
-      try { mr.stop(); mr.stream?.getTracks().forEach((t) => t.stop()) } catch { /* ok */ }
-    }
-    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null }
+    vad.pause()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // ── Abort in-flight stream + audio ────────────────────────────────────────
@@ -273,8 +312,11 @@ export function useVoiceSession() {
       return
     }
 
-    console.log('[AUTO LISTEN] triggered — restarting listen cycle')
-    _startListeningRef.current()
+    console.log('[AUTO LISTEN] triggered — restarting listen cycle in 2000ms')
+    // 2000ms delay: lets TTS audio and room echo fully settle before
+    // Silero VAD re-opens. Without this, Silero immediately fires onSpeechEnd
+    // on the echo/reverb tail of our own TTS output.
+    setTimeout(() => _startListeningRef.current(), 2000)
   }, [])
 
   _startListeningRef.current = async function _startListening(): Promise<void> {
@@ -300,143 +342,49 @@ export function useVoiceSession() {
     }
 
     isRunningRef.current = true
-    const API_BASE = getApiBase()
     abortTask()
 
     // ══════════════════════════════════════════════════════════════════════
-    // PHASE 1 — LISTEN
+    // PHASE 1 — LISTEN  (Silero VAD drives audio capture)
+    // When onSpeechEnd fires, _vadAudioCallbackRef.current() takes over.
     // ══════════════════════════════════════════════════════════════════════
-
-    const t0 = performance.now()
-    console.log('[MIC START ATTEMPT] state:', stateRef.current, 'isStreaming:', isStreamingRef.current, 'isPlaying:', queueRef.current?.isPlaying ?? false, 'hasPending:', queueRef.current?.hasPendingAudio ?? false)
 
     transition('listening')
-    chunksRef.current = []
+    vad.start()
+  }
 
-    try {
-      await new Promise<void>((resolve, reject) => {
-        navigator.mediaDevices
-          .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 } })
-          .then((stream) => {
-            const rec = new MediaRecorder(stream)
-            rec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data) }
-            rec.onstop = () => { stream.getTracks().forEach((t) => t.stop()); resolve() }
-            rec.start()
-            mediaRecRef.current = rec
+  // ── Process utterance from Silero VAD ─────────────────────────────────────
+  // Assigned on every render so closures see fresh state (same pattern as
+  // _startListeningRef). Called by useMicVAD.onSpeechEnd.
 
-            maxRecTimRef.current = setTimeout(() => {
-              if (rec.state !== 'inactive') rec.stop()
-            }, VAD.maxTotalMs)
+  _vadAudioCallbackRef.current = async function _processAudio(vadAudio: Float32Array): Promise<void> {
+    if (!activeRef.current || stateRef.current !== 'listening' || !isRunningRef.current) return
 
-            // Voice Activity Detection
-            try {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const AudioCtxCls = window.AudioContext ?? (window as any).webkitAudioContext
-              if (!AudioCtxCls) return
-              const ctx = new AudioCtxCls() as AudioContext
-              audioCtxRef.current = ctx
-              const analyser = ctx.createAnalyser()
-              analyser.fftSize = 1024
-              ctx.createMediaStreamSource(stream).connect(analyser)
-              const buf = new Uint8Array(analyser.frequencyBinCount)
-              const binWidth = ctx.sampleRate / analyser.fftSize
-              const lo = Math.max(1, Math.round(300 / binWidth))
-              const hi = Math.min(buf.length - 1, Math.round(3400 / binWidth))
-
-              let smoothRms = 0, noiseFloor = 0, calibFrames = 0
-              let threshold: number = VAD.minThreshold, speechCnt = 0
-              type Phase = 'calibrating' | 'waiting' | 'speaking' | 'paused'
-              let phase: Phase = 'calibrating'
-
-              const stopRec = () => {
-                if (rec.state !== 'inactive') rec.stop()
-                ctx.close().catch(() => {})
-              }
-
-              const tick = () => {
-                if (!activeRef.current || rec.state === 'inactive') return
-                analyser.getByteFrequencyData(buf)
-                let ss = 0
-                for (let i = lo; i < hi; i++) ss += buf[i] * buf[i]
-                const raw = Math.sqrt(ss / (hi - lo)) / 128
-                smoothRms = VAD.smoothingAlpha * raw + (1 - VAD.smoothingAlpha) * smoothRms
-
-                switch (phase) {
-                  case 'calibrating':
-                    noiseFloor = (noiseFloor * calibFrames + smoothRms) / (calibFrames + 1)
-                    if (++calibFrames >= VAD.calibrationFrames) {
-                      threshold = Math.max(VAD.minThreshold, Math.min(VAD.maxThreshold, noiseFloor * VAD.thresholdMultiplier))
-                      phase = 'waiting'
-                      noSpeechTimRef.current = setTimeout(stopRec, VAD.noSpeechTimeoutMs)
-                    }
-                    break
-                  case 'waiting':
-                    if (smoothRms > threshold) {
-                      if (++speechCnt >= VAD.speechMinFrames) {
-                        phase = 'speaking'; speechCnt = 0
-                        clearTimeout(noSpeechTimRef.current!); noSpeechTimRef.current = null
-                      }
-                    } else { speechCnt = 0 }
-                    break
-                  case 'speaking': {
-                    const exitLevel = Math.max(VAD.minThreshold * 0.5, noiseFloor * VAD.exitMultiplier)
-                    if (smoothRms < exitLevel) {
-                      phase = 'paused'
-                      silenceTimRef.current = setTimeout(stopRec, VAD.silenceAfterMs)
-                    }
-                    break
-                  }
-                  case 'paused':
-                    if (smoothRms > threshold * VAD.resumeHysteresis) {
-                      phase = 'speaking'
-                      clearTimeout(silenceTimRef.current!); silenceTimRef.current = null
-                    }
-                    break
-                }
-              }
-              rafRef.current = setInterval(tick, VAD.tickIntervalMs)
-            } catch { /* VAD unavailable — fall through to max-duration recording */ }
-          })
-          .catch(reject)
-      })
-    } catch (err) {
-      const denied = err instanceof DOMException && err.name === 'NotAllowedError'
-      setError(denied
-        ? 'Microphone access denied. Click the lock icon and allow microphone.'
-        : 'Could not access microphone.')
-      activeRef.current = false
-      isRunningRef.current = false
-      transition('stopped')
-      setTimeout(forceIdle, 2500)
-      return
-    }
-
-    // Clean up VAD
-    if (rafRef.current)         { clearInterval(rafRef.current); rafRef.current = null }
-    if (silenceTimRef.current)  { clearTimeout(silenceTimRef.current);  silenceTimRef.current = null }
-    if (noSpeechTimRef.current) { clearTimeout(noSpeechTimRef.current); noSpeechTimRef.current = null }
-    if (maxRecTimRef.current)   { clearTimeout(maxRecTimRef.current);   maxRecTimRef.current = null }
-    if (!activeRef.current) { isRunningRef.current = false; return }
+    const API_BASE = getApiBase()
+    vad.pause()   // stop listening while we process; resumed after speaking
 
     // ══════════════════════════════════════════════════════════════════════
-    // PHASE 2 — TRANSCRIBE
+    // PHASE 2 — TRANSCRIBE  (Float32Array 16kHz → WAV → Whisper)
     // ══════════════════════════════════════════════════════════════════════
 
     transition('transcribing')
 
-    // No audio at all → return to idle silently
-    if (!chunksRef.current.length) {
+    const t0 = performance.now()
+    const blob = float32ToWav(vadAudio, 16000)
+
+    // Silero's minSpeechFrames already guards against noise; the WAV size
+    // check is a last-resort safety net for truly empty utterances.
+    if (blob.size < 2_000) {
       transition('idle')
       isRunningRef.current = false
-      return
-    }
-
-    const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-
-    // Blob < 6 KB = breath / noise → return to idle silently
-    if (blob.size < 6_000) {
-      transition('idle')
-      isRunningRef.current = false
+      if (++silentTurnsRef.current < 5) {
+        maybeRestartListening()
+      } else {
+        silentTurnsRef.current = 0
+        activeRef.current = false   // full stop — button resets so next press starts fresh
+        stopMedia()
+        setSessionActive(false)
+      }
       return
     }
 
@@ -446,10 +394,19 @@ export function useVoiceSession() {
     let transcript = ''
     try {
       const form = new FormData()
-      form.append('audio', blob, 'recording.webm')
-      const r = await fetch(`${API_BASE}/api/v1/voice/transcribe`, { method: 'POST', body: form })
-      transcript = ((await r.json())?.data?.text ?? '').trim()
-    } catch { /* silent — fall through to idle */ }
+      form.append('audio', blob, 'recording.wav')
+      // 8-second hard timeout — returns to idle if Whisper API hangs
+      const _tCtrl = new AbortController()
+      const _tTimer = setTimeout(() => _tCtrl.abort(), 8_000)
+      try {
+        const r = await fetch(`${API_BASE}/api/v1/voice/transcribe`, {
+          method: 'POST', body: form, signal: _tCtrl.signal,
+        })
+        transcript = ((await r.json())?.data?.text ?? '').trim()
+      } finally {
+        clearTimeout(_tTimer)
+      }
+    } catch { /* timeout or network — fall through to idle */ }
 
     const t1b = performance.now()
     console.log(`[PERF] transcribe RTT: ${(t1b - t1).toFixed(0)}ms — result: ${transcript ? JSON.stringify(transcript.slice(0, 60)) : '(empty)'}`)
@@ -457,8 +414,19 @@ export function useVoiceSession() {
     if (!transcript) {
       transition('idle')
       isRunningRef.current = false
+      if (++silentTurnsRef.current < 5) {
+        maybeRestartListening()
+      } else {
+        silentTurnsRef.current = 0
+        activeRef.current = false   // full stop — button resets so next press starts fresh
+        stopMedia()
+        setSessionActive(false)
+      }
       return
     }
+
+    // Real speech received — reset the silence counter
+    silentTurnsRef.current = 0
 
     // ══════════════════════════════════════════════════════════════════════
     // PHASE 3 — ROUTE
@@ -519,11 +487,36 @@ export function useVoiceSession() {
       addMsg('user', transcript)
       const rawInput = transcript.replace(/[.!?,;:]+$/, '').trim()
 
+      // Cancel words: user wants to abandon the pending folder dialog
+      if (/^(?:cancel|stop|abort|quit|forget\s+(?:it|that)|never\s+mind|nevermind|leave\s+(?:it|me)|skip\s+it|no(?:\s+thanks)?|nope|don'?t|exit)$/i.test(rawInput)) {
+        pendingFolderRef.current = null
+        const cancelled = "No problem, cancelled."
+        addMsg('assistant', cancelled)
+        transition('speaking')
+        await speakResponse(cancelled)
+        transition('idle')
+        isRunningRef.current = false
+        maybeRestartListening()
+        return
+      }
+
       if (pf.stage === 'name') {
         const name = rawInput
           .replace(/^(?:name\s+it|call\s+it|it(?:'?s|\s+is)?|the\s+name\s+is?|name\s+is?)\s+/i, '')
           .trim()
-        const targetPath = pf.knownPath || 'Desktop'
+        if (!pf.knownPath) {
+          // Have name but still no location — ask for it
+          pendingFolderRef.current = { stage: 'path', name }
+          const q = `Got it — "${name}". Where should I create it? Desktop, D drive, or somewhere else?`
+          addMsg('assistant', q)
+          transition('speaking')
+          await speakResponse(q)
+          transition('idle')
+          isRunningRef.current = false
+          maybeRestartListening()
+          return
+        }
+        const targetPath = pf.knownPath
         pendingFolderRef.current = null
         const holdMsg = `Creating the "${name}" folder now.`
         const aId = addMsg('assistant', holdMsg)
@@ -538,8 +531,10 @@ export function useVoiceSession() {
         transition('processing')
         let spoken: string
         if (result?.success) {
-          lastCreatedFolderRef.current = { name, path: result.path || targetPath }
-          spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${targetPath}. Say "open it" to open it.`)
+          const cp = result.path || targetPath
+          lastCreatedFolderRef.current = { name, path: cp }
+          folderMapRef.current.set(name.toLowerCase(), cp)
+          spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder. Say "open it" to open it.`)
         } else {
           spoken = _failsafe('create_folder', result, `Couldn't create the folder. Please try again.`)
         }
@@ -554,7 +549,12 @@ export function useVoiceSession() {
 
       if (pf.stage === 'path') {
         const { name } = pf
-        const pathStr = rawInput.replace(/^(?:in|on|inside|at)\s+(?:the\s+)?/i, '').trim()
+        // Clean up stutter/repeated phrase: "In D drive. In D drive." → "D drive"
+        // Take only the first location clause (before any punctuation or repeated prep)
+        const pathStr = rawInput
+          .replace(/[.!?].*$/i, '')           // cut at first sentence-ending punctuation
+          .replace(/^(?:in|on|inside|at)\s+(?:the\s+)?/i, '')  // strip leading prep
+          .trim()
         pendingFolderRef.current = null
         const holdMsg = `Creating the "${name}" folder now.`
         const aId = addMsg('assistant', holdMsg)
@@ -569,7 +569,9 @@ export function useVoiceSession() {
         transition('processing')
         let spoken: string
         if (result?.success) {
-          lastCreatedFolderRef.current = { name, path: result.path || pathStr }
+          const cp2 = result.path || pathStr
+          lastCreatedFolderRef.current = { name, path: cp2 }
+          folderMapRef.current.set(name.toLowerCase(), cp2)
           spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${pathStr}. Say "open it" to open it.`)
         } else {
           spoken = _failsafe('create_folder', result, `Couldn't create the folder. Please try again.`)
@@ -682,7 +684,9 @@ export function useVoiceSession() {
         console.log(`[VOICE] queue empty → idle (was: ${s})`)
         if (!ctrl.signal.aborted && (s === 'speaking' || s === 'processing')) {
           transition('idle')
-          maybeRestartListening()   // ← ONLY auto-restart path
+          // 1000ms post-TTS delay: lets room echo settle before mic opens.
+          // Without this, Whisper picks up the tail of Xyron's own voice.
+          setTimeout(() => maybeRestartListening(), 1000)
         }
       },
     })
@@ -721,7 +725,7 @@ export function useVoiceSession() {
             updMsg(aId, { text: msg || 'Sorry, something went wrong.', status: 'error' })
             queue.abort()
             forceIdle()
-            // NO restart — user must tap mic
+            setTimeout(() => maybeRestartListening(), 1500)
           },
 
           onToolAction: (tool, params, _spoken) => {
@@ -760,12 +764,13 @@ export function useVoiceSession() {
           },
 
           onProfileSwitch: (profile, voice) => {
-            // Persist the new voice into assistant settings
+            // Save to the canonical settings key so readAssistantSettings() picks it up.
+            // The old code was writing to 'ai-operator:assistant-settings' which is never read.
             try {
-              const raw  = localStorage.getItem('ai-operator:assistant-settings')
+              const raw  = localStorage.getItem('xyron:assistant-settings')
               const prev = raw ? JSON.parse(raw) : {}
               const next = { ...prev, mode: profile as any, voice: voice as any }
-              localStorage.setItem('ai-operator:assistant-settings', JSON.stringify(next))
+              localStorage.setItem('xyron:assistant-settings', JSON.stringify(next))
             } catch { /* ok */ }
             if (profile === 'chill') {
               setFollowUp('Chill mode on — ask me what to watch, Netflix picks or YouTube vibes?')
@@ -808,7 +813,7 @@ export function useVoiceSession() {
         updMsg(aId, { text: 'Sorry, my response was interrupted. Please ask again.', status: 'error' })
         queue.abort()
         forceIdle()
-        // NO restart
+        setTimeout(() => maybeRestartListening(), 1500)
       }
     }
 
@@ -890,7 +895,7 @@ export function useVoiceSession() {
       try {
         const raw  = localStorage.getItem('ai-operator:assistant-settings')
         const prev = raw ? JSON.parse(raw) : {}
-        localStorage.setItem('ai-operator:assistant-settings', JSON.stringify({ ...prev, mode: 'chill', voice: 'shimmer' }))
+        localStorage.setItem('xyron:assistant-settings', JSON.stringify({ ...prev, mode: 'chill', voice: 'shimmer' }))
       } catch { /* ok */ }
       currentModeRef.current = 'chill'
       if (typeof window !== 'undefined') {
@@ -915,7 +920,25 @@ export function useVoiceSession() {
 
     // ── Folder creation ───────────────────────────────────────────────────
     if (sysAction.createFolder != null) {
-      const { name, path, subfolders } = sysAction.createFolder as { name?: string; path?: string; subfolders?: string[] }
+      const { name, path, subfolders, insideFolder } = sysAction.createFolder as {
+        name?: string; path?: string; subfolders?: string[]; insideFolder?: string
+      }
+
+      // Resolve the target parent path from path + insideFolder:
+      //   path only        → drive/special location (e.g. "d" → D:\)
+      //   insideFolder only → look up in folder history map
+      //   both             → history lookup first; fall back to drive\folder compound
+      const resolvedPath: string | undefined = (() => {
+        if (path && insideFolder) {
+          const fromHistory = folderMapRef.current.get(insideFolder.toLowerCase())
+          if (fromHistory) return fromHistory
+          // Construct compound Windows path: "D:\\" + "games" → "D:\\games"
+          const drive = resolveLocation(path)  // "d" → "D:\\"
+          return drive.endsWith('\\') ? drive + insideFolder : drive + '\\' + insideFolder
+        }
+        if (insideFolder) return folderMapRef.current.get(insideFolder.toLowerCase())
+        return path
+      })()
 
       const _createWithSubs = async (folderName: string, folderPath: string): Promise<{ spoken: string; createdPath: string }> => {
         const result = await fetch(`${API_BASE}/api/v1/system/create-folder`, {
@@ -924,17 +947,25 @@ export function useVoiceSession() {
         }).then(r => r.json()).catch(() => null)
 
         if (!result?.success) {
-          return { spoken: `Couldn't create the folder. Please try again.`, createdPath: '' }
+          const spk = result?.spoken || `Couldn't create the folder. Please try again.`
+          return { spoken: spk, createdPath: '' }
         }
 
         const createdPath = result.path || folderPath
         lastCreatedFolderRef.current = { name: folderName, path: createdPath }
+        folderMapRef.current.set(folderName.toLowerCase(), createdPath)
 
         if (subfolders && subfolders.length > 0) {
           const subResult = await fetch(`${API_BASE}/api/v1/system/create-subfolders`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ parent: createdPath, names: subfolders }),
           }).then(r => r.json()).catch(() => null)
+          if (subResult?.success) {
+            // Register each subfolder so "inside [subfolder]" works next
+            for (const sub of subfolders) {
+              folderMapRef.current.set(sub.toLowerCase(), `${createdPath}\\${sub}`)
+            }
+          }
           const subNote = subResult?.success
             ? ` with subfolders ${subfolders.map(s => `"${s}"`).join(', ')}`
             : ''
@@ -944,33 +975,33 @@ export function useVoiceSession() {
       }
 
       addMsg('user', transcript)
-      if (name && path) {
+      if (name && resolvedPath) {
         const aId = addMsg('assistant', sysAction.response)
         transition('speaking')
         const [, { spoken }] = await Promise.all([
           speakResponse(sysAction.response),
-          _createWithSubs(name, path),
+          _createWithSubs(name, resolvedPath),
         ])
         transition('processing')
         updMsg(aId, { text: spoken })
         transition('speaking')
         await speakResponse(spoken)
+      } else if (name && insideFolder) {
+        // insideFolder was specified but not found in history — ask for location
+        const q = `I don't know where "${insideFolder}" is. Which drive or folder should I create "${name}" in?`
+        pendingFolderRef.current = { stage: 'path', name }
+        addMsg('assistant', q)
+        transition('speaking')
+        await speakResponse(q)
       } else if (name) {
-        // Name given — default to Desktop
-        pendingFolderRef.current = null
-        const aId = addMsg('assistant', sysAction.response)
+        // Name given but no location — ask user where
+        pendingFolderRef.current = { stage: 'path', name }
+        addMsg('assistant', sysAction.response)
         transition('speaking')
-        const [, { spoken }] = await Promise.all([
-          speakResponse(sysAction.response),
-          _createWithSubs(name, 'Desktop'),
-        ])
-        transition('processing')
-        updMsg(aId, { text: spoken })
-        transition('speaking')
-        await speakResponse(spoken)
+        await speakResponse(sysAction.response)
       } else {
         // Need name — ask
-        pendingFolderRef.current = { stage: 'name', knownPath: path || undefined }
+        pendingFolderRef.current = { stage: 'name', knownPath: resolvedPath || undefined }
         addMsg('assistant', sysAction.response)
         transition('speaking')
         await speakResponse(sysAction.response)
@@ -1308,23 +1339,23 @@ export function useVoiceSession() {
     isStreamingRef.current = false
     setSessionActive(true)
 
+    // Greet every time the orb is clicked
     transition('greeting')
-    const { mode } = readAssistantSettings()
+    const { mode, voice } = readAssistantSettings()
     const GREETING = buildGreeting(mode)
     addMsg('assistant', GREETING)
-
+    console.log(`[VOICE] greeting with mode=${mode} voice=${voice}`)
     try {
       await Promise.race([
         speakResponse(GREETING),
         new Promise<void>((r) => setTimeout(r, 12_000)),
       ])
     } catch { /* ok */ }
-
     if (!activeRef.current) return  // stopped during greeting
     transition('idle')
-    // Short cooldown so the mic doesn't pick up the tail of the greeting audio
     await new Promise<void>((r) => setTimeout(r, 450))
-    console.log('[VOICE] greeting done — auto-starting listen')
+
+    console.log('[VOICE] session started — auto-starting listen')
     maybeRestartListening()       // ← kick off first listen cycle automatically
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionState, addMsg, speakResponse, transition, maybeRestartListening])
@@ -1338,14 +1369,15 @@ export function useVoiceSession() {
     isRunningRef.current   = false
     sessionIdRef.current   = ''
     abortTask()
-    stopMedia()
+    vad.pause()
     if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
     stateRef.current = 'idle'
     setSessionState('idle')
     setSessionActive(false)
     setMessages([])
     historyRef.current = []
-  }, [abortTask, stopMedia])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [abortTask])
 
   const clearMessages = useCallback(() => {
     setMessages([])
@@ -1358,7 +1390,7 @@ export function useVoiceSession() {
     return () => {
       activeRef.current = false
       abortTask()
-      stopMedia()
+      vad.pause()
       if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps

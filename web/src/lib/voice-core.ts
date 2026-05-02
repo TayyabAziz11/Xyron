@@ -29,17 +29,17 @@ export type HistoryEntry = { role: 'user' | 'assistant'; text: string }
 
 export const VAD = {
   calibrationFrames:   25,
-  thresholdMultiplier: 4.5,
-  minThreshold:        0.040,
+  thresholdMultiplier: 3.5,       // 3.5× noise floor — passes conversational speech in WSL2 (PulseAudio lowers gain)
+  minThreshold:        0.020,     // minimum RMS for speech; WSL2 conversational voice typically 0.025–0.045
   maxThreshold:        0.150,
   exitMultiplier:      1.05,      // exit when RMS barely above noise floor (fixes "still listening" in noisy rooms)
   resumeHysteresis:    1.30,
-  smoothingAlpha:      0.55,      // balanced smoothing
-  speechMinFrames:     3,
-  silenceAfterMs:      750,       // 750ms of silence = natural end of speech
+  smoothingAlpha:      0.55,
+  speechMinFrames:     3,         // 3 consecutive frames (90ms) to confirm speech start — avoids clipping first syllable
+  silenceAfterMs:      750,
   noSpeechTimeoutMs:   6_000,
   maxTotalMs:          30_000,
-  tickIntervalMs:      30,        // use setInterval not rAF (rAF throttles in background tabs)
+  tickIntervalMs:      30,
 } as const
 
 // ── Stop phrases ──────────────────────────────────────────────────────────────
@@ -152,11 +152,12 @@ export function checkIdentityResponse(text: string, mode?: string): string | nul
 // ── System action detection ───────────────────────────────────────────────────
 
 export interface ParsedEntities {
-  name?:   string
-  path?:   string
-  app?:    string
-  query?:  string
-  target?: string
+  name?:         string
+  path?:         string
+  app?:          string
+  query?:        string
+  target?:       string
+  insideFolder?: string  // "inside tayyab" → "tayyab" — hook resolves via folder history
 }
 
 export interface SystemAction {
@@ -186,7 +187,7 @@ export interface SystemAction {
   createReminder?: string   // "remind me to X in Y minutes" → natural language
   readGmail?:      boolean  // "read my emails" / "check inbox"
   readCalendar?:   boolean  // "what's on my calendar"
-  createFolder?:   { name?: string; path?: string; subfolders?: string[] }  // multi-turn folder creation
+  createFolder?:   { name?: string; path?: string; subfolders?: string[]; insideFolder?: string }  // multi-turn folder creation
   openLastFolder?: boolean                           // "open it" → last created folder
   desktopHotkey?:  string   // "press ctrl+c", "paste", "undo" → keyboard shortcut
   desktopScroll?:  { direction: 'up' | 'down'; amount: number }  // "scroll down 3 times"
@@ -292,9 +293,11 @@ function _validName(s: string | undefined, minLen = 2): boolean {
   return c.length >= minLen && !/^(a|an|the|it|that|this|one|folder|file|thing|some|any)$/i.test(c)
 }
 
+
 export function resolveLocation(raw: string): string {
   const r = raw.toLowerCase().trim()
-  if (/^[a-e]\s*(?:drive|disk|:)?$/.test(r)) return r[0].toUpperCase() + ':\\'
+  // Any drive letter (A-Z), with optional "drive"/"disk"/":"
+  if (/^[a-z]\s*(?:drive|disk|:)?$/.test(r)) return r[0].toUpperCase() + ':\\'
   if (/^desktop$/.test(r)) return 'Desktop'
   if (/^documents?$/.test(r)) return 'Documents'
   if (/^downloads?$/.test(r)) return 'Downloads'
@@ -309,17 +312,35 @@ export function parseEntities(text: string): ParsedEntities {
     .replace(/^(?:please|can you|could you|just|go ahead and)\s+/i, '')
 
   // Name: "name it X", "named X", "called X" — stop at location prepositions
+  // Also handles direct form: "create folder GAMES in D drive" → name="GAMES"
   const nameM =
-    t.match(/\bname\s+it\s+(.+?)(?:\s+(?:and|in|on|at|inside)\s+|\s*$)/i)
-    ?? t.match(/\b(?:named?|called?)\s+(.+?)(?:\s+(?:and|in|on|at|inside)\s+|\s*$)/i)
+    t.match(/\bname\s+it\s+(.+?)(?:\s+(?:and|in|on|at|inside|with)\s+|\s*$)/i)
+    ?? t.match(/\b(?:named?|called?)\s+(.+?)(?:\s+(?:and|in|on|at|inside|with)\s+|\s*$)/i)
+    ?? t.match(/\b(?:create|make|add|new)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+(?!(?:in|on|at|inside|with)\s)(.+?)(?=\s+(?:in|on|at|inside|with)\b|\s*$)/i)
   const rawName = nameM?.[1]?.replace(/\b(?:and|with)\b.*/i, '').trim()
   const name = _validName(rawName) ? rawName : undefined
 
-  // Path: "in E drive", "on desktop", "in documents"
+  // Path: extract the raw location text — backend resolves it to the real WSL path.
+  // "in D drive" → "D drive", "in my D drive" → "D drive", "on the desktop" → "desktop"
   const pathM =
-    t.match(/\b(?:in|on|inside|at)\s+(?:the\s+)?([a-e]\s*(?:drive|disk|:)?)\b/i)
+    t.match(/\b(?:in|on|inside|at)\s+(?:the\s+)?my\s*([a-z])\s+(?:drive|disk)\b/i)
+    ?? t.match(/\b(?:in|on|inside|at)\s+(?:the\s+)?([a-z])\s+(?:drive|disk)\b/i)
+    ?? t.match(/\b(?:in|on|inside|at)\s+(?:the\s+)?([a-z]):/i)
     ?? t.match(/\b(?:in|on|inside|at)\s+(?:the\s+)?(desktop|documents?|downloads?|pictures?|music)\b/i)
-  const path = pathM ? resolveLocation(pathM[1]) : undefined
+  // Send raw captured text — backend's resolve_wsl_path() handles all cases
+  const path = pathM ? pathM[1].trim() : undefined
+
+  // insideFolder: "inside [folder_name]" where folder_name is not a drive/known location.
+  // Hook resolves this via its folder creation history map.
+  // e.g. "inside tayyab" → insideFolder="tayyab", hook looks up "tayyab" → "D:\games\tayyab"
+  let insideFolder: string | undefined
+  // insideFolder: always extracted, even alongside a drive path.
+  // Pattern stops at: in/on/at (location prep), folder, end of string.
+  // Negative lookaheads skip: bare drive letters ("in D drive"), known special folders (desktop/documents/etc).
+  // Matches both "inside tayyab" and "in workspace" but NOT "in D drive" or "in documents".
+  const insideM = t.match(/\b(?:inside|in)\s+(?:the\s+)?(?![a-z](?:\s+(?:drive|disk))?\b)(?!(?:desktop|documents?|downloads?|pictures?|music|videos?)\b)(\w[\w\s-]{0,40}?)(?=\s+(?:in|on|at|inside|with|folder|directory)\b|\s*$)/i)
+  const rawInside = insideM?.[1]?.trim()
+  if (rawInside && _validName(rawInside)) insideFolder = rawInside
 
   // App: "open X", "launch X", "start X"
   const appM = t.match(/\b(?:open|launch|start|run)\s+(?:the\s+)?(\w[\w\s]{1,30}?)(?:\s+(?:app|application|program))?\s*$/i)
@@ -329,7 +350,7 @@ export function parseEntities(text: string): ParsedEntities {
   const queryM = t.match(/\b(?:search(?:\s+for)?|find|look\s+up)\s+(.+)/i)
   const query = queryM?.[1]?.trim()
 
-  return { name, path, app, query }
+  return { name, path, app, query, insideFolder }
 }
 
 export function detectSystemAction(text: string): SystemAction | null {
@@ -530,15 +551,15 @@ export function detectSystemAction(text: string): SystemAction | null {
   // ── Folder creation ────────────────────────────────────────────────────────
   if (/\b(?:create|make|add|new)\s+(?:a\s+)?(?:new\s+)?folder\b/i.test(t)) {
     const ents = parseEntities(t)
-    const { name } = ents
-    const path = ents.path ?? (name ? 'Desktop' : undefined)
+    const { name, insideFolder } = ents
+    const path = ents.path  // raw location text — no Desktop default; backend resolves
 
     // Extract subfolder names from patterns like:
     // "with subfolders Frontend, Backend, and Database"
     // "with folders called X, Y, Z"
     // "inside it create X, Y, Z"
     let subfolders: string[] | undefined
-    const subM = t.match(/\bwith\s+(?:sub)?folders?\s+(?:called\s+|named\s+)?(.+)/i)
+    const subM = t.match(/\bwith\s+(?:(?:a\s+few|some|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?(?:sub)?folders?\s+(?:called\s+|named\s+)?(.+)/i)
       ?? t.match(/\binside\s+(?:it\s+)?(?:create|make|add)\s+(.+)/i)
       ?? t.match(/\bcontaining\s+(?:folders?\s+)?(.+)/i)
     if (subM) {
@@ -550,13 +571,14 @@ export function detectSystemAction(text: string): SystemAction | null {
     }
 
     const subNote = subfolders ? ` with ${subfolders.length} subfolder${subfolders.length !== 1 ? 's' : ''}` : ''
+    const hasLocation = !!(path || insideFolder)
     return {
       intent: 'create_folder',
-      entities: { name, path },
+      entities: { name, path, insideFolder },
       response: name
-        ? (ents.path ? `Sure, creating the folder${subNote} now.` : `Got it — creating "${name}"${subNote} on your Desktop.`)
+        ? (hasLocation ? `Sure, creating the folder${subNote} now.` : `Got it — where should I create "${name}"?`)
         : 'What should I name it, and where should I create it?',
-      createFolder: { name, path, subfolders },
+      createFolder: { name, path, subfolders, insideFolder },
     }
   }
 

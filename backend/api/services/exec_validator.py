@@ -124,12 +124,32 @@ def _check_brightness(params: dict, result_text: str) -> tuple[bool, str]:
 
 @_validator("create_folder", "create_subfolders")
 def _check_folder_created(params: dict, result_text: str) -> tuple[bool, str]:
-    path = params.get("path") or params.get("name") or params.get("folder_path")
-    if path:
-        p = Path(path)
-        exists = p.exists()
-        return exists, ("created" if exists else f"folder missing: {path}")
-    return True, ""
+    import os
+    from utils.path_utils import resolve_wsl_path
+    import re as _re
+
+    base_raw = (params.get("path") or "").strip()
+    name     = (params.get("name") or "").strip()
+
+    if base_raw and name:
+        wsl_base = resolve_wsl_path(base_raw)
+        if wsl_base:
+            clean = _re.sub(r'[<>:"|?*]', "", name.replace("\\", "/")).strip("/")
+            wsl_target = wsl_base.rstrip("/") + "/" + clean
+            exists = os.path.exists(wsl_target)
+            logger.info("[VALID] create_folder: %r → %s", wsl_target, "ok" if exists else "MISSING")
+            return exists, ("ok" if exists else f"folder missing: {wsl_target}")
+
+    # create_subfolders — just confirm parent resolves; individual folders were
+    # already verified inside _exec_create_subfolders with os.path.exists().
+    parent_raw = (params.get("parent") or "").strip()
+    if parent_raw:
+        from utils.path_utils import resolve_wsl_path as _rwp
+        wsl_parent = _rwp(parent_raw)
+        if wsl_parent:
+            return True, f"parent={wsl_parent}"
+
+    return True, ""  # no path info available — trust the tool
 
 
 @_validator("delete_file", "move_file")

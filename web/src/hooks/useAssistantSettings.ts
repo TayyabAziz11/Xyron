@@ -80,7 +80,7 @@ export const MODE_OPTIONS: Array<{ id: BehaviorMode; label: string; desc: string
 const STORAGE_KEY = 'xyron:assistant-settings'
 
 const DEFAULTS: AssistantSettings = {
-  voice:        'nova',
+  voice:        'onyx',   // global default — overridden once a profile is selected
   speed:        1.0,
   mode:         'assistant',
   voiceEnabled: true,

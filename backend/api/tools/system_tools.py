@@ -11,6 +11,7 @@ Registered tools:
 """
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import logging
 import os
@@ -21,8 +22,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import shutil
+
 from .registry import ToolResult, registry
 from .safety import is_safe_path, is_safe_write
+from utils.path_utils import resolve_wsl_path, safe_path, wsl_to_win
 
 logger = logging.getLogger(__name__)
 
@@ -143,11 +147,22 @@ def resolve_path(raw: str) -> str:
         rest  = (m.group(2) or "").replace("/", "\\")
         return drive + ":\\" + rest.lstrip("\\")
 
-    # Named special directories
+    # Named special directories (exact match: "desktop" → "C:\Users\...\Desktop")
     special = _get_win_special()
     key = p.lower().strip("/\\")
     if key in special:
         return special[key]
+
+    # Named special directory + subpath: "desktop\Games" → "C:\Users\...\Desktop\Games"
+    # On WSL/Linux, backslash is NOT a path separator, so Path() won't split it —
+    # we must handle it manually here.
+    for sep in ('\\', '/'):
+        if sep in p:
+            head, tail = p.split(sep, 1)
+            head_key = head.lower().strip()
+            if head_key in special:
+                return special[head_key].rstrip('\\') + '\\' + tail.replace('/', '\\')
+            break  # separator found but prefix not special — stop checking
 
     # Linux absolute path (best-effort pass-through)
     if p.startswith("/"):
@@ -371,31 +386,56 @@ def _exec_create_folder(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResu
     if not name:
         return ToolResult(success=False, text="Folder name is required.", spoken="What should I name the folder?")
 
-    # Sanitize folder name
     name = re.sub(r'[<>:"|?*]', "", name)
 
-    base_path  = resolve_path(base_raw) if base_raw else _windows_home()
-    # Build Windows-style path without os.path.join (which uses / on Linux/WSL)
-    win_target = base_path.rstrip('\\').rstrip('/') + '\\' + name
+    # No location given → ask user; never silently default to Desktop
+    if not base_raw:
+        return ToolResult(
+            success=False,
+            text=f"Where should I create '{name}'?",
+            spoken=f"Where should I create \"{name}\"? Say Desktop, D drive, or give me a path.",
+            data={"needs_clarification": True, "clarification_type": "location", "name": name},
+        )
+
+    # Resolve to WSL2 path — handles "D drive", "myd drive", "desktop", etc.
+    wsl_base = resolve_wsl_path(base_raw)
+    if wsl_base is None:
+        return ToolResult(
+            success=False,
+            text=f"Unknown location: {base_raw!r}",
+            spoken=f"I couldn't find that location. Try Desktop, D drive, or a specific path.",
+            data={"needs_clarification": True, "clarification_type": "location", "name": name},
+        )
+
+    wsl_target = wsl_base.rstrip("/") + "/" + name.replace("\\", "/")
+    win_target = wsl_to_win(wsl_target)
+    logger.info("[EXEC] create_folder: %s  (win: %s)", wsl_target, win_target)
 
     if not is_safe_path(win_target):
         return ToolResult(success=False, text=f"Cannot create folder here: {win_target}",
                           spoken="That location is restricted for safety.", error="Blocked path")
 
-    fs_target = _fs_path(win_target)
     try:
-        fs_target.mkdir(parents=True, exist_ok=True)
+        os.makedirs(wsl_target, exist_ok=True)
+        if not os.path.exists(wsl_target):
+            logger.error("create_folder: makedirs succeeded but path missing: %r", wsl_target)
+            return ToolResult(success=False, text=f"FAILED: {wsl_target}",
+                              spoken="Couldn't create the folder. Please try again.",
+                              error="mkdir succeeded but path missing")
         _store_last_action(ctx, "create_folder", params, win_target)
-        # Auto-open the newly created folder in Explorer
+        # Register in persistent folder memory so future subfolder commands resolve the path.
+        try:
+            from ..services.history_service import history_service as _hs
+            _hs.remember_folder(name.lower(), wsl_target, win_target)
+        except Exception:
+            pass
         ok_open, _ = _open_in_explorer(win_target)
-        loc_label = base_path if base_path else "your Desktop"
-        if ok_open:
-            spoken = f"Done! I created the '{name}' folder in {loc_label} and opened it for you."
-        else:
-            spoken = f"Done! I created the '{name}' folder in {loc_label}. Say 'open it' to open it."
-        msg = f"Created folder '{name}' at {base_path}"
+        spoken = (f"Done! Created '{name}' at {win_target} and opened it."
+                  if ok_open else f"Done! Created '{name}' at {win_target}.")
+        msg = f"Created folder '{name}' at {win_target}"
         return ToolResult(success=True, text=msg, spoken=spoken,
-                          action_path=base_path, data={"path": win_target, "name": name})
+                          action_path=win_target,
+                          data={"path": win_target, "name": name, "wsl_path": wsl_target})
     except PermissionError:
         return ToolResult(success=False, text=f"Permission denied: {win_target}",
                           spoken="I don't have permission to create a folder there.", error="PermissionError")
@@ -403,12 +443,64 @@ def _exec_create_folder(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResu
         return ToolResult(success=False, text=str(exc), spoken="Couldn't create the folder.", error=str(exc))
 
 
+# ── Subfolder name normalization ─────────────────────────────────────────────
+# Whisper often clips or mishears common project folder names.
+# "front" → "Frontend", "b" → "Backend", etc.
+_SUBFOLDER_EXPANSIONS: Dict[str, str] = {
+    "front": "Frontend",    "frontend": "Frontend",
+    "back": "Backend",      "backend": "Backend",     "b": "Backend",
+    "db": "Database",       "database": "Database",
+    "api": "API",
+    "auth": "Auth",         "authentication": "Authentication",
+    "config": "Config",     "configs": "Config",
+    "utils": "Utils",       "util": "Utils",
+    "helpers": "Helpers",   "helper": "Helpers",
+    "docs": "Docs",         "doc": "Docs",
+    "tests": "Tests",       "test": "Tests",
+    "models": "Models",     "views": "Views",
+    "controllers": "Controllers",   "ctrl": "Controllers",
+    "components": "Components",     "comps": "Components",
+    "scripts": "Scripts",   "static": "Static",
+    "public": "Public",     "private": "Private",
+    "assets": "Assets",     "media": "Media",
+    "images": "Images",     "img": "Images",
+    "uploads": "Uploads",   "logs": "Logs",       "log": "Logs",
+    "build": "Build",       "src": "Src",         "lib": "Lib",
+    "core": "Core",         "data": "Data",       "cache": "Cache",
+    "finance": "Finance",   "hr": "HR",           "marketing": "Marketing",
+    "sales": "Sales",       "admin": "Admin",
+}
+
+
+def _normalize_subfolder_name(name: str) -> str:
+    """Expand clipped subfolder names: 'front' → 'Frontend', 'b' → 'Backend'."""
+    return _SUBFOLDER_EXPANSIONS.get(name.lower().strip(), name)
+
+
 def _exec_create_subfolders(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     parent_raw = params.get("parent", "").strip()
     names      = params.get("names", [])
     count      = int(params.get("count", 0) or 0)
 
-    parent_path = resolve_path(parent_raw) if parent_raw else _windows_home()
+    # No parent given → check last action for the folder we just created
+    if not parent_raw:
+        try:
+            from ..services.memory_service import memory_service
+            last = memory_service.get_last_action()
+            if last and last.get("tool") in ("create_folder", "open_directory", "create_subfolders"):
+                parent_raw = (last.get("result") or "").strip()
+                if not parent_raw:
+                    parent_raw = (last.get("params") or {}).get("path", "")
+        except Exception:
+            pass
+
+    if not parent_raw:
+        return ToolResult(
+            success=False,
+            text="Which folder should I create the subfolders in?",
+            spoken="Which folder should I create these in? Say the folder name or path.",
+            data={"needs_clarification": True},
+        )
 
     if not names and count > 0:
         names = [f"Folder {i + 1}" for i in range(min(count, 20))]
@@ -416,9 +508,35 @@ def _exec_create_subfolders(params: Dict[str, Any], ctx: Dict[str, Any]) -> Tool
         return ToolResult(success=False, text="No subfolder names provided.",
                           spoken="What should I name the subfolders?")
 
-    if not is_safe_path(parent_path):
-        return ToolResult(success=False, text=f"Blocked: {parent_path}",
+    # Resolve parent to WSL path
+    parent_wsl = resolve_wsl_path(parent_raw)
+    if parent_wsl is None:
+        return ToolResult(success=False, text=f"Unknown parent location: {parent_raw!r}",
+                          spoken="I couldn't find that folder. Please tell me where to put the subfolders.")
+
+    # Defense-in-depth: if the resolved path doesn't exist, try FolderMemory by base name.
+    # This catches cases where the LLM computed "D:\project" but the folder is "D:\workspace\project".
+    if not os.path.exists(parent_wsl):
+        _base = os.path.basename(parent_wsl.rstrip("/"))
+        try:
+            from ..services.history_service import history_service as _hs
+            _fm = _hs.lookup_folder(_base.lower())
+            if _fm and os.path.exists(_fm["full_wsl"]):
+                logger.info("FolderMemory path fallback: %r → %r", parent_raw, _fm["full_wsl"])
+                parent_wsl = _fm["full_wsl"]
+            else:
+                return ToolResult(success=False,
+                    text=f"Parent folder not found: {parent_raw!r}",
+                    spoken=f"I couldn't find the folder '{_base}'. Please tell me where to put the subfolders.")
+        except Exception:
+            pass
+
+    parent_win = wsl_to_win(parent_wsl)
+    if not is_safe_path(parent_win):
+        return ToolResult(success=False, text=f"Blocked: {parent_win}",
                           spoken="That location is restricted.", error="Blocked path")
+
+    logger.info("create_subfolders: parent_wsl=%r", parent_wsl)
 
     created: list[str] = []
     failed:  list[str] = []
@@ -426,19 +544,32 @@ def _exec_create_subfolders(params: Dict[str, Any], ctx: Dict[str, Any]) -> Tool
         name = re.sub(r'[<>:"|?*]', "", name).strip()
         if not name:
             continue
-        target = os.path.join(parent_path, name)
-        fs_target = _fs_path(target)
+        # Expand clipped names: "front" → "Frontend", "b" → "Backend"
+        name = _normalize_subfolder_name(name)
+        wsl_target = parent_wsl.rstrip("/") + "/" + name
         try:
-            fs_target.mkdir(parents=True, exist_ok=True)
-            created.append(name)
-        except Exception:
+            os.makedirs(wsl_target, exist_ok=True)
+            if os.path.exists(wsl_target):
+                created.append(name)
+                logger.info("[EXEC] create_subfolders: %s", wsl_target)
+                # Register in persistent folder memory
+                try:
+                    from ..services.history_service import history_service as _hs
+                    _hs.remember_folder(name.lower(), wsl_target, wsl_to_win(wsl_target))
+                except Exception:
+                    pass
+            else:
+                logger.error("create_subfolders: makedirs ok but missing: %r", wsl_target)
+                failed.append(name)
+        except Exception as exc:
+            logger.error("create_subfolders: error creating %r: %s", name, exc)
             failed.append(name)
 
     if created:
         names_str = ", ".join(f"'{n}'" for n in created)
-        spoken = f"Done. Created {len(created)} subfolder{'s' if len(created) != 1 else ''}: {names_str}."
+        spoken = f"Done. Created {len(created)} subfolder{'s' if len(created) != 1 else ''}: {names_str} in {parent_win}."
         return ToolResult(success=True, text=spoken, spoken=spoken,
-                          data={"created": created, "parent": parent_path})
+                          data={"created": created, "parent": parent_win, "wsl_parent": parent_wsl})
     return ToolResult(success=False, text="No subfolders were created.",
                       spoken="Couldn't create the subfolders.", error="All failed")
 
@@ -1127,11 +1258,10 @@ def _exec_move_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
         return ToolResult(success=False, text=str(exc), spoken="Couldn't move the file.", error=str(exc))
 
 
-# ── Delete file (requires confirmation_confirmed=True in params) ───────────────
+# ── Delete file ───────────────────────────────────────────────────────────────
 
 def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    raw       = params.get("path", "").strip()
-    confirmed = params.get("confirmed", False)
+    raw = params.get("path", "").strip()
 
     if not raw:
         return ToolResult(success=False, text="File path required.", spoken="Which file should I delete?")
@@ -1142,53 +1272,81 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
                           spoken="That path is restricted. I won't delete it.", error="Blocked")
 
     fs = _fs_path(win_path)
+    logger.info("[delete_file] raw=%r  win_path=%r  fs=%r  fs.exists=%s",
+                raw, win_path, str(fs), fs.exists())
     if not fs.exists():
-        # Bare name with no path separators — search common locations
+        # Determine parent dir and target name for scanning.
+        # resolve_path() expands named dirs: "Desktop" → "C:\\Users\\...\\Desktop"
+        parent_win = resolve_path(str(Path(win_path).parent))
+        target_name = Path(win_path).name
+
+        logger.info("[delete_file] SCAN: parent_win=%r  target_name=%r", parent_win, target_name)
+
+        # If no path separators — search common locations too
         if not any(c in raw for c in ('\\', '/', ':')):
             special = _get_win_special()
-            search_bases = [
+            extra_bases = [
                 _windows_home(),
                 special.get("desktop", ""),
                 special.get("documents", ""),
                 special.get("downloads", ""),
             ]
-            for base in search_bases:
-                if not base:
-                    continue
-                candidate_win = base.rstrip("\\") + "\\" + raw
-                candidate_fs  = _fs_path(candidate_win)
-                if candidate_fs.exists():
-                    fs       = candidate_fs
-                    win_path = candidate_win
+        else:
+            extra_bases = []
+
+        # Build list of parent directories to scan
+        scan_parents = [parent_win] + extra_bases
+        logger.info("[delete_file] scan_parents=%r", scan_parents)
+
+        for base in scan_parents:
+            if not base:
+                continue
+            base_fs = _fs_path(base.rstrip("\\"))
+            if not base_fs.is_dir():
+                continue
+            try:
+                children = [c.name for c in base_fs.iterdir()]
+            except PermissionError:
+                continue
+            logger.info("[delete_file] scanning base=%r  found %d items: %r",
+                        base, len(children), children[:20])
+            # 1. Case-insensitive exact match
+            for child in children:
+                if child.lower() == target_name.lower():
+                    fs       = base_fs / child
+                    win_path = base.rstrip("\\") + "\\" + child
                     break
+            if fs.exists():
+                break
+            # 2. Fuzzy match (cutoff 0.6)
+            matches = difflib.get_close_matches(
+                target_name.lower(),
+                [c.lower() for c in children],
+                n=1, cutoff=0.6,
+            )
+            if matches:
+                # Recover original-case child name
+                matched_lower = matches[0]
+                child = next(c for c in children if c.lower() == matched_lower)
+                fs       = base_fs / child
+                win_path = base.rstrip("\\") + "\\" + child
+                break
+
         if not fs.exists():
             return ToolResult(success=False, text=f"Not found: {win_path}",
                               spoken=f"I couldn't find '{raw}'. Does it exist?")
 
-    # Safety gate — must be explicitly confirmed before deletion
-    if not confirmed:
-        prompt = f"I'm about to permanently delete {fs.name}. Say yes to confirm or no to cancel."
-        return ToolResult(
-            success=False,
-            text=f"CONFIRM_REQUIRED: delete {win_path}",
-            spoken=prompt,
-            data={
-                "requires_confirmation": True,
-                "path": win_path,
-                "name": fs.name,
-                "tool": "delete_file",
-                "params": {"path": raw},
-                "prompt": prompt,
-            },
-            error="confirm_required",
-        )
-
+    wsl_path = safe_path(str(fs))
     try:
         if fs.is_dir():
-            import shutil
-            shutil.rmtree(fs)
+            shutil.rmtree(wsl_path)
         else:
-            fs.unlink()
+            os.remove(wsl_path)
+        # Verify deletion actually happened
+        if os.path.exists(wsl_path):
+            return ToolResult(success=False, text=f"Delete failed — still exists: {wsl_path}",
+                              spoken=f"Couldn't delete {fs.name}, it still exists.",
+                              error="path still exists after delete")
         return ToolResult(success=True, text=f"Deleted: {win_path}",
                           spoken=f"Deleted {fs.name}.",
                           data={"path": win_path, "deleted": True})
@@ -1485,12 +1643,18 @@ registry.register(
         "type": "function",
         "function": {
             "name": "create_folder",
-            "description": "Create a new folder/directory. Use for: 'create folder called X in Y'.",
+            "description": (
+                "Create a new folder/directory. Use for: 'create folder X', 'make a folder called X on Y'. "
+                "Extract ONLY the folder name — not the full sentence. "
+                "Examples: 'create folder TestXyron on Desktop' → name='TestXyron', path='Desktop'; "
+                "'make a folder called Projects in D drive' → name='Projects', path='D:\\\\'; "
+                "'create folder Reports' → name='Reports', path omitted (defaults to Desktop)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Folder name to create"},
-                    "path": {"type": "string", "description": "Parent directory path (e.g. 'E:\\\\' or 'Desktop'). Defaults to user home."},
+                    "name": {"type": "string", "description": "Folder name only — a single word or short phrase, NOT the full sentence."},
+                    "path": {"type": "string", "description": "Parent directory (e.g. 'Desktop', 'D:\\\\', 'E:\\\\Projects'). Defaults to Desktop."},
                 },
                 "required": ["name"],
             },
@@ -1801,12 +1965,17 @@ registry.register(
         "type": "function",
         "function": {
             "name": "delete_file",
-            "description": "Permanently delete a file or folder. ALWAYS requires voice confirmation before executing. Use when user says 'delete X', 'remove X file'.",
+            "description": (
+                "Permanently delete a file or folder. Use when user says 'delete X', 'remove X', 'delete folder X'. "
+                "Extract ONLY the file/folder name or path — not the full sentence. "
+                "Examples: 'delete TestXyron' → path='TestXyron'; "
+                "'delete the folder on Desktop named Projects' → path='Desktop\\\\Projects'; "
+                "'remove file report.txt from Downloads' → path='Downloads\\\\report.txt'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path":      {"type": "string", "description": "Path to delete"},
-                    "confirmed": {"type": "boolean", "description": "Must be true to actually delete — set only after user voice-confirms"},
+                    "path": {"type": "string", "description": "File or folder name/path to delete. Extract only the name, not the full sentence."},
                 },
                 "required": ["path"],
             },

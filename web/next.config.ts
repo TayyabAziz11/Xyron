@@ -9,6 +9,14 @@ const nextConfig: NextConfig = {
       },
     ]
   },
+  webpack: (config, { isServer }) => {
+    if (!isServer) {
+      config.resolve.fallback = { ...config.resolve.fallback, fs: false }
+    }
+    // Enable async WebAssembly for onnxruntime-web (Silero VAD)
+    config.experiments = { ...config.experiments, asyncWebAssembly: true, layers: true }
+    return config
+  },
 }
 
 export default nextConfig
