@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Before Starting Any Work
+
+Always sync with main first:
+```bash
+git checkout main && git pull origin main
+git checkout - && git merge main
+```
+
 ## Running the Project
 
 ### Backend (FastAPI on port 8000)

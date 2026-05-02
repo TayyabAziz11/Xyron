@@ -37,6 +37,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, command, result) VALUES (new.id, new.command, new.result);
 END;
+CREATE TABLE IF NOT EXISTS folder_memory (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL COLLATE NOCASE,
+    full_wsl    TEXT    NOT NULL,
+    full_win    TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_folder_mem_name ON folder_memory(name);
 """
 
 
@@ -111,6 +119,42 @@ class HistoryService:
         if total > 10:
             summary += f". And {total - 10} more commands."
         return summary
+
+    # ── Folder memory ─────────────────────────────────────────────────────────
+
+    def remember_folder(self, name: str, wsl_path: str, win_path: str) -> None:
+        """Persist a created folder so future commands can resolve its full path."""
+        with self._lock:
+            ts = datetime.now().timestamp()
+            self._conn.execute(
+                "INSERT INTO folder_memory(name, full_wsl, full_win, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "full_wsl=excluded.full_wsl, full_win=excluded.full_win, "
+                "created_at=excluded.created_at",
+                (name.lower().strip(), wsl_path, win_path, ts),
+            )
+            self._conn.commit()
+
+    def lookup_folder(self, name: str) -> Optional[dict]:
+        """Return the most recently recorded folder entry for this name, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM folder_memory WHERE name = ? ORDER BY created_at DESC LIMIT 1",
+                (name.lower().strip(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_folders_context(self) -> str:
+        """Return a compact summary of known folders for injection into the LLM system prompt."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, full_win FROM folder_memory ORDER BY created_at DESC LIMIT 30"
+            ).fetchall()
+        if not rows:
+            return ""
+        lines = [f"  {r['name']} → {r['full_win']}" for r in rows]
+        return "Known folders (use these exact paths when creating subfolders):\n" + "\n".join(lines)
 
     def close(self) -> None:
         try:
