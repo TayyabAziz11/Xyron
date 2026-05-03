@@ -79,6 +79,11 @@ def synthesize_kokoro(text: str, voice: str = _KOKORO_VOICE, speed: float = _KOK
         try:
             import soundfile as sf
             samples, sr = _kokoro_engine.create(text, voice=voice, speed=speed, lang="en-us")
+            # Normalize to full loudness — Kokoro often outputs at low amplitude
+            import numpy as _np
+            peak = float(_np.max(_np.abs(samples)))
+            if peak > 0.01:
+                samples = samples * (0.95 / peak)
             buf = io.BytesIO()
             sf.write(buf, samples, sr, format="WAV")
             return buf.getvalue()

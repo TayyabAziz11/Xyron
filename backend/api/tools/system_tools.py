@@ -275,6 +275,12 @@ _APP_MAP: Dict[str, Dict[str, str]] = {
     "postman":     {"wsl": "postman.exe",     "linux": "postman",            "win32": "postman"},
     "obsidian":    {"wsl": "obsidian.exe",    "linux": "obsidian",           "win32": "obsidian"},
     "notion":      {"wsl": "notion.exe",      "linux": "notion-app",         "win32": "notion"},
+    # Browser shortcuts — opened via default browser
+    "youtube":     {"wsl": "https://www.youtube.com",  "win32": "https://www.youtube.com"},
+    "gmail":       {"wsl": "https://mail.google.com",  "win32": "https://mail.google.com"},
+    "github":      {"wsl": "https://github.com",       "win32": "https://github.com"},
+    "chatgpt":     {"wsl": "https://chatgpt.com",      "win32": "https://chatgpt.com"},
+    "google":      {"wsl": "https://www.google.com",   "win32": "https://www.google.com"},
 }
 
 _APP_ALIASES: Dict[str, str] = {
@@ -307,6 +313,56 @@ def _normalise_app(name: str) -> str:
     return _APP_ALIASES.get(n, re.sub(r'[\s\-_]', '', n))
 
 
+# Window title / WScript.AppActivate search strings for common apps
+_APP_FOCUS_TITLE: Dict[str, str] = {
+    "settings":     "Settings",
+    "chrome":       "Google Chrome",
+    "firefox":      "Mozilla Firefox",
+    "edge":         "Microsoft Edge",
+    "spotify":      "Spotify",
+    "discord":      "Discord",
+    "vscode":       "Visual Studio Code",
+    "code":         "Visual Studio Code",
+    "word":         "Word",
+    "excel":        "Excel",
+    "outlook":      "Outlook",
+    "teams":        "Microsoft Teams",
+    "slack":        "Slack",
+    "notepad":      "Notepad",
+    "explorer":     "File Explorer",
+    "youtube":      "YouTube",
+    "whatsapp":     "WhatsApp",
+}
+
+
+def _bring_to_front(app_key: str, delay: float = 1.5) -> None:
+    """Background thread: focus the app window ~delay seconds after launch."""
+    if not (_ON_WSL or _ON_WINDOWS):
+        return
+
+    title = _APP_FOCUS_TITLE.get(app_key, "")
+    if not title:
+        return
+
+    def _do_focus() -> None:
+        import time
+        time.sleep(delay)
+        try:
+            ps_cmd = (
+                f"$s = New-Object -COM WScript.Shell; "
+                f"$null = $s.AppActivate('{title}')"
+            )
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-Command", ps_cmd],
+                capture_output=True, timeout=6,
+            )
+        except Exception as exc:
+            logger.debug("_bring_to_front(%r) failed: %s", title, exc)
+
+    threading.Thread(target=_do_focus, daemon=True).start()
+
+
 def _launch_app(app_name: str) -> tuple[bool, str]:
     key      = _normalise_app(app_name)
     platform = "wsl" if _ON_WSL else ("win32" if _ON_WINDOWS else "linux")
@@ -330,6 +386,7 @@ def _launch_app(app_name: str) -> tuple[bool, str]:
                 )
             else:
                 subprocess.Popen(exe.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _bring_to_front(key)
             return True, f"Launching {app_name}…"
         except Exception as exc:
             return False, f"App '{app_name}' not found. Known apps: vscode, chrome, spotify, terminal, word, excel, teams, slack, discord."
@@ -339,11 +396,12 @@ def _launch_app(app_name: str) -> tuple[bool, str]:
         return False, f"'{app_name}' is not available on this platform."
 
     try:
+        _is_uri = cmd.startswith("ms-settings:") or cmd.startswith("http://") or cmd.startswith("https://")
         if _ON_WSL:
             _cmd = _find_cmdexe() or "cmd.exe"
             subprocess.Popen(['/init', _cmd, '/c', 'start', '', cmd],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif "ms-settings:" in cmd:
+        elif _is_uri:
             subprocess.Popen(["start", cmd], shell=True,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif _ON_WINDOWS:
@@ -351,6 +409,7 @@ def _launch_app(app_name: str) -> tuple[bool, str]:
         else:
             subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         logger.info("Launched: %s → %s", app_name, cmd)
+        _bring_to_front(key)
         return True, f"Launched {app_name}"
     except Exception as exc:
         logger.warning("Launch failed for %s: %s", app_name, exc)

@@ -371,6 +371,10 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
         return None
     kokoro_voice = _KOKORO_VOICE_MAP.get(voice, "af_nova")
     samples, sample_rate = k.create(text, voice=kokoro_voice, speed=speed, lang="en-us")
+    # Normalize to full loudness — Kokoro often outputs at 20-40% amplitude
+    peak = float(np.max(np.abs(samples)))
+    if peak > 0.01:
+        samples = samples * (0.95 / peak)
     # Convert float32 samples → 16-bit PCM WAV bytes
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
     buf = io.BytesIO()
