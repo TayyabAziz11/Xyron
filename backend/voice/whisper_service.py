@@ -228,3 +228,64 @@ def _resolve_lang(language: Optional[str]) -> Optional[str]:
     """Resolve language param to what faster-whisper expects (None = auto-detect)."""
     lang = language or _LANGUAGE
     return None if lang in (None, "auto") else lang
+
+
+# ── Wake phrase verification ───────────────────────────────────────────────────
+
+# Initial prompt biases Whisper toward these proper-noun wake phrases.
+# Without it, "hey xyron" often becomes "he's a" (Whisper misread).
+_WAKE_INITIAL_PROMPT = "Hey Xyron. Wakeup Xyron. Hi Xyron. Okay Xyron. Yo Xyron."
+
+# Keyword set: exact spellings + common Whisper misreadings of wake phonemes.
+#   "hey"   → "he", "he's", "hay"
+#   "xyron" → "zairan", "zahra", "zairon", "siren", "cyron", "iron", "zero"
+_WAKE_KEYWORDS: frozenset[str] = frozenset({
+    'xyron', 'xeron', 'xiron', 'zyron',
+    'hey', 'hi', 'okay', 'ok', 'yo',
+    'wakeup', 'wake',
+    'jarvis',
+    'zairan', 'zahra', 'zairon', 'ziren', 'siren', 'cyron', 'iron',
+    'xavier', 'zero', 'zara',
+    'he', "hes", 'hay',
+})
+
+
+def verify_wake_phrase(pcm: np.ndarray) -> tuple[bool, str]:
+    """
+    Second-stage gate: run Whisper on a short PCM clip and confirm a wake keyword.
+
+    Call this after OWW fires. Pass the last ~2.5s of buffered float32 audio.
+    Returns (matched, transcript).
+
+    Fails OPEN (returns True) if Whisper unavailable — OWW already raised the
+    bar; we prefer a rare false positive over blocking a real wake word.
+    """
+    try:
+        model = _get_model()
+    except Exception:
+        return True, ""
+
+    try:
+        segments_raw, _ = model.transcribe(
+            pcm,
+            beam_size=1,
+            language="en",
+            vad_filter=True,                      # trim silence → focus on actual speech
+            vad_parameters={"min_silence_duration_ms": 100},
+            temperature=0.0,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            initial_prompt=_WAKE_INITIAL_PROMPT,  # bias toward wake phrase vocabulary
+        )
+        transcript = " ".join(s.text.strip() for s in segments_raw).lower()
+        # word-level match: strip punctuation + remove internal apostrophes
+        # so "he's" → "hes", "wake," → "wake", "zahra." → "zahra"
+        words = set(
+            w.strip(".,!?'\"").replace("'", "") for w in transcript.split()
+        )
+        matched = bool(words & _WAKE_KEYWORDS)
+        logger.info("[Whisper/wake] transcript=%r matched=%s", transcript[:80], matched)
+        return matched, transcript
+    except Exception as exc:
+        logger.warning("[Whisper/wake] verification error: %s — failing open", exc)
+        return True, ""

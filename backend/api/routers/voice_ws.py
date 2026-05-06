@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import re
@@ -113,6 +114,13 @@ async def ws_wake(websocket: WebSocket) -> None:
 
     PING_EVERY = 8.0   # shorter interval → detect dead connections faster
 
+    # Rolling audio buffer: last 2.56s of PCM (32 × 1280 samples @ 16kHz).
+    # Used for Whisper second-stage verification when OWW fires.
+    _BUFFER_FRAMES = 32
+    audio_buf: collections.deque[np.ndarray] = collections.deque(maxlen=_BUFFER_FRAMES)
+
+    loop = asyncio.get_event_loop()
+
     try:
         while True:
             if websocket.client_state != WebSocketState.CONNECTED:
@@ -134,8 +142,31 @@ async def ws_wake(websocket: WebSocket) -> None:
             raw = data.get("bytes")
             if raw and len(raw) == FRAME_BYTES:
                 pcm = np.frombuffer(raw, dtype=np.float32).copy()
+                audio_buf.append(pcm)   # always buffer — used for Whisper verify
+
                 triggered, model_name, confidence = _wws.detect_frame(pcm)
                 if triggered:
+                    # ── Second-stage Whisper verification ────────────────────
+                    # OWW models produce false positives from background noise.
+                    # Whisper confirms a wake keyword was actually spoken before
+                    # we send the wake event to the frontend.
+                    clip = np.concatenate(list(audio_buf))
+                    try:
+                        from voice.whisper_service import verify_wake_phrase
+                        matched, transcript = await loop.run_in_executor(
+                            None, verify_wake_phrase, clip
+                        )
+                    except Exception as exc:
+                        logger.warning("[WS/wake] Whisper verify error: %s — failing open", exc)
+                        matched, transcript = True, ""
+
+                    if not matched:
+                        logger.info(
+                            "[WS/wake] WAKE_REJECTED_WHISPER model=%s conf=%.3f transcript=%r",
+                            model_name, confidence, transcript[:60],
+                        )
+                        continue
+
                     if not await _send(websocket, {
                         "type":       "wake",
                         "model":      model_name,
@@ -143,7 +174,8 @@ async def ws_wake(websocket: WebSocket) -> None:
                         "ts":         int(time.time() * 1000),
                     }):
                         break
-                    logger.info("[WS/wake] WAKE model=%s conf=%.3f", model_name, confidence)
+                    logger.info("[WS/wake] WAKE model=%s conf=%.3f transcript=%r",
+                                model_name, confidence, transcript[:60])
                 continue
 
             text = data.get("text")
@@ -158,11 +190,12 @@ async def ws_wake(websocket: WebSocket) -> None:
                         _wws.set_tts_playing(False)
                     elif msg.get("type") == "session_start":
                         _wws.set_session_active(True)
-                        logger.debug("[WS/wake] session gate OPEN (HTTP session started)")
+                        logger.debug("[WS/wake] session gate OPEN")
                     elif msg.get("type") == "session_end":
+                        # Do NOT call reset_cooldown() here — set_session_active(False)
+                        # already resets _last_wake_t so TTS echo gets the 2s debounce.
                         _wws.set_session_active(False)
-                        _wws.reset_cooldown()
-                        logger.debug("[WS/wake] session gate CLOSED (HTTP session ended)")
+                        logger.debug("[WS/wake] session gate CLOSED")
                 except Exception:
                     pass
 
