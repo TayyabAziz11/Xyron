@@ -63,18 +63,18 @@ except json.JSONDecodeError:
 # Hard-coded overrides for the Xyron keyword set.
 # Rationale: 0.90+ required to block false positives from phonetically similar words.
 # Single-word keywords ("xyron") share phonemes with common words → highest threshold.
-_MODEL_THRESHOLDS.setdefault("hey_xyron",    0.50)  # two-word phrase — moderate threshold
-_MODEL_THRESHOLDS.setdefault("wakeup_xyron", 0.50)
-_MODEL_THRESHOLDS.setdefault("xyron",        0.62)  # single word — slightly higher FP risk
-_MODEL_THRESHOLDS.setdefault("hey_xeron",    0.50)  # phonetic variant
-_MODEL_THRESHOLDS.setdefault("hi_xyron",     0.50)
-_MODEL_THRESHOLDS.setdefault("hey_jarvis",   0.75)  # built-in pretrained — keep high
+_MODEL_THRESHOLDS.setdefault("hey_xyron",    0.72)  # raised: noise floor sits at 0.40–0.49
+_MODEL_THRESHOLDS.setdefault("wakeup_xyron", 0.72)
+_MODEL_THRESHOLDS.setdefault("xyron",        0.78)  # single word — highest FP risk
+_MODEL_THRESHOLDS.setdefault("hey_xeron",    0.72)  # phonetic variant
+_MODEL_THRESHOLDS.setdefault("hi_xyron",     0.72)
+_MODEL_THRESHOLDS.setdefault("hey_jarvis",   0.80)  # built-in pretrained
 
 # Path for hard-negative mining log (frames that nearly fire but don't)
 _FP_LOG_PATH = Path(os.path.expanduser("~/.xyron/false_positive_log.jsonl"))
 _FP_CONF_MIN = 0.35  # log near-misses above this — raised to reduce noise in log
 
-_SPEECH_RMS_MIN       = 0.002  # frames below this are pure silence — skip embedding
+_SPEECH_RMS_MIN       = 0.005  # raised: filters near-silence frames before embedding
 _CONSECUTIVE_REQUIRED = 2      # frames above threshold before accepting (anti-spike)
 _CONF_DEBUG_FLOOR     = 0.15   # log ANY score above this at DEBUG level (diagnostics)
 
@@ -115,9 +115,11 @@ class WakeWordService:
     def set_session_active(self, active: bool) -> None:
         """Call with True when a voice session starts, False when it ends."""
         self._session_active = active
-        if active:
-            self._last_wake_t    = time.perf_counter()
-            self._consecutive_hits = {}
+        self._consecutive_hits = {}
+        # Reset cooldown on both transitions:
+        # - session start: prevent immediate re-trigger from the wake beep
+        # - session end: 2s grace so TTS echo in the room decays before re-arming
+        self._last_wake_t = time.perf_counter()
         logger.info("[WakeWord] session_active=%s", active)
 
     # ── Loading ───────────────────────────────────────────────────────────────
