@@ -317,13 +317,48 @@ async def voice_pipeline_endpoint(audio: UploadFile = File(...), request: Reques
 
 # Kokoro voice mapping: OpenAI voice names → Kokoro voice IDs
 _KOKORO_VOICE_MAP: dict[str, str] = {
-    "nova":    "af_nova",      # warm American female
-    "alloy":   "am_echo",      # American male
-    "echo":    "am_echo",      # American male
-    "onyx":    "am_onyx",      # deep American male
-    "fable":   "bm_fable",     # British male
-    "shimmer": "af_sarah",     # American female
+    # OpenAI alias → Kokoro ID
+    "nova":    "af_nova",
+    "alloy":   "am_echo",
+    "echo":    "am_echo",
+    "onyx":    "am_onyx",
+    "fable":   "bm_fable",
+    "shimmer": "af_sarah",
+    # All Kokoro voices pass through unchanged (af_*, am_*, bf_*, bm_*)
 }
+
+# Kokoro native voices — grouped by category for the UI
+_KOKORO_VOICES: list[dict] = [
+    # American Female
+    {"id": "af_heart",   "label": "Heart",   "group": "American Female", "desc": "Warm, expressive"},
+    {"id": "af_bella",   "label": "Bella",   "group": "American Female", "desc": "Bright, friendly"},
+    {"id": "af_nova",    "label": "Nova",    "group": "American Female", "desc": "Clear, natural (default)"},
+    {"id": "af_sarah",   "label": "Sarah",   "group": "American Female", "desc": "Soft, gentle"},
+    {"id": "af_sky",     "label": "Sky",     "group": "American Female", "desc": "Energetic, upbeat"},
+    {"id": "af_nicole",  "label": "Nicole",  "group": "American Female", "desc": "Calm, professional"},
+    {"id": "af_aoede",   "label": "Aoede",   "group": "American Female", "desc": "Smooth, melodic"},
+    {"id": "af_kore",    "label": "Kore",    "group": "American Female", "desc": "Confident, clear"},
+    {"id": "af_jessica", "label": "Jessica", "group": "American Female", "desc": "Conversational"},
+    {"id": "af_river",   "label": "River",   "group": "American Female", "desc": "Natural, flowing"},
+    # American Male
+    {"id": "am_echo",    "label": "Echo",    "group": "American Male",   "desc": "Warm, balanced"},
+    {"id": "am_onyx",    "label": "Onyx",    "group": "American Male",   "desc": "Deep, authoritative"},
+    {"id": "am_adam",    "label": "Adam",    "group": "American Male",   "desc": "Clear, direct"},
+    {"id": "am_michael", "label": "Michael", "group": "American Male",   "desc": "Natural, relaxed"},
+    {"id": "am_liam",    "label": "Liam",    "group": "American Male",   "desc": "Friendly, casual"},
+    {"id": "am_fenrir",  "label": "Fenrir",  "group": "American Male",   "desc": "Bold, strong"},
+    {"id": "am_puck",    "label": "Puck",    "group": "American Male",   "desc": "Expressive, dynamic"},
+    # British Female
+    {"id": "bf_emma",    "label": "Emma",    "group": "British Female",  "desc": "Crisp, professional"},
+    {"id": "bf_isabella","label": "Isabella","group": "British Female",  "desc": "Elegant, warm"},
+    {"id": "bf_alice",   "label": "Alice",   "group": "British Female",  "desc": "Clear, refined"},
+    {"id": "bf_lily",    "label": "Lily",    "group": "British Female",  "desc": "Soft, charming"},
+    # British Male
+    {"id": "bm_fable",   "label": "Fable",   "group": "British Male",    "desc": "Expressive, storytelling"},
+    {"id": "bm_george",  "label": "George",  "group": "British Male",    "desc": "Deep, distinguished"},
+    {"id": "bm_lewis",   "label": "Lewis",   "group": "British Male",    "desc": "Smooth, confident"},
+    {"id": "bm_daniel",  "label": "Daniel",  "group": "British Male",    "desc": "Calm, measured"},
+]
 _KOKORO_MODELS_DIR = "/home/tayyab/.xyron/models"
 _kokoro_instance = None        # module-level singleton, lazy-loaded once
 _kokoro_lock = __import__("threading").Lock()
@@ -344,6 +379,9 @@ def _get_kokoro():
             return None
         try:
             from kokoro_onnx import Kokoro  # type: ignore
+            import onnxruntime as _ort
+            # Suppress memcpy / CPU-fallback warnings (severity 3 = ERROR only)
+            _ort.set_default_logger_severity(3)
             # Propagate ONNX_PROVIDER from settings into os.environ so kokoro_onnx picks it up
             _provider = os.getenv("ONNX_PROVIDER", "")
             if not _provider:
@@ -363,18 +401,88 @@ def _get_kokoro():
         return _kokoro_instance
 
 
+_ORDINALS = {
+    "1st": "first", "2nd": "second", "3rd": "third",
+    "4th": "fourth", "5th": "fifth", "6th": "sixth",
+    "7th": "seventh", "8th": "eighth", "9th": "ninth", "10th": "tenth",
+}
+_ABBREVS = {
+    r'\bGB\b': 'gigabytes', r'\bMB\b': 'megabytes', r'\bKB\b': 'kilobytes',
+    r'\bGHz\b': 'gigahertz', r'\bMHz\b': 'megahertz',
+    r'\bCPU\b': 'CPU', r'\bRAM\b': 'RAM', r'\bSSD\b': 'SSD', r'\bHDD\b': 'HDD',
+    r'\bOS\b': 'operating system',
+    r'\bWiFi\b': 'Wi-Fi', r'\bIP\b': 'I P',
+    r'\be\.g\.\b': 'for example', r'\bi\.e\.\b': 'that is',
+}
+
+
+def _sanitize_tts_text(text: str) -> str:
+    """
+    Prepare text for Kokoro TTS:
+    1. Expand Windows paths  (C:\\folder → C drive folder)
+    2. Expand abbreviations  (GB → gigabytes, etc.)
+    3. Expand ordinals       (1st → first)
+    4. Remove phonemizer-hostile characters
+    """
+    import re as _re
+
+    # Windows paths → spoken form
+    def _path_to_spoken(m: "_re.Match") -> str:
+        part = m.group(2).replace("\\", " ").strip()
+        return f"{m.group(1).upper()} drive {part} folder"
+    text = _re.sub(r'\b([A-Za-z]):[\\\/]([\w\s\-]+)', _path_to_spoken, text)
+    text = text.replace("\\", " ").replace("//", " ")
+
+    # Standalone drive letter "C:" → "C drive"
+    text = _re.sub(r'\b([A-Fa-f]):\s*(?=[^\\]|$)', lambda m: f'{m.group(1).upper()} drive ', text)
+
+    # Abbreviations
+    for pat, repl in _ABBREVS.items():
+        text = _re.sub(pat, repl, text)
+
+    # Ordinals
+    for abbr, spoken in _ORDINALS.items():
+        text = text.replace(abbr, spoken)
+
+    # Large numbers → more natural  (1024 → 1,024)
+    text = _re.sub(r'\b(\d{1,3})(\d{3})\b', r'\1,\2', text)
+
+    # Percentage
+    text = _re.sub(r'(\d+)\s*%', r'\1 percent', text)
+
+    # Remove phonemizer-hostile characters, keep sentence punctuation
+    text = _re.sub(r"[^\w\s.,!?'\-]", " ", text)
+
+    # Collapse whitespace
+    text = _re.sub(r"\s+", " ", text).strip()
+    # Sentence-final punctuation — ensures Kokoro applies closing intonation
+    if text and text[-1] not in '.!?':
+        text += '.'
+    return text
+
+
 def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
     """Generate WAV via Kokoro (local, offline, ~100-400ms after warm-up)."""
     import io, wave, numpy as np
     k = _get_kokoro()
     if k is None:
         return None
-    kokoro_voice = _KOKORO_VOICE_MAP.get(voice, "af_nova")
+    text = _sanitize_tts_text(text)
+    if not text:
+        return None
+    # 0.92 feels natural; pure 1.0 sounds slightly rushed on short commands
+    if speed >= 0.99:
+        speed = 0.92
+    # Pass native Kokoro IDs (af_*, am_*, bf_*, bm_*) through; map OpenAI aliases
+    kokoro_voice = voice if (voice and voice[:3] in ("af_", "am_", "bf_", "bm_")) else _KOKORO_VOICE_MAP.get(voice, "af_nova")
     samples, sample_rate = k.create(text, voice=kokoro_voice, speed=speed, lang="en-us")
     # Normalize to full loudness — Kokoro often outputs at 20-40% amplitude
     peak = float(np.max(np.abs(samples)))
     if peak > 0.01:
         samples = samples * (0.95 / peak)
+    # 50ms trailing silence — prevents abrupt cut-off between streamed sentence chunks
+    silence = np.zeros(int(sample_rate * 0.05), dtype=np.float32)
+    samples = np.concatenate([samples, silence])
     # Convert float32 samples → 16-bit PCM WAV bytes
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
     buf = io.BytesIO()
@@ -422,7 +530,7 @@ async def synthesize_text(request: Request):
       4. pyttsx3 / espeak-ng (offline, robotic, last resort)
 
     Body:   {"text": "...", "speed": 1.0, "voice": "nova"}
-    Returns: audio/wav (Kokoro/pyttsx3) or audio/mpeg (edge-tts/OpenAI)
+    Returns: audio/wav (Kokoro/pyttsx3) or audio/mpeg (edge-tts)
     """
     _ensure_paths()
     body   = await request.json()
@@ -468,33 +576,9 @@ async def synthesize_text(request: Request):
                 headers={"Cache-Control": "no-cache", "X-TTS-Engine": "edge-tts"},
             )
     except Exception as exc:
-        logger.warning("[TTS] edge-tts failed, trying OpenAI: %s", exc)
+        logger.warning("[TTS] edge-tts failed, trying pyttsx3: %s", exc)
 
-    # ── 3. OpenAI TTS fallback ────────────────────────────────────────────────
-    try:
-        from ..config import settings
-        if settings.openai_api_key and settings.openai_api_key.startswith("sk-"):
-            from openai import OpenAI
-            client = OpenAI(api_key=settings.openai_api_key)
-            speed_clamped = max(0.25, min(4.0, speed))
-            tts_resp = client.audio.speech.create(
-                model="tts-1",
-                voice=voice,
-                input=text,
-                response_format="mp3",
-                speed=speed_clamped,
-            )
-            mp3_bytes = tts_resp.content
-            logger.info("[TTS] OpenAI (%s): %d chars → %d bytes", voice, len(text), len(mp3_bytes))
-            return Response(
-                content=mp3_bytes,
-                media_type="audio/mpeg",
-                headers={"Cache-Control": "no-cache", "X-TTS-Engine": "openai"},
-            )
-    except Exception as exc:
-        logger.warning("[TTS] OpenAI TTS failed: %s", exc)
-
-    # ── 4. pyttsx3 / espeak-ng last resort ───────────────────────────────────
+    # ── 3. pyttsx3 / espeak-ng last resort ───────────────────────────────────
     try:
         from voice.tts_service import synthesize_speech, is_tts_available
     except ImportError as exc:
@@ -521,13 +605,12 @@ async def synthesize_text(request: Request):
 
 @router.post("/synthesize-stream")
 async def synthesize_stream(request: Request):
-    """Stream TTS audio bytes directly from OpenAI with zero buffering.
+    """TTS via Kokoro (WAV) with edge-tts MP3 fallback. OpenAI TTS is never used.
 
-    Bytes are piped as they arrive from OpenAI — the client can start playing
-    before the full audio is generated (used with MediaSource API on frontend).
+    Returns audio/wav (Kokoro) or audio/mpeg (edge-tts).
+    The client must handle both content-types — check the Content-Type header.
 
     Body:   {"text": "...", "voice": "nova", "speed": 1.0}
-    Returns: audio/mpeg stream
     """
     _ensure_paths()
     body  = await request.json()
@@ -541,40 +624,47 @@ async def synthesize_stream(request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="text is empty after cleaning")
 
+    import asyncio as _asyncio
+
+    # 1. Kokoro — local, high quality, ~80-400ms after warm-up
+    for attempt in range(2):
+        try:
+            wav_bytes = await _asyncio.get_event_loop().run_in_executor(
+                None, _kokoro_to_wav, text, voice, speed
+            )
+            if wav_bytes:
+                logger.info("[TTS-Stream] Kokoro: %d chars → %d bytes (attempt %d)",
+                            len(text), len(wav_bytes), attempt + 1)
+                return Response(
+                    content=wav_bytes,
+                    media_type="audio/wav",
+                    headers={"Cache-Control": "no-cache", "X-TTS-Engine": "kokoro"},
+                )
+            if attempt == 0:
+                logger.warning("[TTS-Stream] Kokoro returned None, retrying...")
+                await _asyncio.sleep(0.15)
+        except Exception as exc:
+            if attempt == 0:
+                logger.warning("[TTS-Stream] Kokoro attempt 1 failed, retrying: %s", exc)
+                await _asyncio.sleep(0.15)
+            else:
+                logger.warning("[TTS-Stream] Kokoro failed after retry: %s", exc)
+
+    # 2. edge-tts fallback — free, natural quality, requires internet
     try:
-        from ..config import settings
-        if not (settings.openai_api_key and settings.openai_api_key.startswith("sk-")):
-            raise HTTPException(status_code=503, detail="OpenAI API key required for streaming TTS")
-
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
-        speed  = max(0.25, min(4.0, speed))
-
-        async def _stream_bytes():
-            async with client.audio.speech.with_streaming_response.create(
-                model="tts-1",
-                voice=voice,
-                input=text,
-                response_format="mp3",
-                speed=speed,
-            ) as response:
-                async for chunk in response.iter_bytes(chunk_size=4096):
-                    yield chunk
-
-        return StreamingResponse(
-            _stream_bytes(),
-            media_type="audio/mpeg",
-            headers={
-                "Cache-Control":     "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-TTS-Engine":      "openai-stream",
-            },
-        )
-    except HTTPException:
-        raise
+        mp3_bytes = await _edge_tts_mp3(text, voice, speed)
+        if mp3_bytes:
+            logger.info("[TTS-Stream] edge-tts fallback: %d chars → %d bytes",
+                        len(text), len(mp3_bytes))
+            return Response(
+                content=mp3_bytes,
+                media_type="audio/mpeg",
+                headers={"Cache-Control": "no-cache", "X-TTS-Engine": "edge-tts"},
+            )
     except Exception as exc:
-        logger.error("Streaming TTS error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.warning("[TTS-Stream] edge-tts fallback failed: %s", exc)
+
+    raise HTTPException(status_code=503, detail="All TTS engines failed")
 
 
 @router.get("/tts-info")
@@ -600,6 +690,38 @@ async def tts_info():
         pass
 
     return {"success": True, "data": info}
+
+
+@router.get("/voices")
+async def list_voices():
+    """Return all available Kokoro voices grouped by category."""
+    _ensure_paths()
+    groups: dict[str, list] = {}
+    for v in _KOKORO_VOICES:
+        groups.setdefault(v["group"], []).append({
+            "id":    v["id"],
+            "label": v["label"],
+            "desc":  v["desc"],
+        })
+    # Try to fetch actual available voices from the loaded Kokoro instance
+    available_ids: set[str] | None = None
+    try:
+        k = _get_kokoro()
+        if k is not None:
+            available_ids = {str(name) for name in k.get_voices()}
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "data": {
+            "groups": [
+                {"name": name, "voices": voices}
+                for name, voices in groups.items()
+            ],
+            "available": list(available_ids) if available_ids is not None else None,
+        },
+    }
 
 
 # ── Streaming AI response ─────────────────────────────────────────────────────

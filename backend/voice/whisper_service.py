@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import re
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,50 @@ logger = logging.getLogger(__name__)
 _MODEL_SIZE  = os.getenv("WHISPER_MODEL", "small")
 _LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "auto")   # "auto" → None (multilingual)
 _CONF_THRESH = float(os.getenv("WHISPER_CONFIDENCE_THRESHOLD", "-1.0"))
+
+# Bias Whisper toward system command vocabulary — no API cost, just text.
+_VOICE_INITIAL_PROMPT = (
+    "Voice assistant command for Windows. "
+    "C drive, D drive, E drive, F drive, folder, settings, volume, brightness, battery, WiFi. "
+    "Open, create, delete, close, screenshot, maximize, minimize, lock, shutdown."
+)
+
+# Post-processing: fix common phonetic mistakes from Whisper before routing.
+_CORRECTIONS: list[tuple[re.Pattern, str | object]] = [
+    # Drive letter mishears
+    (re.compile(r'\bsee\s+drive\b',         re.I), 'C drive'),
+    (re.compile(r'\bsea\s+drive\b',         re.I), 'C drive'),
+    (re.compile(r'\bsi\s+drive\b',          re.I), 'C drive'),
+    (re.compile(r'\bthe\s+c\s+drive\b',     re.I), 'C drive'),
+    (re.compile(r'\bdee\s+drive\b',         re.I), 'D drive'),
+    (re.compile(r'\bee\s+drive\b',          re.I), 'E drive'),
+    (re.compile(r'\beff\s+drive\b',         re.I), 'F drive'),
+    # Inline "C:" or "C/" notation → spoken form
+    (re.compile(r'\b([a-fA-F])\s*[:/]',    re.I),
+     lambda m: f'{m.group(1).upper()} drive '),
+    # Folder/directory typos
+    (re.compile(r'\bfould?er\b',            re.I), 'folder'),
+    (re.compile(r'\bdirec?t(?:o|a)ry\b',   re.I), 'directory'),
+    # Common command normalizations
+    (re.compile(r'\bcreate\s+a\s+new\s+folder\b', re.I), 'create folder'),
+    (re.compile(r'\bopen\s+the\s+settings?\b',     re.I), 'open settings'),
+    (re.compile(r'\bopen\s+file\s+explorer\b',     re.I), 'open file explorer'),
+    # Volume numbers (word → digit)
+    (re.compile(r'\bvolume\s+to\s+(?:one\s+)?hundred\b',  re.I), 'volume to 100'),
+    (re.compile(r'\bvolume\s+to\s+fifty\b',                re.I), 'volume to 50'),
+    (re.compile(r'\bvolume\s+to\s+twenty[\s-]?five\b',     re.I), 'volume to 25'),
+    (re.compile(r'\bvolume\s+to\s+seventy[\s-]?five\b',    re.I), 'volume to 75'),
+    # Brightness numbers
+    (re.compile(r'\bbrightness\s+to\s+(?:one\s+)?hundred\b', re.I), 'brightness to 100'),
+    (re.compile(r'\bbrightness\s+to\s+fifty\b',               re.I), 'brightness to 50'),
+]
+
+
+def _apply_corrections(text: str) -> str:
+    """Apply rule-based corrections to fix Whisper phonetic transcription errors."""
+    for pattern, repl in _CORRECTIONS:
+        text = pattern.sub(repl, text)  # type: ignore[arg-type]
+    return text.strip()
 
 _model = None
 
@@ -124,12 +169,20 @@ def transcribe_audio(
         vad_parameters={"min_silence_duration_ms": 300},
         temperature=0.0,              # greedy — deterministic + fastest
         condition_on_previous_text=False,
+        initial_prompt=_VOICE_INITIAL_PROMPT,  # bias toward command vocabulary
     )
 
     segments  = _filter_segments(segments_raw)
-    full_text = " ".join(s.text.strip() for s in segments).strip()
+    raw_text  = " ".join(s.text.strip() for s in segments).strip()
+    full_text = _apply_corrections(raw_text)
+
     avg_conf  = (sum(s.avg_logprob for s in segments) / len(segments)
                  if segments else -999.0)
+
+    if full_text != raw_text:
+        logger.info("[Whisper] correction applied: %r → %r", raw_text, full_text)
+    logger.info("[Whisper] transcript=%r lang=%s conf=%.2f",
+                full_text[:80], info.language, avg_conf)
 
     return {
         "text":       full_text,

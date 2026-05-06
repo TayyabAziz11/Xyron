@@ -97,6 +97,7 @@ export function useWakeWord(
 
     let alive       = true
     let wsReady     = false
+    let wakeCooldown = false
     let ws: WebSocket | null = null
     let audioCtx: AudioContext | null = null
     let stream: MediaStream | null = null
@@ -119,10 +120,13 @@ export function useWakeWord(
             const msg = JSON.parse(e.data as string)
             if (msg.type === 'ready') {
               clearTimeout(timer)
+              // Suppress wake events for 2s while OWW warms up on ambient noise
+              wakeCooldown = true
+              setTimeout(() => { wakeCooldown = false }, 2_000)
               wsReady = true
               resolve()
-            } else if (msg.type === 'wake' && alive) {
-              alive = false
+            } else if (msg.type === 'wake' && alive && !wakeCooldown) {
+              wakeCooldown = true
               const { model, confidence } = msg
               console.log(`[WakeWord] triggered — model=${model} conf=${confidence?.toFixed(3)}`)
               playWakeBeep()
@@ -131,6 +135,13 @@ export function useWakeWord(
               } else {
                 activateRef.current()
               }
+              // Re-arm after 4s so the WS stays alive for the next wake
+              setTimeout(() => {
+                wakeCooldown = false
+                if (ws?.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: 'reset_cooldown' }))
+                }
+              }, 4_000)
             }
           } catch { /* ignore */ }
         }
@@ -144,6 +155,19 @@ export function useWakeWord(
       if (!ws || ws.readyState !== WebSocket.OPEN || !wsReady) return
       ws.send(frame.buffer)
     }
+
+    function sendWakeMsg(type: string): void {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type }))
+    }
+
+    const onTtsStart     = () => sendWakeMsg('tts_start')
+    const onTtsEnd       = () => sendWakeMsg('tts_end')
+    const onSessionStart = () => sendWakeMsg('session_start')
+    const onSessionEnd   = () => sendWakeMsg('session_end')
+    window.addEventListener('xyron:tts-start',     onTtsStart)
+    window.addEventListener('xyron:tts-end',       onTtsEnd)
+    window.addEventListener('xyron:session-start', onSessionStart)
+    window.addEventListener('xyron:session-end',   onSessionEnd)
 
     async function startAudio(): Promise<void> {
       try {
@@ -234,6 +258,10 @@ export function useWakeWord(
       stream?.getTracks().forEach((t) => t.stop())
       audioCtx?.close().catch(() => {})
       if (workletUrl) URL.revokeObjectURL(workletUrl)
+      window.removeEventListener('xyron:tts-start',     onTtsStart)
+      window.removeEventListener('xyron:tts-end',       onTtsEnd)
+      window.removeEventListener('xyron:session-start', onSessionStart)
+      window.removeEventListener('xyron:session-end',   onSessionEnd)
     }
   }, [enabled])
 

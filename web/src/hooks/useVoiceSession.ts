@@ -44,6 +44,9 @@ export type { SessionState, ConvMessage }
 
 const STOP_RESPONSE = "Okay, stopping now. Talk to you later."
 
+// Session auto-expires after this many ms of silence (no new commands)
+const SESSION_TIMEOUT_MS = 30_000  // 30s idle; cleared on speech start, reset after each response
+
 // ── State machine ─────────────────────────────────────────────────────────────
 //
 // Canonical flow:
@@ -118,13 +121,16 @@ export function useVoiceSession() {
 
   // ── Streaming refs ────────────────────────────────────────────────────────
 
-  const taskCtrlRef = useRef<AbortController | null>(null)
-  const queueRef    = useRef<AudioQueue | null>(null)
+  const taskCtrlRef       = useRef<AbortController | null>(null)
+  const queueRef          = useRef<AudioQueue | null>(null)
+  const sessionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // ── Universal context memory (intent + entities + last action) ───────────
   const lastActionRef = useRef<{ intent: string; action: SystemAction; transcript: string } | null>(null)
   // ── Folder creation context ───────────────────────────────────────────────
-  const lastCreatedFolderRef = useRef<{ name: string; path: string } | null>(null)
+  const lastCreatedFolderRef  = useRef<{ name: string; path: string } | null>(null)
+  // Tracks all paths created in the last create action for "delete them" resolution
+  const lastCreatedFoldersRef = useRef<string[]>([])
   // Maps every created folder name (lowercase) → full Windows path, for resolving
   // "inside tayyab" references across nested creations (e.g. games/tayyab/gta).
   const folderMapRef = useRef<Map<string, string>>(new Map())
@@ -150,7 +156,25 @@ export function useVoiceSession() {
     minSpeechMs:    400,  // need 400ms of speech — avoids noise bursts and breaths
     preSpeechPadMs: 150,  // capture 150ms before detection fires (avoids clipping "Cr-eate")
     onSpeechStart: () => {
-      console.log('[SILERO VAD] speech start')
+      console.log('[SILERO VAD] speech start — state:', stateRef.current)
+      // Reset session idle timer on any speech activity
+      if (sessionTimeoutRef.current) {
+        clearTimeout(sessionTimeoutRef.current)
+        sessionTimeoutRef.current = null
+      }
+      // Interrupt: user spoke while assistant was playing TTS
+      if (stateRef.current === 'speaking') {
+        console.log('[VOICE] interrupt — aborting TTS, transitioning to listening')
+        taskCtrlRef.current?.abort()
+        taskCtrlRef.current = null
+        queueRef.current?.abort()
+        queueRef.current = null
+        isStreamingRef.current = false
+        isRunningRef.current = true   // allow _processAudio guard to pass
+        stateRef.current = 'listening'
+        setSessionState('listening')
+        window.dispatchEvent(new Event('xyron:tts-end'))
+      }
     },
     onSpeechEnd: (audio) => {
       _vadAudioCallbackRef.current(audio)
@@ -240,6 +264,30 @@ export function useVoiceSession() {
     isStreamingRef.current = false
   }, [])
 
+  // ── Session idle timeout ──────────────────────────────────────────────────
+  // Called after each response — if no new command arrives within SESSION_TIMEOUT_MS,
+  // the session ends automatically (Jarvis behavior: goes quiet after a few seconds).
+
+  const resetSessionTimeout = useCallback(() => {
+    if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current)
+    if (!activeRef.current) return
+    sessionTimeoutRef.current = setTimeout(() => {
+      if (!activeRef.current) return
+      console.log('[SESSION_FLOW] session_timeout — ending after', SESSION_TIMEOUT_MS / 1000, 's of inactivity')
+      activeRef.current      = false
+      isRunningRef.current   = false
+      isStreamingRef.current = false
+      sessionTimeoutRef.current = null
+      vad.pause()
+      setSessionActive(false)
+      stateRef.current = 'idle'
+      setSessionState('idle')
+      window.dispatchEvent(new Event('xyron:tts-end'))
+      window.dispatchEvent(new Event('xyron:session-end'))
+    }, SESSION_TIMEOUT_MS)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // ── TTS for fast-paths (greeting, identity, system) ───────────────────────
 
   const speakResponse = useCallback(async (raw: string): Promise<void> => {
@@ -249,33 +297,54 @@ export function useVoiceSession() {
     const { voice, speed, voiceEnabled, volume } = readAssistantSettings()
     if (!voiceEnabled) return
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const ctrl    = new AbortController()
-        const timeout = setTimeout(() => ctrl.abort(), 7_000)
-        let resp: Response
-        try {
-          resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, voice, speed }), signal: ctrl.signal,
-          })
-        } finally { clearTimeout(timeout) }
-        if (resp!.ok) {
-          const url = URL.createObjectURL(await resp!.blob())
-          await new Promise<void>((resolve) => {
-            const audio = new Audio(url)
-            audio.volume = volume
-            const done  = () => { URL.revokeObjectURL(url); resolve() }
-            const t = setTimeout(done, (Math.max(6, text.length / 8) / speed) * 1000 + 10_000)
-            audio.onended = () => { clearTimeout(t); done() }
-            audio.onerror = () => { clearTimeout(t); done() }
-            audio.play().catch(() => { clearTimeout(t); done() })
-          })
-          return
-        }
-      } catch { /* retry */ }
+    window.dispatchEvent(new Event('xyron:tts-start'))
+    // Clear idle timer while TTS is playing — prevents timeout firing mid-speech
+    if (sessionTimeoutRef.current) {
+      clearTimeout(sessionTimeoutRef.current)
+      sessionTimeoutRef.current = null
     }
-    // TTS failed — text is shown on screen; skip browser speech synthesis to avoid robotic fallback voice
+    console.log('[FLOW] tts_playing')
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const ctrl    = new AbortController()
+          const timeout = setTimeout(() => ctrl.abort(), 7_000)
+          let resp: Response
+          try {
+            resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text, voice, speed }), signal: ctrl.signal,
+            })
+          } finally { clearTimeout(timeout) }
+          if (resp!.ok) {
+            const url = URL.createObjectURL(await resp!.blob())
+            await new Promise<void>((resolve) => {
+              const audio  = new Audio(url)
+              audio.volume = volume
+              let resolved = false
+              const safeResolve = () => { if (!resolved) { resolved = true; resolve() } }
+              const cleanup     = () => URL.revokeObjectURL(url)
+              const t = setTimeout(() => { cleanup(); safeResolve() }, (Math.max(6, text.length / 8) / speed) * 1000 + 10_000)
+              audio.onended = () => { clearTimeout(t); cleanup(); safeResolve() }
+              audio.onerror = () => { clearTimeout(t); cleanup(); safeResolve() }
+              // Pre-prime: resolve at 85% playback — mic restarts before TTS fully ends
+              audio.ontimeupdate = () => {
+                if (!resolved && audio.duration > 0 && audio.currentTime / audio.duration >= 0.85) {
+                  audio.ontimeupdate = null
+                  console.log('[FLOW] tts_near_end — pre-priming mic')
+                  safeResolve()   // audio keeps playing; onended cleans up url
+                }
+              }
+              audio.play().catch(() => { clearTimeout(t); cleanup(); safeResolve() })
+            })
+            return
+          }
+        } catch { /* retry */ }
+      }
+      // TTS failed — text is shown on screen; skip browser speech synthesis to avoid robotic fallback voice
+    } finally {
+      window.dispatchEvent(new Event('xyron:tts-end'))
+    }
   }, [])
 
   // ── Main listen function — ref-based so it's always fresh ────────────────
@@ -306,16 +375,15 @@ export function useVoiceSession() {
       null
 
     if (reason) {
-      console.log(`[AUTO LISTEN] blocked (${reason})`)
+      console.log(`[SESSION_FLOW] listen_blocked — ${reason}`)
       return
     }
 
-    console.log('[AUTO LISTEN] triggered — restarting listen cycle in 2000ms')
-    // 2000ms delay: lets TTS audio and room echo fully settle before
-    // Silero VAD re-opens. Without this, Silero immediately fires onSpeechEnd
-    // on the echo/reverb tail of our own TTS output.
-    setTimeout(() => _startListeningRef.current(), 2000)
-  }, [])
+    console.log('[SESSION_FLOW] listening_restarted — VAD starting now, active:', activeRef.current)
+    console.log('[FLOW] mic_restarted')
+    resetSessionTimeout()  // arm 30s idle timer; cleared on speech start
+    void _startListeningRef.current()
+  }, [resetSessionTimeout])
 
   _startListeningRef.current = async function _startListening(): Promise<void> {
     // ── Guard 1: session must be active ──────────────────────────────────────
@@ -339,16 +407,35 @@ export function useVoiceSession() {
       return
     }
 
+    // Guard 5: VAD must be ready — loading=true means ONNX model not yet initialized,
+    // errored=true means MicVAD.new() threw (usually: SharedArrayBuffer blocked by
+    // missing COOP/COEP headers, or mic permission denied).
+    if (vad.loading) {
+      console.warn('[SESSION_FLOW] listen_blocked — VAD still loading ONNX model, retry in 1500ms')
+      setTimeout(() => maybeRestartListening(), 1500)
+      return
+    }
+    if (vad.errored) {
+      console.error('[SESSION_FLOW] VAD errored (SharedArrayBuffer/COOP-COEP issue?):', vad.errored)
+      setError('Voice microphone failed to initialize — please refresh the page.')
+      return
+    }
+
     isRunningRef.current = true
     abortTask()
 
-    // ══════════════════════════════════════════════════════════════════════
-    // PHASE 1 — LISTEN  (Silero VAD drives audio capture)
-    // When onSpeechEnd fires, _vadAudioCallbackRef.current() takes over.
-    // ══════════════════════════════════════════════════════════════════════
-
+    console.log('[SESSION_FLOW] mic_stream_active — VAD starting (listening was:', vad.listening, ')')
+    console.log('[FLOW] vad_started')
     transition('listening')
-    vad.start()
+    try {
+      await vad.start()
+      console.log('[FLOW] mic_active')
+    } catch (err) {
+      console.error('[SESSION_FLOW] vad.start() threw:', err)
+      isRunningRef.current = false
+      transition('idle')
+      setTimeout(() => maybeRestartListening(), 2000)
+    }
   }
 
   // ── Process utterance from Silero VAD ─────────────────────────────────────
@@ -365,6 +452,8 @@ export function useVoiceSession() {
     // PHASE 2 — TRANSCRIBE  (Float32Array 16kHz → WAV → Whisper)
     // ══════════════════════════════════════════════════════════════════════
 
+    console.log('[SESSION_FLOW] transcription_started')
+    console.log('[FLOW] transcription_sent')
     transition('transcribing')
 
     const t0 = performance.now()
@@ -410,21 +499,25 @@ export function useVoiceSession() {
     console.log(`[PERF] transcribe RTT: ${(t1b - t1).toFixed(0)}ms — result: ${transcript ? JSON.stringify(transcript.slice(0, 60)) : '(empty)'}`)
 
     if (!transcript) {
+      console.log('[SESSION_FLOW] transcription_ended — empty, restarting listen')
       transition('idle')
       isRunningRef.current = false
       if (++silentTurnsRef.current < 5) {
         maybeRestartListening()
       } else {
         silentTurnsRef.current = 0
-        activeRef.current = false   // full stop — button resets so next press starts fresh
+        activeRef.current = false
         stopMedia()
         setSessionActive(false)
+        window.dispatchEvent(new Event('xyron:session-end'))
       }
       return
     }
 
     // Real speech received — reset the silence counter
     silentTurnsRef.current = 0
+    console.log('[SESSION_FLOW] transcription_ended —', JSON.stringify(transcript))
+    console.log('[FLOW] response_received —', JSON.stringify(transcript.slice(0, 60)))
 
     // ══════════════════════════════════════════════════════════════════════
     // PHASE 3 — ROUTE
@@ -444,14 +537,25 @@ export function useVoiceSession() {
         const aId = addMsg('assistant', 'Okay, doing it now…')
         transition('processing')
         try {
-          const resp = await fetch(`${API_BASE}/api/v1/system/execute-tool`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tool: pending.tool, params: { ...pending.params, confirmed: true } }),
-          })
-          const d = await resp.json().catch(() => null)
-          const spoken = d?.spoken || d?.message || 'Done.'
+          let d: Record<string, unknown> | null = null
+          if (pending.tool === '__delete_multiple__') {
+            const resp = await fetch(`${API_BASE}/api/v1/system/delete-multiple`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(pending.params),
+            })
+            d = await resp.json().catch(() => null)
+          } else {
+            const resp = await fetch(`${API_BASE}/api/v1/system/execute-tool`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tool: pending.tool, params: { ...pending.params, confirmed: true } }),
+            })
+            d = await resp.json().catch(() => null)
+          }
+          const spoken = (d?.spoken as string) || (d?.message as string) || 'Done.'
           updMsg(aId, { text: spoken })
+          if (d?.success) lastCreatedFoldersRef.current = []
           transition('speaking')
           await speakResponse(spoken)
         } catch {
@@ -531,6 +635,7 @@ export function useVoiceSession() {
         if (result?.success) {
           const cp = result.path || targetPath
           lastCreatedFolderRef.current = { name, path: cp }
+          lastCreatedFoldersRef.current = [cp]
           folderMapRef.current.set(name.toLowerCase(), cp)
           spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder. Say "open it" to open it.`)
         } else {
@@ -569,6 +674,7 @@ export function useVoiceSession() {
         if (result?.success) {
           const cp2 = result.path || pathStr
           lastCreatedFolderRef.current = { name, path: cp2 }
+          lastCreatedFoldersRef.current = [cp2]
           folderMapRef.current.set(name.toLowerCase(), cp2)
           spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${pathStr}. Say "open it" to open it.`)
         } else {
@@ -682,9 +788,7 @@ export function useVoiceSession() {
         console.log(`[VOICE] queue empty → idle (was: ${s})`)
         if (!ctrl.signal.aborted && (s === 'speaking' || s === 'processing')) {
           transition('idle')
-          // 1000ms post-TTS delay: lets room echo settle before mic opens.
-          // Without this, Whisper picks up the tail of Xyron's own voice.
-          setTimeout(() => maybeRestartListening(), 1000)
+          maybeRestartListening()
         }
       },
     })
@@ -951,6 +1055,7 @@ export function useVoiceSession() {
 
         const createdPath = result.path || folderPath
         lastCreatedFolderRef.current = { name: folderName, path: createdPath }
+        lastCreatedFoldersRef.current = [createdPath]
         folderMapRef.current.set(folderName.toLowerCase(), createdPath)
 
         if (subfolders && subfolders.length > 0) {
@@ -1028,6 +1133,75 @@ export function useVoiceSession() {
         addMsg('assistant', spoken)
         transition('speaking')
         await speakResponse(spoken)
+      }
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Standalone subfolder creation ─────────────────────────────────────
+    if (sysAction.createSubfolders) {
+      const { count, names } = sysAction.createSubfolders
+      addMsg('user', transcript)
+      const aId = addMsg('assistant', sysAction.response)
+      transition('speaking')
+      speakResponse(sysAction.response)  // speak while creating
+      const parent = lastCreatedFolderRef.current?.path ?? ''
+      const result = await fetch(`${API_BASE}/api/v1/system/create-subfolders`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parent, names: names.length > 0 ? names : undefined, count }),
+      }).then(r => r.json()).catch(() => null)
+      if (result?.success && parent && names.length > 0) {
+        lastCreatedFoldersRef.current = names.map(n => `${parent}\\${n}`)
+      }
+      const spoken = result?.spoken ?? (result?.success ? 'Done — subfolders created.' : "Couldn't create the subfolders.")
+      updMsg(aId, { text: spoken })
+      transition('processing')
+      transition('speaking')
+      await speakResponse(spoken)
+      transition('idle')
+      isRunningRef.current = false
+      maybeRestartListening()
+      return
+    }
+
+    // ── Delete folder / file (with voice confirmation) ────────────────────
+    if (sysAction.deleteItem !== undefined) {
+      const rawTarget = sysAction.deleteItem.target
+
+      // "delete them/those" → use all paths from last creation
+      const isPronouns = !rawTarget || /^(?:them|those|it|that|all)$/i.test(rawTarget.trim())
+      let resolvedPaths: string[] = []
+      if (isPronouns && lastCreatedFoldersRef.current.length > 0) {
+        resolvedPaths = lastCreatedFoldersRef.current
+      } else if (rawTarget) {
+        resolvedPaths = [rawTarget]
+      } else if (lastCreatedFolderRef.current?.path) {
+        resolvedPaths = [lastCreatedFolderRef.current.path]
+      }
+
+      if (resolvedPaths.length === 0) {
+        addMsg('user', transcript)
+        const msg = "I'm not sure what to delete. Please say the folder or file name."
+        addMsg('assistant', msg)
+        transition('speaking')
+        await speakResponse(msg)
+        transition('idle')
+        isRunningRef.current = false
+        maybeRestartListening()
+        return
+      }
+      addMsg('user', transcript)
+      addMsg('assistant', sysAction.response)
+      transition('speaking')
+      await speakResponse(sysAction.response)
+      // Park the action — use delete-multiple for >1 paths, delete_file for single
+      const isBulk = resolvedPaths.length > 1
+      pendingConfirmRef.current = {
+        tool:   isBulk ? '__delete_multiple__' : 'delete_file',
+        params: isBulk ? { paths: resolvedPaths } : { path: resolvedPaths[0] },
+        prompt: sysAction.response,
       }
       transition('idle')
       isRunningRef.current = false
@@ -1326,6 +1500,7 @@ export function useVoiceSession() {
     isRunningRef.current   = false
     isStreamingRef.current = false
     setSessionActive(true)
+    window.dispatchEvent(new Event('xyron:session-start'))
 
     // Greet every time the orb is clicked
     transition('greeting')
@@ -1341,8 +1516,6 @@ export function useVoiceSession() {
     } catch { /* ok */ }
     if (!activeRef.current) return  // stopped during greeting
     transition('idle')
-    await new Promise<void>((r) => setTimeout(r, 450))
-
     console.log('[VOICE] session started — auto-starting listen')
     maybeRestartListening()       // ← kick off first listen cycle automatically
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1356,12 +1529,17 @@ export function useVoiceSession() {
     isStreamingRef.current = false
     isRunningRef.current   = false
     sessionIdRef.current   = ''
+    if (sessionTimeoutRef.current) {
+      clearTimeout(sessionTimeoutRef.current)
+      sessionTimeoutRef.current = null
+    }
     abortTask()
     vad.pause()
     if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
     stateRef.current = 'idle'
     setSessionState('idle')
     setSessionActive(false)
+    window.dispatchEvent(new Event('xyron:session-end'))
     setMessages([])
     historyRef.current = []
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1377,6 +1555,7 @@ export function useVoiceSession() {
   useEffect(() => {
     return () => {
       activeRef.current = false
+      if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current)
       abortTask()
       vad.pause()
       if (typeof window !== 'undefined') window.speechSynthesis?.cancel()

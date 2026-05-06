@@ -579,6 +579,10 @@ def _exec_create_subfolders(params: Dict[str, Any], ctx: Dict[str, Any]) -> Tool
 
     if not names and count > 0:
         names = [f"Folder {i + 1}" for i in range(min(count, 20))]
+    elif len(names) == 1 and count > 1:
+        # "create 3 named documents" → documents_1, documents_2, documents_3
+        base = names[0]
+        names = [f"{base}_{i + 1}" for i in range(min(count, 20))]
     elif not names:
         return ToolResult(success=False, text="No subfolder names provided.",
                           spoken="What should I name the subfolders?")
@@ -1355,6 +1359,24 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
     if not raw:
         return ToolResult(success=False, text="File path required.", spoken="Which file should I delete?")
 
+    # Fix AI-generated paths like "c\games" (letter + backslash, no colon) → "C:\games"
+    # resolve_path requires "C:\" prefix; without the colon it returns the string unchanged.
+    _dm = re.match(r'^([A-Za-z])\\(.+)$', raw)
+    if _dm:
+        raw = f"{_dm.group(1).upper()}:\\{_dm.group(2)}"
+        logger.info("[delete_file] normalized drive path → %r", raw)
+
+    # For bare names (no drive/slash) resolve via FolderMemory before guessing path
+    if raw and not any(c in raw for c in ('\\', '/', ':')):
+        try:
+            from ..services.history_service import history_service as _hs_del
+            _fm_del = _hs_del.lookup_folder(raw.lower().strip())
+            if _fm_del and _fm_del.get("full_wsl") and os.path.exists(_fm_del["full_wsl"]):
+                raw = wsl_to_win(_fm_del["full_wsl"])
+                logger.info("[delete_file] FolderMemory resolved %r → %r", params.get("path"), raw)
+        except Exception:
+            pass
+
     win_path = resolve_path(raw)
     if not is_safe_path(win_path):
         return ToolResult(success=False, text=f"Blocked: {win_path}",
@@ -1419,6 +1441,18 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
                 fs       = base_fs / child
                 win_path = wsl_to_win(str(fs))
                 break
+
+        if not fs.exists():
+            # Last resort: FolderMemory lookup on base name
+            try:
+                from ..services.history_service import history_service as _hs_fb
+                _fm_fb = _hs_fb.lookup_folder(target_name.lower().strip())
+                if _fm_fb and _fm_fb.get("full_wsl") and os.path.exists(_fm_fb["full_wsl"]):
+                    fs       = Path(_fm_fb["full_wsl"])
+                    win_path = wsl_to_win(str(fs))
+                    logger.info("[delete_file] FolderMemory fallback: %r → %r", target_name, str(fs))
+            except Exception:
+                pass
 
         if not fs.exists():
             return ToolResult(success=False, text=f"Not found: {win_path}",

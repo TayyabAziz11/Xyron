@@ -186,8 +186,10 @@ export interface SystemAction {
   createReminder?: string   // "remind me to X in Y minutes" → natural language
   readGmail?:      boolean  // "read my emails" / "check inbox"
   readCalendar?:   boolean  // "what's on my calendar"
-  createFolder?:   { name?: string; path?: string; subfolders?: string[]; insideFolder?: string }  // multi-turn folder creation
-  openLastFolder?: boolean                           // "open it" → last created folder
+  createFolder?:      { name?: string; path?: string; subfolders?: string[]; insideFolder?: string }  // multi-turn folder creation
+  createSubfolders?:  { count: number; names: string[] }  // standalone "create 3 subfolders named X Y Z"
+  deleteItem?:        { target: string | null }           // "delete this folder" / "delete [name]"
+  openLastFolder?: boolean                                 // "open it" → last created folder
   desktopHotkey?:  string   // "press ctrl+c", "paste", "undo" → keyboard shortcut
   desktopScroll?:  { direction: 'up' | 'down'; amount: number }  // "scroll down 3 times"
   runWorkflow?:    string   // workflow trigger text → automation_workflow_service
@@ -566,6 +568,43 @@ export function detectSystemAction(text: string): SystemAction | null {
     }
   }
 
+  // ── Standalone subfolder creation ("create 3 subfolders named X Y Z in it") ─
+  // Must run BEFORE the generic folder check so "create subfolders" isn't swallowed.
+  const _subOnlyM = t.match(
+    /\b(?:create|make|add|now\s+create)\s+(?:(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?sub[\s-]?folders?\b/i
+  )
+  if (_subOnlyM && !/\b(?:create|make|add|new)\s+(?:a\s+)?(?:new\s+)?folder\b/i.test(t)) {
+    const _NUM: Record<string, number> = {
+      one: 1, two: 2, three: 3, four: 4, five: 5,
+      six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    }
+    const cStr = _subOnlyM[1] ?? ''
+    const count = parseInt(cStr) || _NUM[cStr.toLowerCase()] || 1
+    const _namesM = t.match(/(?:named?|called?|with\s+(?:the\s+)?names?\s+(?:of\s+)?)\s+([^.!?]+)/i)
+    const names = _namesM
+      ? _namesM[1].split(/\s*,\s*|\s+and\s+|\s+/).map(s => s.trim()).filter(s => s.length > 1)
+      : []
+    return {
+      response: `On it — creating ${count > 1 ? count + ' subfolders' : 'the subfolder'}.`,
+      intent: 'create_subfolders',
+      createSubfolders: { count, names },
+    }
+  }
+
+  // ── Delete folder / file ──────────────────────────────────────────────────
+  const _delM =
+    t.match(/\b(?:delete|remove|erase|wipe)\s+(?:this|that|the)\s+(?:folder|file|directory)\b/i)
+    ?? t.match(/\b(?:delete|remove|erase|wipe)\s+(?:it|folder|file)\s*$/i)
+    ?? t.match(/\b(?:delete|remove|erase|wipe)\s+(?:folder\s+|file\s+)?(?:called\s+|named\s+)?([a-z0-9 _\-]{2,60})(?:\s+folder|\s+file)?\s*$/i)
+  if (_delM) {
+    const target = (typeof _delM[1] === 'string' ? _delM[1].trim() : null)
+    return {
+      response: `Are you sure you want to delete${target ? ` "${target}"` : ' that'}? Say "yes" to confirm.`,
+      intent: 'delete',
+      deleteItem: { target },
+    }
+  }
+
   // ── Workflow triggers (delegated to backend automation service) ───────────
   if (
     /\bplay\s+.+\s+on\s+youtube\b/i.test(t) ||
@@ -877,36 +916,13 @@ export function fetchTtsUrlStream(
   if (!_USE_MSE) return fetchTtsUrl(text, voice, speed, signal, apiBase)
 
   return new Promise<string>((resolve, reject) => {
-    const ms  = new MediaSource()
-    const url = URL.createObjectURL(ms)
-    let resolved = false
-
-    const _fail = (err: unknown) => {
-      if (!resolved) { URL.revokeObjectURL(url); reject(err) }
+    // On any failure fall back to the full-blob Kokoro path
+    const _fallback = (err?: unknown) => {
+      fetchTtsUrl(text, voice, speed, signal, apiBase).then(resolve, reject)
+      if (err) console.warn('[TTS-stream] fallback to synthesize:', err)
     }
 
-    ms.addEventListener('sourceopen', async () => {
-      let sb: SourceBuffer
-      try {
-        sb = ms.addSourceBuffer('audio/mpeg')
-      } catch (e) {
-        _fail(e); return
-      }
-
-      const _append = (chunk: Uint8Array) =>
-        new Promise<void>((res, rej) => {
-          if (signal.aborted) { rej(new Error('aborted')); return }
-          const go = () => {
-            try { sb.appendBuffer(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer) } catch (e) { rej(e); return }
-            sb.addEventListener('updateend', () => res(), { once: true })
-          }
-          if (sb.updating) {
-            sb.addEventListener('updateend', go, { once: true })
-          } else {
-            go()
-          }
-        })
-
+    ;(async () => {
       try {
         const r = await fetch(`${apiBase}/api/v1/voice/synthesize-stream`, {
           method:  'POST',
@@ -914,27 +930,68 @@ export function fetchTtsUrlStream(
           body:    JSON.stringify({ text, voice, speed }),
           signal,
         })
-        if (!r.ok || !r.body) throw new Error(`TTS stream ${r.status}`)
+        if (!r.ok || !r.body) { _fallback(new Error(`TTS ${r.status}`)); return }
 
-        const reader = r.body.getReader()
-        while (true) {
-          const { done, value } = await reader.read()
-          if (signal.aborted || done) {
-            if (ms.readyState === 'open') ms.endOfStream()
-            break
-          }
-          await _append(value)
-          // Resolve as soon as the first chunk is buffered — <audio> can play now
-          if (!resolved) { resolved = true; resolve(url) }
+        const ct = r.headers.get('content-type') || ''
+
+        // Kokoro WAV — read full blob, create URL directly (no MediaSource needed)
+        if (ct.includes('audio/wav')) {
+          const blob = await r.blob()
+          if (blob.size > 0) resolve(URL.createObjectURL(blob))
+          else _fallback(new Error('empty wav'))
+          return
         }
-      } catch (e) {
-        if (ms.readyState === 'open') { try { ms.endOfStream() } catch {} }
-        _fail(e)
-      }
-    }, { once: true })
 
-    // Safety: if sourceopen never fires (e.g. detached document), fall back
-    setTimeout(() => { if (!resolved) _fail(new Error('MSE sourceopen timeout')) }, 8_000)
+        // edge-tts MP3 — stream via MediaSource for low-latency playback
+        const ms  = new MediaSource()
+        const url = URL.createObjectURL(ms)
+        let started = false
+
+        ms.addEventListener('sourceopen', async () => {
+          let sb: SourceBuffer
+          try {
+            sb = ms.addSourceBuffer('audio/mpeg')
+          } catch (e) {
+            URL.revokeObjectURL(url); _fallback(e); return
+          }
+
+          const _append = (chunk: Uint8Array) =>
+            new Promise<void>((res, rej) => {
+              if (signal.aborted) { rej(new Error('aborted')); return }
+              const go = () => {
+                try { sb.appendBuffer(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer) } catch (e) { rej(e); return }
+                sb.addEventListener('updateend', () => res(), { once: true })
+              }
+              if (sb.updating) {
+                sb.addEventListener('updateend', go, { once: true })
+              } else {
+                go()
+              }
+            })
+
+          try {
+            const reader = r.body!.getReader()
+            while (true) {
+              const { done, value } = await reader.read()
+              if (signal.aborted || done) {
+                if (ms.readyState === 'open') ms.endOfStream()
+                break
+              }
+              await _append(value)
+              if (!started) { started = true; resolve(url) }
+            }
+          } catch (e) {
+            if (ms.readyState === 'open') { try { ms.endOfStream() } catch {} }
+            if (!started) { URL.revokeObjectURL(url); _fallback(e) }
+          }
+        }, { once: true })
+
+        setTimeout(() => { if (!started) { URL.revokeObjectURL(url); _fallback(new Error('MSE timeout')) } }, 8_000)
+
+      } catch (e) {
+        _fallback(e)
+      }
+    })()
   })
 }
 

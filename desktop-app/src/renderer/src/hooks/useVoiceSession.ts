@@ -740,35 +740,9 @@ function _fetchTtsUrlStream(
   if (!_USE_MSE) return _fetchTtsUrl(text, voice, speed, signal)
 
   return new Promise<string | null>((resolve) => {
-    const ms  = new MediaSource()
-    const url = URL.createObjectURL(ms)
-    let resolved = false
+    const _fail = () => _fetchTtsUrl(text, voice, speed, signal).then(resolve)
 
-    const _fail = () => {
-      if (!resolved) {
-        resolved = true
-        URL.revokeObjectURL(url)
-        // Fall back to standard blob approach
-        _fetchTtsUrl(text, voice, speed, signal).then(resolve)
-      }
-    }
-
-    ms.addEventListener('sourceopen', async () => {
-      let sb: SourceBuffer
-      try { sb = ms.addSourceBuffer('audio/mpeg') } catch { _fail(); return }
-
-      const _append = (chunk: Uint8Array) =>
-        new Promise<void>((res, rej) => {
-          if (signal.aborted) { rej(new Error('aborted')); return }
-          const go = () => {
-            try { sb.appendBuffer(chunk) } catch (e) { rej(e); return }
-            sb.addEventListener('updateend', res, { once: true })
-          }
-          sb.updating
-            ? sb.addEventListener('updateend', go, { once: true })
-            : go()
-        })
-
+    ;(async () => {
       try {
         const r = await fetch(`${API_BASE}/api/v1/voice/synthesize-stream`, {
           method: 'POST',
@@ -778,23 +752,57 @@ function _fetchTtsUrlStream(
         })
         if (!r.ok || !r.body) { _fail(); return }
 
-        const reader = r.body.getReader()
-        while (true) {
-          const { done, value } = await reader.read()
-          if (signal.aborted || done) {
-            if (ms.readyState === 'open') ms.endOfStream()
-            break
-          }
-          await _append(value)
-          if (!resolved) { resolved = true; resolve(url) }
+        const ct = r.headers.get('content-type') || ''
+
+        // Kokoro WAV — read full blob, create URL directly (no streaming needed)
+        if (ct.includes('audio/wav')) {
+          const blob = await r.blob()
+          resolve(blob.size > 0 ? URL.createObjectURL(blob) : null)
+          return
         }
+
+        // edge-tts MP3 — stream via MediaSource for low-latency playback
+        const ms  = new MediaSource()
+        const url = URL.createObjectURL(ms)
+        let started = false
+
+        ms.addEventListener('sourceopen', async () => {
+          let sb: SourceBuffer
+          try { sb = ms.addSourceBuffer('audio/mpeg') } catch { _fail(); return }
+
+          const _append = (chunk: Uint8Array) =>
+            new Promise<void>((res, rej) => {
+              if (signal.aborted) { rej(new Error('aborted')); return }
+              const go = () => {
+                try { sb.appendBuffer(chunk) } catch (e) { rej(e); return }
+                sb.addEventListener('updateend', res, { once: true })
+              }
+              sb.updating ? sb.addEventListener('updateend', go, { once: true }) : go()
+            })
+
+          try {
+            const reader = r.body!.getReader()
+            while (true) {
+              const { done, value } = await reader.read()
+              if (signal.aborted || done) {
+                if (ms.readyState === 'open') ms.endOfStream()
+                break
+              }
+              await _append(value)
+              if (!started) { started = true; resolve(url) }
+            }
+          } catch {
+            if (ms.readyState === 'open') try { ms.endOfStream() } catch {}
+            if (!started) _fail()
+          }
+        }, { once: true })
+
+        setTimeout(() => { if (!started) _fail() }, 8_000)
+
       } catch {
-        if (ms.readyState === 'open') { try { ms.endOfStream() } catch {} }
         _fail()
       }
-    }, { once: true })
-
-    setTimeout(() => { if (!resolved) _fail() }, 8_000)
+    })()
   })
 }
 
@@ -936,6 +944,7 @@ async function _streamAndSpeak(
 
 const API_BASE = 'http://localhost:8000'
 const STOP_RESPONSE = "Okay, stopping now. Talk to you later."
+const SESSION_TIMEOUT_MS = 30_000  // 30s idle before auto-close (AI can take 5-10s to respond)
 const RETRY_MSG = "Didn't catch that. Listening again."
 
 export function useVoiceSession() {
@@ -954,13 +963,15 @@ export function useVoiceSession() {
   const rafRef         = useRef<number | null>(null)
 
   // Streaming refs
-  const taskCtrlRef  = useRef<AbortController | null>(null)
-  const queueRef     = useRef<AudioQueue | null>(null)
-  const isRunningRef = useRef(false)   // single-instance guard — true while listen cycle is active
+  const taskCtrlRef       = useRef<AbortController | null>(null)
+  const queueRef          = useRef<AudioQueue | null>(null)
+  const isRunningRef      = useRef(false)   // single-instance guard — true while listen cycle is active
+  const sessionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const historyRef = useRef<Array<{ role: string; text: string }>>([])
   const pendingFolderRef   = useRef<{ stage: 'name'; knownPath?: string } | { stage: 'path'; name: string } | null>(null)
-  const lastCreatedFolderRef = useRef<{ name: string; path: string } | null>(null)
+  const lastCreatedFolderRef  = useRef<{ name: string; path: string } | null>(null)
+  const lastCreatedFoldersRef = useRef<string[]>([])
   const lastActionRef = useRef<{ intent: string; action: SystemAction; transcript: string } | null>(null)
 
   const addMsg = useCallback((role: ConvMessage['role'], text: string, status: ConvMessage['status'] = 'done'): string => {
@@ -1003,6 +1014,7 @@ export function useVoiceSession() {
     if (!text) return
     const { voice, speed, voiceEnabled, volume } = readAssistantSettings()
     if (!voiceEnabled) return
+    window.dispatchEvent(new Event('xyron:tts-start'))
     try {
       const ctrl    = new AbortController()
       const timeout = setTimeout(() => ctrl.abort(), 30000)
@@ -1028,10 +1040,28 @@ export function useVoiceSession() {
           audio.onerror = () => { clearTimeout(safety); done() }
           audio.play().catch(() => { clearTimeout(safety); done() })
         })
+        window.dispatchEvent(new Event('xyron:tts-end'))
         return
       }
     } catch { /* fall through */ }
+    window.dispatchEvent(new Event('xyron:tts-end'))
     await speakBrowser(cleanForSpeech(raw))
+  }, [])
+
+  // ── Session idle timeout — ends session after SESSION_TIMEOUT_MS of silence ─
+  const resetSessionTimeout = useCallback(() => {
+    if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current)
+    if (!activeRef.current) return
+    sessionTimeoutRef.current = setTimeout(() => {
+      if (!activeRef.current) return
+      console.log('[SESSION_FLOW] session_timeout — ending after', SESSION_TIMEOUT_MS / 1000, 's of inactivity')
+      activeRef.current    = false
+      isRunningRef.current = false
+      sessionTimeoutRef.current = null
+      setSessionState('idle')
+      window.dispatchEvent(new Event('xyron:session-end'))
+    }, SESSION_TIMEOUT_MS)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // ── Auto-restart — THE ONLY path that starts a new listen cycle ───────────
@@ -1040,16 +1070,17 @@ export function useVoiceSession() {
 
   const maybeRestartListening = useCallback(() => {
     if (!activeRef.current) {
-      console.log('[AUTO LISTEN] blocked (session inactive)')
+      console.log('[SESSION_FLOW] session_timeout — session ended (session inactive)')
       return
     }
     if (isRunningRef.current) {
       console.log('[AUTO LISTEN] blocked (already running)')
       return
     }
-    console.log('[AUTO LISTEN] triggered — restarting listen cycle')
+    console.log('[SESSION_FLOW] session_started — restarting listen cycle, active:', activeRef.current)
+    resetSessionTimeout()  // arm 8s idle timer on each listen restart
     loopRef.current()
-  }, [])
+  }, [resetSessionTimeout])
 
   // ── Conversation loop ──────────────────────────────────────────────────────
   loopRef.current = async function loop(): Promise<void> {
@@ -1061,8 +1092,14 @@ export function useVoiceSession() {
     taskCtrlRef.current?.abort()
     queueRef.current?.abort()
 
+    // Safety: if this function exits for ANY reason without explicitly clearing
+    // isRunningRef, the finally block guarantees the next cycle can start.
+    let _explicitReturn = false
+
+    try {
+
     // LISTEN
-    console.log('[MIC START ATTEMPT] state:', sessionState, 'isRunning:', isRunningRef.current, 'active:', activeRef.current)
+    console.log('[SESSION_FLOW] mic_stream_active — loop started, active:', activeRef.current)
     setSessionState('listening')
     chunksRef.current = []
 
@@ -1130,7 +1167,7 @@ export function useVoiceSession() {
                     }
                     break
                   case 'waiting':
-                    if (smoothRms > threshold) { if (++speechCnt >= VAD.speechMinFrames) { phase = 'speaking'; speechCnt = 0; clearTimeout(noSpeechTimRef.current!); noSpeechTimRef.current = null } }
+                    if (smoothRms > threshold) { if (++speechCnt >= VAD.speechMinFrames) { phase = 'speaking'; speechCnt = 0; clearTimeout(noSpeechTimRef.current!); noSpeechTimRef.current = null; if (sessionTimeoutRef.current) { clearTimeout(sessionTimeoutRef.current); sessionTimeoutRef.current = null; console.log('[SESSION_FLOW] speech detected — session timeout suspended') } } }
                     else { speechCnt = 0 }
                     break
                   case 'speaking': {
@@ -1162,6 +1199,7 @@ export function useVoiceSession() {
       activeRef.current = false
       isRunningRef.current = false
       setSessionState('stopped')
+      window.dispatchEvent(new Event('xyron:session-end'))
       setTimeout(() => setSessionState('idle'), 2500)
       return
     }
@@ -1173,8 +1211,10 @@ export function useVoiceSession() {
     if (!activeRef.current) return
 
     // TRANSCRIBE
+    console.log('[SESSION_FLOW] transcription_started')
     setSessionState('transcribing')
     if (!chunksRef.current.length) {
+      console.log('[SESSION_FLOW] transcription_ended — empty audio, restarting listen')
       isRunningRef.current = false
       maybeRestartListening()
       return
@@ -1195,11 +1235,13 @@ export function useVoiceSession() {
     } catch { /* retry */ }
 
     if (!transcript) {
+      console.log('[SESSION_FLOW] transcription_ended — no speech detected, restarting listen')
       addMsg('system', RETRY_MSG)
       isRunningRef.current = false
       maybeRestartListening()
       return
     }
+    console.log('[SESSION_FLOW] transcription_ended — text:', JSON.stringify(transcript))
 
     // STOP CHECK
     if (isStopPhrase(transcript)) {
@@ -1209,6 +1251,7 @@ export function useVoiceSession() {
       await speakResponse(STOP_RESPONSE)
       activeRef.current = false
       setSessionState('stopped')
+      window.dispatchEvent(new Event('xyron:session-end'))
       setTimeout(() => setSessionState('idle'), 1500)
       return
     }
@@ -1295,6 +1338,7 @@ export function useVoiceSession() {
           if (result2?.success) {
             const loc2: string = result2.path || pf.knownPath
             lastCreatedFolderRef.current = { name, path: loc2 }
+            lastCreatedFoldersRef.current = [loc2]
             spoken2 = `Done! I created a folder named "${name}" in ${loc2}. You can say "open this folder" to open it.`
           } else {
             spoken2 = result2?.spoken || `Couldn't create the folder. Please try again.`
@@ -1325,6 +1369,7 @@ export function useVoiceSession() {
         if (resultD?.success) {
           const locD: string = resultD.path || 'Desktop'
           lastCreatedFolderRef.current = { name, path: locD }
+          lastCreatedFoldersRef.current = [locD]
           spokenD = resultD.spoken || `Done! I created the "${name}" folder on your Desktop. Say "open it" to open it.`
         } else {
           spokenD = resultD?.spoken || `Couldn't create the folder. Please try again.`
@@ -1358,6 +1403,7 @@ export function useVoiceSession() {
         if (result?.success) {
           const loc: string = result.path || pathStr
           lastCreatedFolderRef.current = { name, path: loc }
+          lastCreatedFoldersRef.current = [loc]
           spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${loc}. Say "open it" to open it.`)
         } else {
           spoken = _failsafe('create_folder', result, `Couldn't create the folder. Please try again.`)
@@ -1392,7 +1438,10 @@ export function useVoiceSession() {
       const sp3 = res3?.success
         ? `Done! "${inheritedName}" created in ${newPath}.`
         : res3?.spoken || `Couldn't create it. Please try again.`
-      if (res3?.success) lastCreatedFolderRef.current = { name: inheritedName, path: res3.path || newPath }
+      if (res3?.success) {
+        lastCreatedFolderRef.current = { name: inheritedName, path: res3.path || newPath }
+        lastCreatedFoldersRef.current = [res3.path || newPath]
+      }
       updMsg(aId3, { text: sp3 })
       setSessionState('speaking')
       await speakResponse(sp3)
@@ -1532,6 +1581,7 @@ export function useVoiceSession() {
           if (result?.success) {
             const loc: string = result.path || path
             lastCreatedFolderRef.current = { name, path: loc }
+            lastCreatedFoldersRef.current = [loc]
             spoken = _failsafe('create_folder', result, `Done! I created the "${name}" folder in ${loc}. Say "open it" to open it.`)
           } else {
             spoken = _failsafe('create_folder', result, `Couldn't create the folder. Please try again.`)
@@ -1721,10 +1771,12 @@ export function useVoiceSession() {
 
   const startSession = useCallback(async () => {
     if (sessionState !== 'idle') return
+    console.log('[SESSION_FLOW] session_started — greeting phase')
     setError(null)
     setMessages([])
     historyRef.current = []
     activeRef.current = true
+    window.dispatchEvent(new Event('xyron:session-start'))
     setSessionState('greeting')
 
     const { mode } = readAssistantSettings()
@@ -1742,11 +1794,16 @@ export function useVoiceSession() {
   }, [sessionState, addMsg, speakResponse, maybeRestartListening])
 
   const stopSession = useCallback(() => {
-    activeRef.current  = false
+    activeRef.current    = false
     isRunningRef.current = false
+    if (sessionTimeoutRef.current) {
+      clearTimeout(sessionTimeoutRef.current)
+      sessionTimeoutRef.current = null
+    }
     taskCtrlRef.current?.abort()
     queueRef.current?.abort()
     stopMedia()
+    window.dispatchEvent(new Event('xyron:session-end'))
     setSessionState('idle')
     setMessages([])
     historyRef.current = []

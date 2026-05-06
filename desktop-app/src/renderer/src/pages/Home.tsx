@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Sparkles, Radio, Zap, Lightbulb, ChevronRight } from 'lucide-react'
 import { useVoiceSession } from '../hooks/useVoiceSession'
@@ -98,7 +98,23 @@ export default function Home() {
   const isActive  = sessionState !== 'idle' && sessionState !== 'stopped'
   const hasMessages = messages.length > 0
 
-  const { supported: wakeSupported, listening: wakeListening } = useWakeWord(startSession, !isActive, startWorkSession)
+  const handleWakeActivate = useCallback(() => {
+    console.log('[SESSION_FLOW] wake_detected — sessionState:', sessionState, 'isActive:', isActive)
+    if (!isActive) {
+      startSession()
+    } else if (sessionState === 'listening') {
+      // Already listening — wake word fired redundantly, ignore
+      console.log('[SESSION_FLOW] wake ignored — already listening')
+    } else {
+      // Session alive but busy (speaking/processing/greeting) — ignore
+      console.log('[SESSION_FLOW] wake ignored — session busy, state:', sessionState)
+    }
+  }, [startSession, sessionState, isActive])
+  const handleWorkActivate = useCallback(() => {
+    startWorkSession()
+  }, [startWorkSession])
+  // Disable wake WS during active session — prevents re-triggering while assistant speaks
+  const { supported: wakeSupported, listening: wakeListening } = useWakeWord(handleWakeActivate, !isActive, handleWorkActivate)
 
   // Auto-scroll to latest message
   useEffect(() => {

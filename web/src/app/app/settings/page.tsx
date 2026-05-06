@@ -1,7 +1,7 @@
 'use client'
 
-import { useState } from 'react'
-import { Mic, Volume2, VolumeX, CheckCircle, XCircle, Play } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Mic, Volume2, VolumeX, CheckCircle, XCircle, Play, ChevronDown, ChevronRight } from 'lucide-react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/Card'
 import { StatusDot } from '@/components/ui/StatusDot'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
@@ -10,11 +10,13 @@ import { useApi } from '@/hooks/useApi'
 import { api } from '@/lib/api'
 import {
   useAssistantSettings,
-  VOICE_OPTIONS,
   MODE_OPTIONS,
   type OpenAIVoice,
   type BehaviorMode,
 } from '@/hooks/useAssistantSettings'
+
+interface KokoroVoice { id: string; label: string; desc: string }
+interface KokoroGroup { name: string; voices: KokoroVoice[] }
 
 const ENV_VARS = ['OPENAI_API_KEY', 'REPO_ROOT', 'API_PORT', 'CORS_ORIGINS']
 
@@ -52,24 +54,34 @@ export default function SettingsPage() {
   const { data: status, loading: statusLoading }   = useApi(() => api.health.status())
   const { settings, saveSettings }                 = useAssistantSettings()
 
-  const [previewing, setPreviewing] = useState<OpenAIVoice | null>(null)
+  const [previewing, setPreviewing] = useState<string | null>(null)
   const [previewErr, setPreviewErr] = useState<string | null>(null)
+  const [voiceGroups, setVoiceGroups] = useState<KokoroGroup[]>([])
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(['American Female']))
 
   const API_BASE =
     typeof window !== 'undefined'
       ? (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000')
       : 'http://localhost:8000'
 
-  async function previewVoice(voice: OpenAIVoice) {
+  useEffect(() => {
+    fetch(`${API_BASE}/api/v1/voice/voices`)
+      .then(r => r.json())
+      .then(d => { if (d?.data?.groups) setVoiceGroups(d.data.groups) })
+      .catch(() => {})
+  }, [API_BASE])
+
+  async function previewVoice(voice: string) {
     if (previewing) return
     setPreviewing(voice)
     setPreviewErr(null)
     try {
+      const label = voice.includes('_') ? voice.split('_')[1] : voice
       const resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
-          text:  `Hi, I'm ${voice.charAt(0).toUpperCase() + voice.slice(1)}, your Xyron voice.`,
+          text:  `Hi, I'm ${label.charAt(0).toUpperCase() + label.slice(1)}, your Xyron assistant voice.`,
           voice,
           speed: settings.speed,
         }),
@@ -84,10 +96,18 @@ export default function SettingsPage() {
         audio.play().catch(() => resolve())
       })
     } catch {
-      setPreviewErr('Preview failed — make sure the backend is running and OPENAI_API_KEY is set.')
+      setPreviewErr('Preview failed — make sure the backend is running.')
     } finally {
       setPreviewing(null)
     }
+  }
+
+  function toggleGroup(name: string) {
+    setExpandedGroups(prev => {
+      const next = new Set(prev)
+      next.has(name) ? next.delete(name) : next.add(name)
+      return next
+    })
   }
 
   return (
@@ -175,49 +195,72 @@ export default function SettingsPage() {
             </div>
 
             <p className="text-xs text-text-muted">
-              Powered by OpenAI TTS (tts-1). Select a voice for the Xyron.
+              Powered by Kokoro ONNX (local, offline). Select a voice — click ▶ to preview.
             </p>
-            <div className="grid grid-cols-1 gap-2">
-              {VOICE_OPTIONS.map((v) => {
-                const active = settings.voice === v.id
-                return (
-                  <div
-                    key={v.id}
-                    className={`flex items-center justify-between rounded-lg border px-3 py-2.5 cursor-pointer transition-all ${
-                      active
-                        ? 'border-brand/60 bg-brand/8'
-                        : 'border-surface-border bg-surface-overlay hover:border-brand/30'
-                    }`}
-                    onClick={() => saveSettings({ voice: v.id })}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`h-3 w-3 rounded-full border-2 flex-shrink-0 ${
-                          active ? 'border-brand bg-brand' : 'border-surface-border'
-                        }`}
-                      />
-                      <div>
-                        <p className={`text-sm font-medium ${active ? 'text-brand-light' : 'text-text-secondary'}`}>
-                          {v.label}
-                        </p>
-                        <p className="text-xs text-text-muted">{v.desc}</p>
-                      </div>
+            {voiceGroups.length === 0 ? (
+              <div className="flex justify-center py-4"><LoadingSpinner /></div>
+            ) : (
+              <div className="space-y-2">
+                {voiceGroups.map((group) => {
+                  const expanded = expandedGroups.has(group.name)
+                  return (
+                    <div key={group.name} className="rounded-lg border border-surface-border overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() => toggleGroup(group.name)}
+                        className="w-full flex items-center justify-between px-3 py-2 bg-surface-overlay hover:bg-surface-raised transition-colors"
+                      >
+                        <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">{group.name}</span>
+                        {expanded
+                          ? <ChevronDown className="h-3.5 w-3.5 text-text-muted" />
+                          : <ChevronRight className="h-3.5 w-3.5 text-text-muted" />}
+                      </button>
+                      {expanded && (
+                        <div className="divide-y divide-surface-border">
+                          {group.voices.map((v) => {
+                            const active = settings.voice === v.id
+                            return (
+                              <div
+                                key={v.id}
+                                className={`flex items-center justify-between px-3 py-2 cursor-pointer transition-colors ${
+                                  active
+                                    ? 'bg-brand/8'
+                                    : 'bg-surface-raised hover:bg-surface-overlay'
+                                }`}
+                                onClick={() => saveSettings({ voice: v.id as OpenAIVoice })}
+                              >
+                                <div className="flex items-center gap-2.5">
+                                  <div className={`h-2.5 w-2.5 rounded-full border-2 flex-shrink-0 ${
+                                    active ? 'border-brand bg-brand' : 'border-surface-border'
+                                  }`} />
+                                  <div>
+                                    <p className={`text-sm font-medium leading-tight ${active ? 'text-brand-light' : 'text-text-secondary'}`}>
+                                      {v.label}
+                                    </p>
+                                    <p className="text-xs text-text-muted">{v.desc}</p>
+                                  </div>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); previewVoice(v.id) }}
+                                  disabled={previewing !== null}
+                                  className="flex items-center gap-1 px-2 py-0.5 rounded bg-surface-border text-xs text-text-muted
+                                    hover:text-text-secondary hover:bg-surface-overlay transition-colors disabled:opacity-40"
+                                >
+                                  {previewing === v.id
+                                    ? <span className="animate-pulse">…</span>
+                                    : <><Play className="h-3 w-3" /> Play</>}
+                                </button>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
                     </div>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); previewVoice(v.id) }}
-                      disabled={previewing !== null}
-                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-raised border border-surface-border text-xs text-text-muted
-                        hover:text-text-secondary hover:border-brand/30 transition-colors disabled:opacity-40"
-                    >
-                      {previewing === v.id
-                        ? <span className="animate-pulse">Playing…</span>
-                        : <><Play className="h-3 w-3" /> Preview</>}
-                    </button>
-                  </div>
-                )
-              })}
-            </div>
+                  )
+                })}
+              </div>
+            )}
             {previewErr && (
               <p className="text-xs text-status-error">{previewErr}</p>
             )}

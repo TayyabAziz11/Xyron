@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type OpenAIVoice = 'nova' | 'alloy' | 'echo' | 'fable' | 'onyx' | 'shimmer'
+export type OpenAIVoice = string   // OpenAI alias or native Kokoro ID (af_*, am_*, bf_*, bm_*)
 export type BehaviorMode = 'friendly' | 'professional' | 'assistant' | 'boss' | 'chill' | 'work' | 'focus' | 'morning' | 'jarvis' | 'entertainment' | 'system' | 'chat'
 
 export interface AssistantSettings {

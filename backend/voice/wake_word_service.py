@@ -49,8 +49,8 @@ except Exception:
 
 _CUSTOM_MODELS_DIR   = Path(os.getenv("WAKE_MODELS_DIR", os.path.expanduser("~/.xyron/wake_models")))
 _FALLBACK_MODEL      = os.getenv("WAKE_WORD_MODEL", "hey_jarvis").strip()
-_DEFAULT_THRESHOLD   = float(os.getenv("WAKE_WORD_THRESHOLD", "0.5"))
-_COOLDOWN_S          = float(os.getenv("WAKE_COOLDOWN_S", "3.0"))
+_DEFAULT_THRESHOLD   = float(os.getenv("WAKE_WORD_THRESHOLD", "0.50"))
+_COOLDOWN_S          = float(os.getenv("WAKE_COOLDOWN_S", "2.0"))
 
 # Per-model threshold overrides from env
 try:
@@ -61,20 +61,22 @@ except json.JSONDecodeError:
     _MODEL_THRESHOLDS = {}
 
 # Hard-coded overrides for the Xyron keyword set.
-# Rationale for high thresholds:
-#   - Shorter keywords ("xyron") share phonemes with common words → need stricter gate.
-#   - Multi-syllable ("hey_xyron") are more discriminative → slightly lower is fine.
-#   - 0.65+ eliminates 95%+ of false positives while keeping near-100% true recall.
-_MODEL_THRESHOLDS.setdefault("hey_xyron",    0.65)
-_MODEL_THRESHOLDS.setdefault("wakeup_xyron", 0.70)
-_MODEL_THRESHOLDS.setdefault("xyron",        0.80)  # single word — highest FP risk
-_MODEL_THRESHOLDS.setdefault("hey_xeron",    0.60)
-_MODEL_THRESHOLDS.setdefault("hi_xyron",     0.60)
-_MODEL_THRESHOLDS.setdefault("hey_jarvis",   0.55)  # built-in for testing
+# Rationale: 0.90+ required to block false positives from phonetically similar words.
+# Single-word keywords ("xyron") share phonemes with common words → highest threshold.
+_MODEL_THRESHOLDS.setdefault("hey_xyron",    0.50)  # two-word phrase — moderate threshold
+_MODEL_THRESHOLDS.setdefault("wakeup_xyron", 0.50)
+_MODEL_THRESHOLDS.setdefault("xyron",        0.62)  # single word — slightly higher FP risk
+_MODEL_THRESHOLDS.setdefault("hey_xeron",    0.50)  # phonetic variant
+_MODEL_THRESHOLDS.setdefault("hi_xyron",     0.50)
+_MODEL_THRESHOLDS.setdefault("hey_jarvis",   0.75)  # built-in pretrained — keep high
 
 # Path for hard-negative mining log (frames that nearly fire but don't)
 _FP_LOG_PATH = Path(os.path.expanduser("~/.xyron/false_positive_log.jsonl"))
-_FP_CONF_MIN = 0.35  # log frames above this but below threshold
+_FP_CONF_MIN = 0.20  # log near-misses above this (lowered for diagnostics)
+
+_SPEECH_RMS_MIN       = 0.002  # frames below this are pure silence — skip embedding
+_CONSECUTIVE_REQUIRED = 2      # frames above threshold before accepting (anti-spike)
+_CONF_DEBUG_FLOOR     = 0.15   # log ANY score above this at DEBUG level (diagnostics)
 
 
 class WakeWordService:
@@ -94,8 +96,29 @@ class WakeWordService:
         self._mel_sess          = None
         self._emb_sess          = None
         self._fp_log_lock       = threading.Lock()
+        # TTS-aware muting: set True while assistant is speaking to block self-trigger
+        self._tts_playing       = False
+        # Session gate: True blocks all wake events while a voice session is running
+        self._session_active    = False
+        # Per-model consecutive frame hits for consistency (anti-spike filter)
+        self._consecutive_hits: dict[str, int] = {}
 
         threading.Thread(target=self._load_all, daemon=True, name="wake-loader").start()
+
+    def set_tts_playing(self, playing: bool) -> None:
+        """Call with True when TTS starts, False when it ends."""
+        self._tts_playing = playing
+        if playing:
+            self._last_wake_t    = time.perf_counter()
+            self._consecutive_hits = {}
+
+    def set_session_active(self, active: bool) -> None:
+        """Call with True when a voice session starts, False when it ends."""
+        self._session_active = active
+        if active:
+            self._last_wake_t    = time.perf_counter()
+            self._consecutive_hits = {}
+        logger.info("[WakeWord] session_active=%s", active)
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -103,10 +126,17 @@ class WakeWordService:
         try:
             import onnxruntime as ort  # type: ignore
 
+            # Suppress memcpy / node-assignment warnings (severity 3 = ERROR only)
+            ort.set_default_logger_severity(3)
+
+            # Prefer CUDA; CPU is automatic fallback — no manual provider list needed
+            _so = ort.SessionOptions()
+            _so.log_severity_level = 3
+
             # Load shared feature extraction models
             builtin = str(_OWW_BUILTIN_DIR)
-            self._mel_sess = ort.InferenceSession(f"{builtin}/melspectrogram.onnx")
-            self._emb_sess = ort.InferenceSession(f"{builtin}/embedding_model.onnx")
+            self._mel_sess = ort.InferenceSession(f"{builtin}/melspectrogram.onnx", sess_options=_so)
+            self._emb_sess = ort.InferenceSession(f"{builtin}/embedding_model.onnx", sess_options=_so)
 
             loaded: list[str] = []
 
@@ -115,7 +145,7 @@ class WakeWordService:
             for onnx_file in sorted(_CUSTOM_MODELS_DIR.glob("*.onnx")):
                 name = onnx_file.stem
                 try:
-                    sess = ort.InferenceSession(str(onnx_file))
+                    sess = ort.InferenceSession(str(onnx_file), sess_options=_so)
                     self._models[name] = sess
                     self._thresholds[name] = _MODEL_THRESHOLDS.get(name, _DEFAULT_THRESHOLD)
                     self._buffers[name] = np.zeros((16, 96), dtype=np.float32)
@@ -128,7 +158,7 @@ class WakeWordService:
             if not self._models and _FALLBACK_MODEL:
                 onnx_path = f"{builtin}/{_FALLBACK_MODEL}_v0.1.onnx"
                 if os.path.exists(onnx_path):
-                    sess = ort.InferenceSession(onnx_path)
+                    sess = ort.InferenceSession(onnx_path, sess_options=_so)
                     name = _FALLBACK_MODEL
                     self._models[name] = sess
                     self._thresholds[name] = _MODEL_THRESHOLDS.get(name, _DEFAULT_THRESHOLD)
@@ -185,12 +215,29 @@ class WakeWordService:
         if not self._oww_ready:
             return False, "", 0.0
 
+        # HARD BLOCK 1: voice session is active — wake must be fully silent
+        if self._session_active:
+            logger.debug("[WakeWord] WAKE_REJECTED_SESSION_ACTIVE")
+            return False, "", 0.0
+
+        # HARD BLOCK 2: TTS is playing — prevents self-triggering on assistant voice
+        if self._tts_playing:
+            logger.debug("[WakeWord] WAKE_REJECTED_TTS_ACTIVE")
+            return False, "", 0.0
+
+        # VAD pre-check: reject silence and low-energy noise frames
+        rms = float(np.sqrt(np.mean(pcm_1280 ** 2)))
+        if rms < _SPEECH_RMS_MIN:
+            return False, "", 0.0
+
         emb = self._extract_embedding(pcm_1280)
         if emb is None:
             return False, "", 0.0
 
         now = time.perf_counter()
-        if now - self._last_wake_t < _COOLDOWN_S:
+        remaining = _COOLDOWN_S - (now - self._last_wake_t)
+        if remaining > 0:
+            logger.debug("[WakeWord] WAKE_REJECTED_DEBOUNCE remaining=%.2fs", remaining)
             return False, "", 0.0
 
         best_name  = ""
@@ -213,6 +260,11 @@ class WakeWordService:
                         inp_name = sess.get_inputs()[0].name
                         conf = float(sess.run(None, {inp_name: win})[0].flatten()[0])
 
+                    # Diagnostic: log any score worth seeing so engineers can tune thresholds
+                    if conf >= _CONF_DEBUG_FLOOR:
+                        logger.debug("[WakeWord] score model=%s conf=%.3f threshold=%.3f rms=%.4f",
+                                     name, conf, self._thresholds[name], rms)
+
                     if conf >= self._thresholds[name]:
                         priority = len(name)
                         if priority > best_score or (priority == best_score and conf > best_conf):
@@ -225,12 +277,50 @@ class WakeWordService:
                     logger.debug("[WakeWord] %s predict error: %s", name, exc)
 
         if best_name:
-            self._last_wake_t = now
-            self._reset_buffers()
-            logger.info("[WakeWord] WAKE — model=%s conf=%.3f", best_name, best_conf)
-            return True, best_name, best_conf
+            # Consistency check: require CONSECUTIVE_REQUIRED frames above threshold
+            cnt = self._consecutive_hits.get(best_name, 0) + 1
+            self._consecutive_hits = {best_name: cnt}  # reset all other models
 
-        # Hard-negative mining: log near-misses (above noise floor but below threshold)
+            if cnt >= _CONSECUTIVE_REQUIRED:
+                self._consecutive_hits = {}
+                self._last_wake_t = now
+                self._reset_buffers()
+                logger.info("[WakeWord] WAKE_ACCEPTED model=%s conf=%.3f frames=%d",
+                            best_name, best_conf, cnt)
+                return True, best_name, best_conf
+            else:
+                logger.debug("[WakeWord] WAKE_PENDING_CONFIRM model=%s conf=%.3f frame=%d/%d",
+                             best_name, best_conf, cnt, _CONSECUTIVE_REQUIRED)
+                return False, "", 0.0
+
+        # Combined-evidence: multiple models agree above _FP_CONF_MIN → soft trigger
+        # Handles phonetic variants ("zyron"/"zairon") detected across different models
+        if len(near_misses) >= 2:
+            multi_best = max(near_misses, key=lambda x: x[1])
+            multi_name, multi_conf = multi_best
+            if multi_conf >= _FP_CONF_MIN * 1.5:  # 0.30 combined floor
+                combined_cnt = self._consecutive_hits.get("__combined__", 0) + 1
+                self._consecutive_hits = {"__combined__": combined_cnt}
+                if combined_cnt >= _CONSECUTIVE_REQUIRED:
+                    self._consecutive_hits = {}
+                    self._last_wake_t = now
+                    self._reset_buffers()
+                    logger.info("[WakeWord] WAKE_ACCEPTED_COMBINED models=%s conf=%.3f frames=%d",
+                                [n for n, _ in near_misses], multi_conf, combined_cnt)
+                    return True, multi_name, multi_conf
+                return False, "", 0.0
+
+        # Reset consistency counters on miss
+        self._consecutive_hits = {}
+
+        # Log near-misses just below threshold
+        for name, conf in near_misses:
+            thresh = self._thresholds.get(name, _DEFAULT_THRESHOLD)
+            if conf >= thresh * 0.80:
+                logger.info("[WakeWord] WAKE_REJECTED_LOW_CONF model=%s conf=%.3f threshold=%.3f",
+                            name, conf, thresh)
+
+        # Hard-negative mining: log near-misses above noise floor
         self._log_near_misses(near_misses)
         return False, "", 0.0
 

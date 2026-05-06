@@ -106,7 +106,7 @@ async def ws_wake(websocket: WebSocket) -> None:
     })
     logger.info("[WS/wake] connected — models: %s", _wws.model_names)
 
-    PING_EVERY = 20.0
+    PING_EVERY = 8.0   # shorter interval → detect dead connections faster
 
     try:
         while True:
@@ -147,6 +147,17 @@ async def ws_wake(websocket: WebSocket) -> None:
                     msg = json.loads(text)
                     if msg.get("type") == "reset_cooldown":
                         _wws.reset_cooldown()
+                    elif msg.get("type") == "tts_start":
+                        _wws.set_tts_playing(True)
+                    elif msg.get("type") == "tts_end":
+                        _wws.set_tts_playing(False)
+                    elif msg.get("type") == "session_start":
+                        _wws.set_session_active(True)
+                        logger.debug("[WS/wake] session gate OPEN (HTTP session started)")
+                    elif msg.get("type") == "session_end":
+                        _wws.set_session_active(False)
+                        _wws.reset_cooldown()
+                        logger.debug("[WS/wake] session gate CLOSED (HTTP session ended)")
                 except Exception:
                     pass
 
@@ -161,9 +172,13 @@ async def ws_wake(websocket: WebSocket) -> None:
 # ── Voice Session WebSocket ───────────────────────────────────────────────────
 
 # VAD constants
-_SILENCE_RMS     = 0.008  # RMS below this = silence
-_SILENCE_FRAMES  = 9      # 9 × 80ms = 720ms silence → end of speech
-_MIN_SPEECH_FRAMES = 5    # < 400ms → too short, discard
+_SILENCE_RMS       = 0.008   # RMS below this = silence
+_SILENCE_FRAMES    = 9       # 9 × 80ms = 720ms silence → end of speech
+_MIN_SPEECH_FRAMES = 5       # < 400ms → too short, discard
+_INTERRUPT_RMS     = 0.020   # RMS above this during TTS = user interrupt
+
+# Session constants
+SESSION_TIMEOUT  = 8.0        # seconds of silence before session auto-ends
 
 # TTS chunking: split response at sentence boundaries, max N chars per chunk
 _TTS_MAX_CHARS   = 80
@@ -206,14 +221,23 @@ def _split_for_tts(text: str) -> list[str]:
 
 
 async def _synthesize_chunk(text: str, voice: str, speed: float) -> Optional[bytes]:
-    """Synthesize one TTS chunk asynchronously."""
-    try:
-        from api.routers.voice import _kokoro_to_wav
-        wav = await asyncio.to_thread(_kokoro_to_wav, text, voice, speed)
-        return wav
-    except Exception as exc:
-        logger.warning("[WS/session] TTS error: %s", exc)
-        return None
+    """Synthesize one TTS chunk via Kokoro; retry once on None or exception."""
+    for attempt in range(2):
+        try:
+            from api.routers.voice import _kokoro_to_wav
+            wav = await asyncio.to_thread(_kokoro_to_wav, text, voice, speed)
+            if wav:
+                return wav
+            if attempt == 0:
+                logger.warning("[WS/session] Kokoro returned None, retrying...")
+                await asyncio.sleep(0.15)
+        except Exception as exc:
+            if attempt == 0:
+                logger.warning("[WS/session] Kokoro attempt 1 failed, retrying: %s", exc)
+                await asyncio.sleep(0.15)
+            else:
+                logger.error("[WS/session] Kokoro failed after retry: %s", exc)
+    return None
 
 
 @router.websocket("/ws/session")
@@ -234,7 +258,14 @@ async def ws_session(websocket: WebSocket) -> None:
     except (asyncio.TimeoutError, WebSocketDisconnect, json.JSONDecodeError):
         pass
 
-    logger.info("[WS/session] started voice=%s speed=%.1f", voice, speed)
+    logger.info("[SESSION_STARTED] voice=%s speed=%.1f", voice, speed)
+
+    # Block wake word for the duration of this session
+    try:
+        from voice.wake_word_service import wake_word_service as _wws
+        _wws.set_session_active(True)
+    except Exception:
+        pass
 
     # ── Instant "Yes?" ACK ────────────────────────────────────────────────────
     ack_path = Path("/tmp/xyron-ack/on_it.wav")
@@ -249,17 +280,147 @@ async def ws_session(websocket: WebSocket) -> None:
 
     await _send(websocket, {"type": "listening"})
 
-    # ── State ─────────────────────────────────────────────────────────────────
+    # ── Session state ─────────────────────────────────────────────────────────
     pcm_buffer: list[np.ndarray] = []
-    silence_count  = 0
-    speech_started = False
-    is_speaking    = False  # True while TTS chunks are playing
+    silence_count       = 0
+    speech_started      = False
+    is_speaking         = False      # True while TTS is streaming
+    last_activity_t     = time.time()
+    interrupt_event     = asyncio.Event()
+    last_response_text: str = ""     # for CLARIFY repetition
+
+    from brain.memory_manager import new_session_memory
+    memory = new_session_memory()
+
+    # ── Session timeout watcher ───────────────────────────────────────────────
+
+    async def _timeout_watcher() -> None:
+        while websocket.client_state == WebSocketState.CONNECTED:
+            await asyncio.sleep(1.0)
+            idle_s = time.time() - last_activity_t
+            if not is_speaking and idle_s > SESSION_TIMEOUT:
+                await _send(websocket, {
+                    "type":   "session_timeout",
+                    "reason": "inactivity",
+                    "idle_s": round(idle_s, 1),
+                })
+                logger.info("[SESSION_ENDED] inactivity timeout after %.1fs", idle_s)
+                try:
+                    await websocket.close(1000)
+                except Exception:
+                    pass
+                break
+
+    asyncio.create_task(_timeout_watcher())
+
+    # ── TTS helper: sequential synthesis for short (tool/memory) responses ────
+
+    async def _tts_sequential(text: str) -> bool:
+        """Synthesize `text` chunk-by-chunk with interrupt check. Returns True if interrupted."""
+        interrupt_event.clear()
+        logger.info("[TTS_STARTED] chars=%d", len(text))
+        chunks = _split_for_tts(text)
+        n = len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            if interrupt_event.is_set():
+                logger.info("[TTS_INTERRUPTED] at chunk %d/%d", i, n)
+                return True
+            wav = await _synthesize_chunk(chunk, voice, speed)
+            if interrupt_event.is_set():
+                logger.info("[TTS_INTERRUPTED] post-synth chunk %d/%d", i, n)
+                return True
+            if wav:
+                sent = await _send(websocket, {
+                    "type":  "audio",
+                    "data":  base64.b64encode(wav).decode(),
+                    "chunk": i,
+                    "total": n,
+                    "final": (i == n),
+                    "text":  chunk,
+                })
+                if not sent:
+                    return False
+            if websocket.client_state != WebSocketState.CONNECTED:
+                return False
+        return False
+
+    # ── Tool execution helper ─────────────────────────────────────────────────
+
+    async def _run_tool(tool_name: str, tool_params: dict) -> str:
+        from api.tools import registry as _registry
+        from api.config import settings as _cfg
+        try:
+            from api.services.window_context import window_context as _wctx
+            _aw = _wctx.get_active_window()
+        except Exception:
+            _aw = None
+        _ctx = {"openai_key": _cfg.openai_api_key, "active_window": _aw}
+        result = await asyncio.to_thread(_registry.execute, tool_name, tool_params, _ctx)
+        # Persist to context memory for pronoun resolution next turn
+        try:
+            from api.services.context_memory import context_memory as _cm
+            _data  = result.data or {}
+            _paths = [str(p) for p in _data.get("paths", [])]
+            _ents  = [str(e) for e in _data.get("entities", [])]
+            if not _paths and tool_params.get("path"):
+                _paths = [str(tool_params["path"])]
+            _cm.record_action(tool_name, _ents, _paths)
+        except Exception:
+            pass
+        try:
+            from api.services.memory_service import memory_service as _ms
+            _ms.set_last_action(tool_name, tool_params, result.text)
+        except Exception:
+            pass
+        return (result.spoken or result.text or "Done.").strip()
+
+    # ── LLM streaming path: overlapped generation + TTS ──────────────────────
+
+    async def _run_llm_stream(transcript: str, history: list[dict]) -> tuple[str, bool]:
+        """
+        Stream LLM tokens → sentence chunks → Kokoro TTS in parallel.
+        Returns (full_response_text, interrupted).
+        """
+        from api.services.response_pipeline import stream_response_with_tts
+        interrupt_event.clear()
+        logger.info("[TTS_STARTED] streaming LLM+TTS pipeline")
+        full_text  = ""
+        interrupted = False
+        try:
+            async for sentence, wav, chunk_idx, is_final in stream_response_with_tts(
+                transcript, history, voice=voice, speed=speed
+            ):
+                if interrupt_event.is_set():
+                    interrupted = True
+                    logger.info("[TTS_INTERRUPTED] LLM stream at chunk %d", chunk_idx)
+                    break
+                full_text += sentence + " "
+                await _send(websocket, {"type": "response", "text": sentence, "chunk": chunk_idx})
+                if wav:
+                    await _send(websocket, {
+                        "type":  "audio",
+                        "data":  base64.b64encode(wav).decode(),
+                        "chunk": chunk_idx,
+                        "final": is_final,
+                        "text":  sentence,
+                    })
+                if websocket.client_state != WebSocketState.CONNECTED:
+                    interrupted = True
+                    break
+        except Exception as exc:
+            logger.warning("[WS/session] LLM stream error: %s", exc)
+            fallback = "I ran into an issue. Please try again."
+            await _send(websocket, {"type": "response", "text": fallback, "chunk": 1})
+            await _tts_sequential(fallback)
+            full_text = fallback
+        return full_text.strip(), interrupted
 
     # ── Utterance processor ───────────────────────────────────────────────────
 
     async def process_utterance(frames: list[np.ndarray]) -> None:
-        nonlocal is_speaking
+        nonlocal is_speaking, last_activity_t, last_response_text
 
+        last_activity_t = time.time()
         audio = np.concatenate(frames).astype(np.float32)
 
         # STT — fast mode: beam_size=1, English only, no internal VAD
@@ -271,6 +432,7 @@ async def ws_session(websocket: WebSocket) -> None:
             logger.warning("[WS/session] STT error: %s", exc)
             await _send(websocket, {"type": "error", "message": "STT failed"})
             is_speaking = False
+            await _send(websocket, {"type": "listening"})
             return
 
         if not transcript:
@@ -280,53 +442,136 @@ async def ws_session(websocket: WebSocket) -> None:
 
         await _send(websocket, {"type": "transcript", "text": transcript, "final": True})
         logger.info("[WS/session] transcript: %r", transcript)
+        memory.add_user(transcript)
 
-        # LLM dispatch
-        try:
-            from api.services.command_service import classify_intent, _dispatch_to_skill
-            import uuid as _uuid
-            intent     = classify_intent(transcript)
-            cid        = str(_uuid.uuid4())[:8]
-            raw_result = await asyncio.to_thread(_dispatch_to_skill, transcript, intent, cid)
-            if isinstance(raw_result, dict):
-                response_text = str(
-                    raw_result.get("spoken") or raw_result.get("message") or raw_result
-                ).strip()
+        # ── Orchestrator decision ─────────────────────────────────────────────
+        from brain.orchestrator import orchestrator as _orch, ActionType
+        decision = await _orch.decide(transcript, memory.history_for_llm())
+        logger.info("[ORCHESTRATOR] action=%s reason=%s", decision.action.name, decision.reason)
+
+        response_text: str = ""
+        interrupted:   bool = False
+
+        # ── STOP ──────────────────────────────────────────────────────────────
+        if decision.action == ActionType.STOP:
+            response_text = "Goodbye! Have a great day."
+            await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
+            await _tts_sequential(response_text)
+            await _send(websocket, {"type": "done"})
+            try:
+                await websocket.close(1000)
+            except Exception:
+                pass
+            return
+
+        # ── INTERRUPT — soft cancel, keep session alive ────────────────────────
+        elif decision.action == ActionType.INTERRUPT:
+            is_speaking     = False
+            last_activity_t = time.time()
+            await _send(websocket, {"type": "listening"})
+            return
+
+        # ── CLARIFY — repeat last response ────────────────────────────────────
+        elif decision.action == ActionType.CLARIFY:
+            response_text = last_response_text or "I didn't catch that. Could you say it again?"
+            await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
+            interrupted = await _tts_sequential(response_text)
+
+        # ── MEMORY_REF — pronoun resolved to prior action ─────────────────────
+        elif decision.action == ActionType.MEMORY_REF:
+            tool = decision.tool_name
+            try:
+                if tool == "delete_file":
+                    from api.tools import registry as _registry
+                    paths = decision.tool_params.get("paths", [])
+                    logger.info("[MEMORY_USED] delete_ref paths=%s", paths)
+                    deleted, failed = [], []
+                    for p in paths:
+                        try:
+                            r = await asyncio.to_thread(
+                                _registry.execute,
+                                "delete_file", {"path": p, "confirmed": True}, {},
+                            )
+                            (deleted if r.success else failed).append(p)
+                        except Exception:
+                            failed.append(p)
+                    if deleted and not failed:
+                        response_text = f"Deleted {len(deleted)} item{'s' if len(deleted) > 1 else ''}."
+                    elif deleted:
+                        response_text = f"Deleted {len(deleted)}, but {len(failed)} failed."
+                    else:
+                        response_text = "I couldn't delete those — they may no longer exist."
+                elif tool:
+                    logger.info("[MEMORY_USED] %s ref tool=%s", decision.reason, tool)
+                    response_text = await _run_tool(tool, decision.tool_params)
+                else:
+                    response_text = "I couldn't resolve what you're referring to."
+            except Exception as exc:
+                logger.warning("[WS/session] memory_ref exec error: %s", exc)
+                response_text = "I had trouble with that reference."
+            await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
+            interrupted = await _tts_sequential(response_text)
+
+        # ── TOOL — matched tool execution ─────────────────────────────────────
+        elif decision.action == ActionType.TOOL:
+            try:
+                response_text = await _run_tool(decision.tool_name, decision.tool_params)
+            except Exception as exc:
+                logger.warning("[WS/session] tool exec error: %s", exc)
+                response_text = "That action ran into an issue."
+            await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
+            interrupted = await _tts_sequential(response_text)
+
+        # ── MULTI_STEP — compound command via planner ─────────────────────────
+        elif decision.action == ActionType.MULTI_STEP:
+            from brain.planner import planner as _planner
+            from brain.orchestrator import orchestrator as _o2, ActionType as _AT
+
+            async def _step_fn(step_text: str, hist: list[dict]) -> str:
+                step_dec = await _o2.decide(step_text, hist)
+                if step_dec.action == _AT.TOOL:
+                    return await _run_tool(step_dec.tool_name, step_dec.tool_params)
+                elif step_dec.action == _AT.MEMORY_REF and step_dec.tool_name:
+                    return await _run_tool(step_dec.tool_name, step_dec.tool_params)
+                else:
+                    from api.services.response_pipeline import quick_response
+                    return await quick_response(step_text, hist)
+
+            plan = _planner.build(transcript)
+            if plan:
+                response_text = await _planner.execute(plan, _step_fn, memory.history_for_llm())
             else:
-                response_text = str(raw_result).strip() if raw_result else "Done."
-        except Exception as exc:
-            logger.warning("[WS/session] dispatch error: %s", exc)
-            response_text = "I ran into an issue with that."
+                response_text = "I had trouble parsing those steps."
+            await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
+            interrupted = await _tts_sequential(response_text)
 
-        await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
+        # ── LLM — overlapped streaming generation + TTS ───────────────────────
+        else:
+            response_text, interrupted = await _run_llm_stream(
+                transcript, memory.history_for_llm()
+            )
 
-        # TTS — stream sentence-by-sentence
-        chunks = _split_for_tts(response_text)
-        n      = len(chunks)
-        for i, chunk_text in enumerate(chunks, 1):
-            wav = await _synthesize_chunk(chunk_text, voice, speed)
-            if wav:
-                sent = await _send(websocket, {
-                    "type":  "audio",
-                    "data":  base64.b64encode(wav).decode(),
-                    "chunk": i,
-                    "total": n,
-                    "final": (i == n),
-                    "text":  chunk_text,
-                })
-                if not sent:
-                    break
-            if websocket.client_state != WebSocketState.CONNECTED:
-                break
+        # ── Post-dispatch bookkeeping ─────────────────────────────────────────
+        if response_text:
+            last_response_text = response_text
+        memory.add_assistant(response_text, tool_name=decision.tool_name)
 
-        await _send(websocket, {"type": "done"})
-        is_speaking = False
+        logger.info("[TTS_STOPPED] interrupted=%s", interrupted)
+        is_speaking     = False
+        last_activity_t = time.time()
+
+        if not interrupted:
+            await _send(websocket, {"type": "done"})
+            await _send(websocket, {"type": "listening"})
+        # If interrupted: VAD in the main loop already detected speech; it re-arms naturally
 
     # ── Main receive loop ─────────────────────────────────────────────────────
     try:
         while websocket.client_state == WebSocketState.CONNECTED:
             try:
-                data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                data = await asyncio.wait_for(
+                    websocket.receive(), timeout=SESSION_TIMEOUT + 5.0
+                )
             except asyncio.TimeoutError:
                 if not await _send(websocket, {"type": "ping"}):
                     break
@@ -347,9 +592,10 @@ async def ws_session(websocket: WebSocket) -> None:
                         if speech_started and len(pcm_buffer) >= _MIN_SPEECH_FRAMES:
                             frames = list(pcm_buffer)
                             pcm_buffer.clear()
-                            speech_started = False
-                            silence_count  = 0
-                            is_speaking    = True
+                            speech_started  = False
+                            silence_count   = 0
+                            is_speaking     = True
+                            interrupt_event.clear()
                             asyncio.create_task(process_utterance(frames))
                     elif t == "tts_done":
                         is_speaking = False
@@ -362,15 +608,23 @@ async def ws_session(websocket: WebSocket) -> None:
             raw = data.get("bytes")
             if not raw or len(raw) != FRAME_BYTES:
                 continue
-            if is_speaking:
-                continue  # ignore mic while TTS is playing
 
             pcm = np.frombuffer(raw, dtype=np.float32).copy()
             rms = float(np.sqrt(np.mean(pcm ** 2)))
 
+            if is_speaking:
+                # Interrupt detection: significant user speech during TTS
+                if rms > _INTERRUPT_RMS:
+                    interrupt_event.set()
+                    logger.info("[TTS_INTERRUPTED] user speech rms=%.4f", rms)
+                    await _send(websocket, {"type": "listening"})
+                continue  # always skip VAD accumulation while TTS plays
+
+            # Normal VAD accumulation
             if rms > _SILENCE_RMS:
-                speech_started = True
-                silence_count  = 0
+                speech_started  = True
+                silence_count   = 0
+                last_activity_t = time.time()  # reset session idle timer on speech
                 pcm_buffer.append(pcm)
                 if len(pcm_buffer) == _MIN_SPEECH_FRAMES:
                     await _send(websocket, {"type": "transcript", "text": "…", "final": False})
@@ -381,9 +635,10 @@ async def ws_session(websocket: WebSocket) -> None:
                     if len(pcm_buffer) >= _MIN_SPEECH_FRAMES:
                         frames = list(pcm_buffer)
                         pcm_buffer.clear()
-                        speech_started = False
-                        silence_count  = 0
-                        is_speaking    = True
+                        speech_started  = False
+                        silence_count   = 0
+                        is_speaking     = True
+                        interrupt_event.clear()
                         asyncio.create_task(process_utterance(frames))
                     else:
                         pcm_buffer.clear()
@@ -395,4 +650,10 @@ async def ws_session(websocket: WebSocket) -> None:
     except Exception as exc:
         logger.debug("[WS/session] unexpected error: %s", exc)
     finally:
-        logger.info("[WS/session] connection closed")
+        try:
+            from voice.wake_word_service import wake_word_service as _wws_cleanup
+            _wws_cleanup.set_session_active(False)
+            _wws_cleanup.reset_cooldown()
+        except Exception:
+            pass
+        logger.info("[SESSION_ENDED] connection closed")

@@ -325,12 +325,15 @@ async def create_folder(body: dict):
     Body: {"path": "E:\\\\", "name": "Projects"}
     """
     from api.tools import registry
+    from api.services.context_memory import context_memory
     name = body.get("name", "").strip()
     path = body.get("path", "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="'name' is required")
     result = registry.execute("create_folder", {"path": path, "name": name})
     created_path = (result.data or {}).get("path", "") if result.success else ""
+    if result.success and created_path:
+        context_memory.record_action("create_folder", [name], [created_path])
     return {"success": result.success, "message": result.text, "spoken": result.spoken, "path": created_path}
 
 
@@ -341,6 +344,7 @@ async def create_subfolders(body: dict):
     Body: {"parent": "E:\\\\Projects", "names": ["Frontend", "Backend", "Database"]}
     """
     from api.tools import registry
+    from api.services.context_memory import context_memory
     parent = body.get("parent", "").strip()
     names  = body.get("names", [])
     if not parent:
@@ -348,6 +352,10 @@ async def create_subfolders(body: dict):
     if not names:
         raise HTTPException(status_code=400, detail="'names' is required")
     result = registry.execute("create_subfolders", {"parent": parent, "names": names})
+    if result.success:
+        import os as _os
+        created_paths = [_os.path.join(parent, n) for n in names]
+        context_memory.record_action("create_subfolders", names, created_paths, {"parent": parent})
     return {"success": result.success, "message": result.text, "spoken": result.spoken}
 
 
@@ -406,7 +414,62 @@ async def execute_tool(body: dict):
         raise HTTPException(status_code=404, detail=f"Tool '{tool}' not found")
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, registry.execute, tool, params, {})
+    if result.success and tool in ("delete_file", "delete_folder"):
+        from api.services.context_memory import context_memory
+        target = params.get("path", params.get("name", ""))
+        if target:
+            context_memory.record_action(tool, [str(target)], [str(target)])
     return {"success": result.success, "spoken": result.spoken, "message": result.text, "data": result.data}
+
+
+@router.post("/delete-multiple")
+async def delete_multiple(body: dict):
+    """Delete multiple files/folders by path.
+
+    Body: {"paths": ["C:\\\\foo", "C:\\\\bar"]}
+    Returns: {"success": bool, "deleted": [...], "failed": [...]}
+    """
+    import asyncio
+    from api.tools import registry
+    from api.services.context_memory import context_memory
+
+    paths = body.get("paths") or []
+    if not paths:
+        raise HTTPException(status_code=400, detail="'paths' is required")
+
+    deleted: list[str] = []
+    failed:  list[dict] = []
+    loop = asyncio.get_event_loop()
+
+    for p in paths:
+        p = str(p).strip()
+        if not p:
+            continue
+        result = await loop.run_in_executor(
+            None, registry.execute, "delete_file", {"path": p, "confirmed": True}, {}
+        )
+        if result.success:
+            deleted.append(p)
+        else:
+            failed.append({"path": p, "reason": result.text})
+
+    if deleted:
+        import os as _os
+        names = [_os.path.basename(p) or p for p in deleted]
+        context_memory.record_action("delete_multiple", names, deleted)
+
+    overall = len(failed) == 0
+    spoken = (
+        f"Deleted {len(deleted)} item{'s' if len(deleted) != 1 else ''}."
+        if overall
+        else f"Deleted {len(deleted)}, failed {len(failed)}."
+    )
+    return {
+        "success":  overall,
+        "spoken":   spoken,
+        "deleted":  deleted,
+        "failed":   failed,
+    }
 
 
 @router.get("/registered-tools")

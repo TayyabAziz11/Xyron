@@ -89,6 +89,7 @@ _TOOL_DESCS: dict[str, str] = {
     "maximize_window":        "maximize fullscreen enlarge window",
     "close_window":           "close current window alt f4",
     "create_folder":          "create new folder directory make folder",
+    "create_subfolders":      "create multiple subfolders inside folder make sub-folders sub-directories in it named",
     "list_directory":         "list files contents folder directory show what is inside",
     "search_files":           "search find file by name pattern in folder",
     "move_file":              "move file folder from one place to another",
@@ -206,6 +207,41 @@ class IntentRouter:
         add(r'\b(?:take\s+(?:a\s+)?)?screenshot\b|\bcapture\s+(?:the\s+)?screen\b', "take_screenshot")
         add(r'\bwhat.?s\s+(?:on|showing\s+on)\s+(?:my\s+)?screen\b|\bread\s+(?:the\s+)?screen\b', "read_screen")
 
+        # ── Drive letters (must be before open_application catch-all) ───────────
+        # "open C drive", "open the D drive", "go to E drive", "open C:"
+        add(
+            r'\b(?:open|go\s+to|show|browse|navigate\s+to)\s+(?:the\s+)?([a-fA-F])\s+(?:drive|disk|partition)\b',
+            "open_drive",
+            lambda m: {"drive": m.group(1).upper()},
+        )
+        add(
+            r'\b(?:open|go\s+to|show|browse)\s+(?:the\s+)?([a-fA-F]):\s*[\\\/]?\b',
+            "open_drive",
+            lambda m: {"drive": m.group(1).upper()},
+        )
+
+        # ── System settings shortcuts ────────────────────────────────────────
+        add(
+            r'\b(?:open|show|go\s+to|launch)\s+(?:windows?\s+)?settings?\b',
+            "open_application",
+            lambda m: {"app_name": "settings"},
+        )
+        add(
+            r'\b(?:open|show|launch)\s+(?:the\s+)?control\s+panel\b',
+            "open_application",
+            lambda m: {"app_name": "control panel"},
+        )
+        add(
+            r'\b(?:open|launch|show)\s+(?:the\s+)?task\s+manager\b',
+            "open_application",
+            lambda m: {"app_name": "task manager"},
+        )
+        add(
+            r'\b(?:open|launch|show)\s+(?:the\s+)?device\s+manager\b',
+            "open_application",
+            lambda m: {"app_name": "device manager"},
+        )
+
         # ── Known system folders (must be before open_application catch-all) ───
         _FOLDERS = r'(?:downloads?|documents?|desktop|pictures?|photos?|music|videos?|temp(?:orary)?|home|appdata)'
         # "open downloads folder", "open my downloads", "open the downloads folder"
@@ -219,6 +255,46 @@ class IntentRouter:
             r'\b(?:open|show|go\s+to|browse)\s+(?:the\s+)?(?:folder|directory)\s+(' + _FOLDERS + r')\b',
             "open_directory",
             lambda m: {"path": m.group(1).lower()},
+        )
+
+        # ── Subfolder creation ────────────────────────────────────────────────
+        _NUM_WORDS = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        }
+
+        def _parse_subfolders(m: re.Match) -> dict:
+            raw = m.group(0)
+            # Extract count from digit or word
+            count = 0
+            digit_m = re.search(r'\b(\d+)\b', raw)
+            if digit_m:
+                count = int(digit_m.group(1))
+            else:
+                for word, n in _NUM_WORDS.items():
+                    if re.search(r'\b' + word + r'\b', raw, re.IGNORECASE):
+                        count = n
+                        break
+            # Extract explicit names: "named X, Y, Z" / "name of X" / "called X"
+            names: list[str] = []
+            named_m = re.search(
+                r'(?:named?|called?|with\s+(?:the\s+)?name(?:s)?\s+(?:of)?)\s+([^.?!]+)',
+                raw, re.IGNORECASE,
+            )
+            if named_m:
+                raw_names = named_m.group(1)
+                # Split on commas, "and", whitespace-only boundaries
+                parts = re.split(r'\s*(?:,|and)\s*|\s+', raw_names.strip())
+                names = [p.strip().rstrip('.,') for p in parts if p.strip()]
+            return {"count": count or len(names) or 1, "names": names}
+
+        add(
+            r'\b(?:create|make|add)\s+(?:\d+\s+|(?:' +
+            '|'.join(_NUM_WORDS.keys()) +
+            r')\s+)?sub[\s-]?(?:folder|directory|folders|directories)\b'
+            r'|\bcreate\s+sub[\s-]?folder',
+            "create_subfolders",
+            _parse_subfolders,
         )
 
         # ── Open / close application ──────────────────────────────────────────
@@ -331,6 +407,7 @@ class IntentRouter:
         with self._cache_lock:
             if key in self._cache:
                 c = self._cache[key]
+                logger.debug("[IntentRouter] Tier1 cache hit: %r → %s", text[:60], c.tool_name)
                 return RouteResult(c.tool_name, c.params, 1, 1.0)
 
         # Tier 2 — regex
@@ -344,14 +421,27 @@ class IntentRouter:
                 result = RouteResult(tool, params, 2, 1.0)
                 with self._cache_lock:
                     self._cache[key] = result
+                logger.info("[IntentRouter] Tier2 regex: %r → %s params=%s",
+                            text[:60], tool, params)
                 return result
 
         # Tier 3 — semantic classifier
         result = self._semantic_route(text)
         if result.tool_name:
+            logger.info("[IntentRouter] Tier3 semantic: %r → %s conf=%.2f",
+                        text[:60], result.tool_name, result.confidence)
             return result
 
-        # Tier 4 — no match
+        # Tier 4 — no match; log top candidates so engineers can diagnose
+        candidates = self.top_candidates(text, n=3)
+        if candidates:
+            top_str = ", ".join(f"{n}({c:.2f})" for n, c in candidates)
+            logger.info("[IntentRouter] Tier4 no match for %r — top candidates: %s "
+                        "(none exceeded 0.65 threshold) → falling back to LLM",
+                        text[:60], top_str)
+        else:
+            logger.info("[IntentRouter] Tier4 no match for %r — semantic classifier "
+                        "not ready or no candidates → falling back to LLM", text[:60])
         return RouteResult(None, {}, 4, 0.0)
 
     def top_candidates(self, text: str, n: int = 3) -> list[tuple[str, float]]:

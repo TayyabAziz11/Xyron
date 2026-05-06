@@ -157,14 +157,19 @@ export default function CommandCenterPage() {
   // Wake word: start session if not running. During active session the system
   // auto-listens — wake word can also trigger a listen cycle as a backup (guards protect).
   const wakeActivate = useCallback(() => {
-    if (session.isActive) session.startListening()
-    else session.startSession()
+    console.log('[SESSION_FLOW] wake_detected — session.isActive:', session.isActive, 'state:', session.state)
+    if (!session.isActive) {
+      session.startSession()
+    } else if (session.state === 'idle' || session.state === 'listening') {
+      // Session alive and waiting — kick a listen cycle
+      session.startListening()
+    } else {
+      // Session active but busy (speaking/processing) — ignore this wake, stay in current flow
+      console.log('[SESSION_FLOW] wake ignored — session busy, state:', session.state)
+    }
   }, [session])
 
-  const { supported: wakeSupported, listening: wakeListening } = useWakeWord(
-    wakeActivate,
-    session.state === 'idle',   // only run wake word loop when idle
-  )
+  const { supported: wakeSupported, listening: wakeListening } = useWakeWord(wakeActivate)
   const { data: commands, submit, submitting, lastResult, refetch } = useCommands()
   const { settings, saveSettings, speak, stop, isSpeaking } = useVoice()
   const { getDraft, confirmDraft, rejectDraft, editDraft, executing } = useDrafts()
