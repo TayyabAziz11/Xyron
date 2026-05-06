@@ -164,18 +164,79 @@ Open `http://localhost:3001/app/command-center` in your browser and tap the orb 
 
 ## GPU Setup (optional but recommended)
 
-If you have an NVIDIA GPU, install the CUDA-enabled ONNX runtime for much faster wake word detection and Whisper transcription:
+Xyron auto-detects your GPU on startup and shifts Whisper and the wake word models to it automatically — no code changes needed. When working correctly you'll see this in the backend logs:
+
+```
+[Whisper] GPU detected: NVIDIA RTX A2000 — using float16
+[Whisper] Loading 'small' on cuda (float16)…
+[Whisper] Model ready.
+[Warmup] Whisper ready — device=cuda compute=float16
+```
+
+The RTX A2000 is fully supported and will run everything on float16 out of the box. If you see `cpu` instead of `cuda`, follow the steps below.
+
+### Step 1 — Install CUDA Toolkit
+
+Download and install from [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads). Version 11.8 or newer.
+
+After install, verify:
+```bash
+nvidia-smi        # should show your GPU and driver version
+nvcc --version    # should show CUDA version
+```
+
+### Step 2 — Register CUDA libraries (WSL2 only)
+
+On WSL2, CUDA libraries are installed on Windows but need to be registered inside the Linux environment:
 
 ```bash
-pip uninstall onnxruntime
+# Find where libcuda.so lives (path may vary by driver version)
+find /usr/lib/wsl -name "libcuda.so*" 2>/dev/null
+
+# Create the ldconfig entry
+echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf
+sudo ldconfig
+
+# Verify
+ldconfig -p | grep libcuda
+```
+
+### Step 3 — Install GPU-enabled ONNX runtime
+
+```bash
+pip uninstall onnxruntime -y
 pip install onnxruntime-gpu
 
-# Verify CUDA is found
+# Verify CUDA provider is available
 python3 -c "import onnxruntime; print(onnxruntime.get_available_providers())"
 # Should include: CUDAExecutionProvider
 ```
 
-Then set `ONNX_PROVIDER=CUDAExecutionProvider` in `backend/.env` (already the default).
+### Step 4 — Set `.env`
+
+```env
+ONNX_PROVIDER=CUDAExecutionProvider
+```
+
+This is already the default in the template above. If you don't have a GPU, change it to `CPUExecutionProvider`.
+
+### What shifts to GPU automatically
+
+| Component | GPU benefit |
+|-----------|-------------|
+| Whisper STT | float16 inference — ~3–5× faster transcription |
+| Wake word (OWW) | ONNX models run on CUDA — lower latency per frame |
+| Kokoro TTS | CPU-only (ONNX CPU is fast enough for TTS) |
+
+### Troubleshooting
+
+**Still seeing `cpu` in logs after setup:**
+```bash
+# Check that PyTorch can see CUDA (Whisper device detection uses torch)
+python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+If this returns `False`, your CUDA installation or WSL2 GPU passthrough isn't configured correctly. Check that you're running WSL2 (not WSL1) and that your Windows NVIDIA driver is up to date (525+).
 
 ---
 
