@@ -80,6 +80,12 @@ desktop.ini
 # Unnecessary local assets
 Public/
 
+# Large model files (too big for GitHub — store separately)
+backend/voice/models/*.onnx
+backend/voice/models/*.bin
+dataset/
+dataset_processed/
+
 # Misc
 *.bak
 *.backup
