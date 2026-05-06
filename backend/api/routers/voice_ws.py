@@ -98,13 +98,18 @@ async def ws_wake(websocket: WebSocket) -> None:
         await websocket.close()
         return
 
+    # Reset singleton state so a stuck session gate from a previous connection
+    # never blocks wake detection on reconnect.
+    _wws.set_session_active(False)
+    _wws.set_tts_playing(False)
+
     await _send(websocket, {
         "type":       "ready",
         "models":     _wws.model_names,
         "thresholds": {n: _wws._thresholds.get(n, 0.5) for n in _wws.model_names},
         "cooldown_s": 3.0,
     })
-    logger.info("[WS/wake] connected — models: %s", _wws.model_names)
+    logger.info("[WS/wake] connected — models: %s (session/tts gates reset)", _wws.model_names)
 
     PING_EVERY = 8.0   # shorter interval → detect dead connections faster
 

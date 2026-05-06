@@ -72,7 +72,7 @@ _MODEL_THRESHOLDS.setdefault("hey_jarvis",   0.75)  # built-in pretrained — ke
 
 # Path for hard-negative mining log (frames that nearly fire but don't)
 _FP_LOG_PATH = Path(os.path.expanduser("~/.xyron/false_positive_log.jsonl"))
-_FP_CONF_MIN = 0.20  # log near-misses above this (lowered for diagnostics)
+_FP_CONF_MIN = 0.35  # log near-misses above this — raised to reduce noise in log
 
 _SPEECH_RMS_MIN       = 0.002  # frames below this are pure silence — skip embedding
 _CONSECUTIVE_REQUIRED = 2      # frames above threshold before accepting (anti-spike)
@@ -277,9 +277,10 @@ class WakeWordService:
                     logger.debug("[WakeWord] %s predict error: %s", name, exc)
 
         if best_name:
-            # Consistency check: require CONSECUTIVE_REQUIRED frames above threshold
+            # Consistency check: require CONSECUTIVE_REQUIRED frames above threshold.
+            # Keep only the winning model's counter (others are irrelevant once one wins).
             cnt = self._consecutive_hits.get(best_name, 0) + 1
-            self._consecutive_hits = {best_name: cnt}  # reset all other models
+            self._consecutive_hits = {best_name: cnt}
 
             if cnt >= _CONSECUTIVE_REQUIRED:
                 self._consecutive_hits = {}
@@ -288,30 +289,18 @@ class WakeWordService:
                 logger.info("[WakeWord] WAKE_ACCEPTED model=%s conf=%.3f frames=%d",
                             best_name, best_conf, cnt)
                 return True, best_name, best_conf
-            else:
-                logger.debug("[WakeWord] WAKE_PENDING_CONFIRM model=%s conf=%.3f frame=%d/%d",
-                             best_name, best_conf, cnt, _CONSECUTIVE_REQUIRED)
-                return False, "", 0.0
 
-        # Combined-evidence: multiple models agree above _FP_CONF_MIN → soft trigger
-        # Handles phonetic variants ("zyron"/"zairon") detected across different models
-        if len(near_misses) >= 2:
-            multi_best = max(near_misses, key=lambda x: x[1])
-            multi_name, multi_conf = multi_best
-            if multi_conf >= _FP_CONF_MIN * 1.5:  # 0.30 combined floor
-                combined_cnt = self._consecutive_hits.get("__combined__", 0) + 1
-                self._consecutive_hits = {"__combined__": combined_cnt}
-                if combined_cnt >= _CONSECUTIVE_REQUIRED:
-                    self._consecutive_hits = {}
-                    self._last_wake_t = now
-                    self._reset_buffers()
-                    logger.info("[WakeWord] WAKE_ACCEPTED_COMBINED models=%s conf=%.3f frames=%d",
-                                [n for n, _ in near_misses], multi_conf, combined_cnt)
-                    return True, multi_name, multi_conf
-                return False, "", 0.0
+            logger.debug("[WakeWord] WAKE_PENDING_CONFIRM model=%s conf=%.3f frame=%d/%d",
+                         best_name, best_conf, cnt, _CONSECUTIVE_REQUIRED)
+            return False, "", 0.0
 
-        # Reset consistency counters on miss
-        self._consecutive_hits = {}
+        # Miss frame: decrement each counter by 1 (floor 0) instead of hard-resetting.
+        # A single dip frame no longer wipes a partially-built hit run — the counter
+        # naturally drains to zero over two miss frames, which is the right behaviour
+        # for a wake phrase that has brief dips mid-phoneme.
+        self._consecutive_hits = {
+            k: max(0, v - 1) for k, v in self._consecutive_hits.items() if v > 1
+        }
 
         # Log near-misses just below threshold
         for name, conf in near_misses:
