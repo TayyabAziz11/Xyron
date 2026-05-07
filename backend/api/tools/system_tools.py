@@ -3608,6 +3608,29 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     except Exception as exc:
         return ToolResult(success=False, text=str(exc), spoken="Couldn't open that.", error=str(exc))
 
+# ── Takeover Mode ─────────────────────────────────────────────────────────────
+
+def _exec_takeover_mode(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    """Cinematic takeover: open VS Code and fire TAKEOVER_START to the frontend."""
+    _launch_app("vscode")   # non-blocking, fire-and-forget
+    return ToolResult(
+        success=True,
+        text="Takeover initiated.",
+        spoken="Control granted.",
+        data={"frontend_action": "TAKEOVER_START"},
+    )
+
+registry.register(name="takeover_mode",
+    definition={"type": "function", "function": {
+        "name": "takeover_mode",
+        "description": (
+            "Activate Xyron cinematic takeover mode. Opens VS Code, triggers a "
+            "cinematic activation sequence. Use for: 'takeover', 'xyron takeover', "
+            "'take over', 'take control', 'focus mode', 'workspace mode'."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    executor=_exec_takeover_mode, risk="low", category="system")
+
 registry.register(name="smart_open",
     definition={"type":"function","function":{"name":"smart_open",
         "description":"Search the user's system for a file, folder, video, or picture by name and open it. Use for: 'open my course folder', 'play that video', 'show that picture', 'open the Downloads folder', 'play the movie'.",

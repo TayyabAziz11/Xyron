@@ -36,6 +36,7 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
     (["search youtube", "youtube search", "find on youtube", "look up on youtube"], "system", "youtube_search"),
     (["play video", "play on youtube", "watch video", "watch on youtube"], "system", "youtube_play"),
     (["search google", "google search", "search the web", "search web", "look up", "google for"], "system", "google_search"),
+    (["takeover", "xyron takeover", "take over", "take control", "focus mode", "workspace mode"], "system", "takeover_mode"),
     (["open app", "launch app", "start app", "open vscode", "open vs code", "open chrome",
       "open spotify", "open terminal", "open calculator", "launch chrome", "launch spotify",
       "launch vscode", "launch vs code", "open notepad", "open firefox"], "system", "open_app"),

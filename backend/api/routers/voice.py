@@ -804,6 +804,12 @@ _PROFILE_SWITCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Takeover mode trigger ─────────────────────────────────────────────────────
+_TAKEOVER_TRIGGER_RE = re.compile(
+    r'\b(?:takeover|take\s+over|take\s+control|focus\s+mode|workspace\s+mode|xyron\s+takeover|takeover\s+mode|work\s+mode|let[\'s]*\s+go|grind\s+mode|grind\s+time|time\s+to\s+grind|beast\s+mode)\b',
+    re.IGNORECASE,
+)
+
 # ── Chill mode action trigger ─────────────────────────────────────────────────
 # Distinct from profile switch — these phrases activate chill mode AND open media
 _CHILL_TRIGGER_RE = re.compile(
@@ -2303,6 +2309,18 @@ async def respond_stream(body: _RespondStreamBody):
                     system_content += f"\n\n{sc}"
             except Exception:
                 pass
+
+            # ── LAYER 0d2: Takeover mode ──────────────────────────────────────
+            if _TAKEOVER_TRIGGER_RE.search(body.text.strip()):
+                confirm = "Control granted."
+                yield f"data: {json.dumps({'type': 'action', 'tool': 'takeover_mode', 'params': {}, 'spoken': confirm})}\n\n"
+                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': confirm})}\n\n"
+                yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': confirm})}\n\n"
+                try:
+                    _get_history().log(body.text, confirm, "takeover_mode", body.session_id)
+                except Exception:
+                    pass
+                return
 
             # ── LAYER 0e: Chill mode action trigger ───────────────────────────
             # Handled BEFORE profile switch so "chill mode" opens media + sets personality

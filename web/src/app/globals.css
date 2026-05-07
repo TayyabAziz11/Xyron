@@ -40,3 +40,44 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #2a2a40;
 }
+
+/* ── Takeover glitch effect ───────────────────────────────────────────────── */
+
+@keyframes glitch-r {
+  0%   { clip-path: inset(12% 0 72% 0); transform: translateX(-4px) }
+  25%  { clip-path: inset(55% 0 20% 0); transform: translateX(3px) }
+  50%  { clip-path: inset(30% 0 45% 0); transform: translateX(-2px) }
+  75%  { clip-path: inset(80% 0 5%  0); transform: translateX(5px) }
+  100% { clip-path: inset(0%  0 90% 0); transform: translateX(0px) }
+}
+
+@keyframes glitch-g {
+  0%   { clip-path: inset(60% 0 10% 0); transform: translateX(3px) }
+  25%  { clip-path: inset(20% 0 60% 0); transform: translateX(-4px) }
+  50%  { clip-path: inset(75% 0 5%  0); transform: translateX(2px) }
+  75%  { clip-path: inset(10% 0 40% 0); transform: translateX(-3px) }
+  100% { clip-path: inset(45% 0 25% 0); transform: translateX(0px) }
+}
+
+@keyframes glitch-b {
+  0%   { clip-path: inset(35% 0 40% 0); transform: translateX(5px) }
+  25%  { clip-path: inset(70% 0 15% 0); transform: translateX(-2px) }
+  50%  { clip-path: inset(5%  0 80% 0); transform: translateX(4px) }
+  75%  { clip-path: inset(50% 0 30% 0); transform: translateX(-5px) }
+  100% { clip-path: inset(20% 0 55% 0); transform: translateX(0px) }
+}
+
+.glitch-r {
+  background: rgba(255, 0, 0, 0.15);
+  animation: glitch-r 0.16s steps(4) forwards;
+}
+.glitch-g {
+  background: rgba(0, 255, 100, 0.10);
+  animation: glitch-g 0.16s steps(4) forwards;
+  animation-delay: 0.02s;
+}
+.glitch-b {
+  background: rgba(60, 80, 255, 0.15);
+  animation: glitch-b 0.16s steps(4) forwards;
+  animation-delay: 0.04s;
+}

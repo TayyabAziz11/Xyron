@@ -831,6 +831,9 @@ export function useVoiceSession() {
           },
 
           onToolAction: (tool, params, _spoken) => {
+            if (tool === 'takeover_mode') {
+              window.dispatchEvent(new Event('xyron:takeover'))
+            }
             fetch(`${API_BASE}/api/v1/system/execute-tool`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ tool, params }),

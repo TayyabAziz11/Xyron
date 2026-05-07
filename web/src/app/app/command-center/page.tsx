@@ -28,6 +28,12 @@ import { useVoice } from '@/hooks/useVoice'
 import { useDrafts } from '@/hooks/useDrafts'
 import { useTasks } from '@/hooks/useTasks'
 import { useProactive } from '@/hooks/useProactive'
+import { useTakeoverMode } from '@/hooks/useTakeoverMode'
+import TakeoverHUD      from '@/components/takeover/TakeoverHUD'
+import NeuralCore       from '@/components/takeover/NeuralCore'
+import ScreenBreach     from '@/components/takeover/ScreenBreach'
+import ThoughtStream    from '@/components/takeover/ThoughtStream'
+import SignalDistortion from '@/components/takeover/SignalDistortion'
 import type { Command, Draft } from '@/lib/types'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -189,6 +195,7 @@ export default function CommandCenterPage() {
 
   // Proactive notifications (Feature #7)
   const { notifications, dismiss: dismissNotif } = useProactive()
+  const { phase: takeoverPhase, systemLine: takeoverLine, stopTakeover } = useTakeoverMode()
   const [currentDraft, setCurrentDraft] = useState<Draft | null>(null)
   const spokenIdRef = useRef<string | null>(null)
 
@@ -669,6 +676,13 @@ export default function CommandCenterPage() {
 
       {/* Proactive notifications (Feature #7) */}
       <ProactiveToast notifications={notifications} onDismiss={dismissNotif} />
+
+      {/* ── Cinematic Takeover Mode ── */}
+      <SignalDistortion phase={takeoverPhase} />
+      <ScreenBreach     phase={takeoverPhase} />
+      <NeuralCore       phase={takeoverPhase} />
+      <ThoughtStream    phase={takeoverPhase} />
+      <TakeoverHUD      phase={takeoverPhase} systemLine={takeoverLine} onClose={stopTakeover} />
     </PageTransition>
   )
 }

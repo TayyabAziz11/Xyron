@@ -557,6 +557,15 @@ async def ws_session(websocket: WebSocket) -> None:
             except Exception as exc:
                 logger.warning("[WS/session] tool exec error: %s", exc)
                 response_text = "That action ran into an issue."
+            # Some tools signal the frontend to trigger a UI sequence.
+            # Send the action frame BEFORE TTS so the frontend can start
+            # its visual sequence in parallel with the audio playing.
+            _FE_ACTIONS: dict[str, str] = {"takeover_mode": "TAKEOVER_START"}
+            if decision.tool_name in _FE_ACTIONS:
+                await _send(websocket, {
+                    "type":   "frontend_action",
+                    "action": _FE_ACTIONS[decision.tool_name],
+                })
             await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
             interrupted = await _tts_sequential(response_text)
 
