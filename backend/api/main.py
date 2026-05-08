@@ -101,10 +101,9 @@ async def startup() -> None:
             _l.warning("[Warmup] IntentRouter: %s", exc)
         # 4. WakeWordService — loads OWW + tiny Whisper wake model
         try:
-            from voice.wake_word_service import wake_word_service as _wws, preload_wake_model
-            preload_wake_model()
+            from voice.wake_word_service import wake_word_service as _wws
             import time as _wt; _wt.sleep(1)  # allow OWW background thread to finish
-            _l.info("[Warmup] WakeWordService ready — oww=%s wake_model=tiny", _wws._oww_ready)
+            _l.info("[Warmup] WakeWordService ready — oww=%s", _wws._oww_ready)
         except Exception as exc:
             _l.warning("[Warmup] WakeWordService: %s", exc)
         # 5. Pre-generate TTS ack cache for instant playback (On it / Opening / Done)
