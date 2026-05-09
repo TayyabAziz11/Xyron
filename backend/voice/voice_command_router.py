@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 import requests
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_BASE = "http://localhost:8000"
+DEFAULT_API_BASE = os.getenv("XYRON_API_BASE", "http://localhost:8000")
 
 
 class VoiceCommandRouter:

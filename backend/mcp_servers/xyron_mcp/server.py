@@ -35,6 +35,7 @@ Register in Claude CLI (~/.claude/mcp_config.json):
     }
 """
 
+import os
 import sys
 import json
 import signal
@@ -52,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xyron_mcp")
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = os.getenv("XYRON_BACKEND_URL", "http://localhost:8000")
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────

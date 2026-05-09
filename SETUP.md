@@ -57,6 +57,12 @@ SCREEN_CONTEXT_INTERVAL=300
 # Cost caps
 XYRON_MAX_GPT4O_PER_HOUR=0
 XYRON_MAX_MINI_PER_HOUR=200
+
+# Cross-machine overrides (optional — defaults work for single-machine setups)
+# XYRON_API_BASE=http://localhost:8000       # change if backend runs on a different host/port
+# XYRON_BACKEND_URL=http://localhost:8000   # used by the MCP server
+# OLLAMA_API_URL=http://localhost:11434/api/generate  # change if Ollama runs elsewhere
+# FS_SCAN_ROOTS=/home/user,/data            # comma-separated paths to index (WSL2: auto-detects /mnt/d-g)
 ```
 
 ---

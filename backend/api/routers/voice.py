@@ -1184,7 +1184,7 @@ _MEETING_STOP_RE    = re.compile(r"stop\s+(?:meeting|recording|transcrib)", re.I
 _MEETING_SUMMARY_RE = re.compile(r"summarize\s+(?:what\s+was\s+said|the\s+meeting|meeting\s+so\s+far)", re.IGNORECASE)
 
 # ── Ollama fallback (Feature #8) ─────────────────────────────────────────────
-_OLLAMA_URL = "http://localhost:11434/api/generate"
+_OLLAMA_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 _OLLAMA_MODEL = "llama3"
 
 _VOICE_SYSTEM_PROMPT = (
@@ -3579,8 +3579,9 @@ async def respond_stream(body: _RespondStreamBody):
                     if tool_name == "_reminder_create":
                         try:
                             import httpx
+                            _api_base = os.getenv("XYRON_API_BASE", "http://localhost:8000")
                             r = httpx.post(
-                                "http://localhost:8000/api/v1/reminders",
+                                f"{_api_base}/api/v1/reminders",
                                 json={"text": tool_params.get("text", body.text)},
                                 timeout=5,
                             )
