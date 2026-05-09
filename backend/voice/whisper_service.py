@@ -294,8 +294,7 @@ def verify_wake_phrase(pcm: np.ndarray) -> tuple[bool, str]:
             pcm,
             beam_size=1,
             language="en",
-            vad_filter=True,                      # trim silence → focus on actual speech
-            vad_parameters={"min_silence_duration_ms": 100},
+            vad_filter=False,                     # window is already 2.56s — VAD strips inter-word gaps on WSL2 audio
             temperature=0.0,
             condition_on_previous_text=False,
             without_timestamps=True,
