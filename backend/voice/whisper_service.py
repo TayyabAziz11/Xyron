@@ -239,14 +239,15 @@ _WAKE_INITIAL_PROMPT = "Hey Xyron. Wakeup Xyron. Hi Xyron. Okay Xyron. Yo Xyron.
 # Keyword set: exact spellings + common Whisper misreadings of wake phonemes.
 #   "hey"   → "he", "he's", "hay"
 #   "xyron" → "zairan", "zahra", "zairon", "siren", "cyron", "iron", "zero"
-_WAKE_KEYWORDS: frozenset[str] = frozenset({
+# Name tokens — at least one of these MUST appear in the transcript for a match.
+# Prefix words ('hey', 'hi', 'ok') are intentionally excluded: they appear in
+# normal speech constantly and cause false positives when checked in isolation.
+_WAKE_NAMES: frozenset[str] = frozenset({
     'xyron', 'xeron', 'xiron', 'zyron',
-    'hey', 'hi', 'okay', 'ok', 'yo',
-    'wakeup', 'wake',
+    'wakeup',
     'jarvis',
-    'zairan', 'zahra', 'zairon', 'ziren', 'siren', 'cyron', 'iron',
-    'xavier', 'zero', 'zara',
-    'he', "hes", 'hay',
+    'zairan', 'zahra', 'zairon', 'ziren', 'siren', 'cyron',
+    'xavier', 'zero',
 })
 
 
@@ -283,7 +284,7 @@ def verify_wake_phrase(pcm: np.ndarray) -> tuple[bool, str]:
         words = set(
             w.strip(".,!?'\"").replace("'", "") for w in transcript.split()
         )
-        matched = bool(words & _WAKE_KEYWORDS)
+        matched = bool(words & _WAKE_NAMES)
         logger.info("[Whisper/wake] transcript=%r matched=%s", transcript[:80], matched)
         return matched, transcript
     except Exception as exc:
