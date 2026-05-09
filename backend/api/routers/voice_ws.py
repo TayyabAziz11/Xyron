@@ -152,10 +152,16 @@ async def ws_wake(websocket: WebSocket) -> None:
                     # we send the wake event to the frontend.
                     clip = np.concatenate(list(audio_buf))
                     try:
-                        from voice.whisper_service import verify_wake_phrase
-                        matched, transcript = await loop.run_in_executor(
-                            None, verify_wake_phrase, clip
-                        )
+                        from voice.whisper_service import verify_wake_phrase, _model_ready
+                        # If Whisper is still loading (startup warmup), skip verification
+                        # and fail open — don't block or double-load the model.
+                        if not _model_ready.is_set():
+                            logger.info("[WS/wake] Whisper not ready yet — skipping verification, failing open")
+                            matched, transcript = True, ""
+                        else:
+                            matched, transcript = await loop.run_in_executor(
+                                None, verify_wake_phrase, clip
+                            )
                     except Exception as exc:
                         logger.warning("[WS/wake] Whisper verify error: %s — failing open", exc)
                         matched, transcript = True, ""

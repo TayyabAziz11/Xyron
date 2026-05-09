@@ -75,7 +75,11 @@ def _apply_corrections(text: str) -> str:
         text = pattern.sub(repl, text)  # type: ignore[arg-type]
     return text.strip()
 
-_model = None
+import threading as _threading
+
+_model       = None
+_model_lock  = _threading.Lock()
+_model_ready = _threading.Event()   # set once the model is fully loaded and usable
 
 
 # ── Hardware detection ────────────────────────────────────────────────────────
@@ -98,12 +102,30 @@ def _detect_device() -> tuple[str, str]:
 
 def _get_model():
     global _model
-    if _model is None:
+    # Fast path — model already loaded, no lock needed.
+    if _model is not None:
+        return _model
+    # Slow path — first caller loads; concurrent callers block until done.
+    with _model_lock:
+        if _model is not None:      # re-check after acquiring lock (double-checked locking)
+            return _model
         from faster_whisper import WhisperModel
         device, compute_type = _detect_device()
         logger.info("[Whisper] Loading '%s' on %s (%s)…", _MODEL_SIZE, device, compute_type)
-        _model = WhisperModel(_MODEL_SIZE, device=device, compute_type=compute_type)
+        try:
+            _model = WhisperModel(_MODEL_SIZE, device=device, compute_type=compute_type)
+        except Exception as exc:
+            if device == "cuda":
+                logger.warning(
+                    "[Whisper] GPU load failed (%s) — falling back to CPU int8. "
+                    "Fix: echo '/usr/lib/wsl/lib' | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf && sudo ldconfig",
+                    exc,
+                )
+                _model = WhisperModel(_MODEL_SIZE, device="cpu", compute_type="int8")
+            else:
+                raise
         logger.info("[Whisper] Model ready.")
+        _model_ready.set()          # unblock any callers waiting on the ready gate
     return _model
 
 
@@ -119,6 +141,7 @@ def set_model_size(size: str) -> None:
     """Hot-swap model size — reloads on next transcription call."""
     global _model, _MODEL_SIZE
     _model = None
+    _model_ready.clear()    # reset gate so callers wait for the new model to load
     _MODEL_SIZE = size
     logger.info("[Whisper] Model size set to '%s'", size)
 
