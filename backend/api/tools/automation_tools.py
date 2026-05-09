@@ -339,7 +339,7 @@ def _exec_run_workflow(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResul
         return ToolResult(success=False, text="Workflow name required.", spoken="Which workflow should I run?")
 
     try:
-        from ..services.workflow_service import workflow_service
+        from ..services.automation_workflow_service import automation_workflow_service as workflow_service
         result = workflow_service.execute(name, variables, ctx)
         return ToolResult(
             success=result.get("success", False),

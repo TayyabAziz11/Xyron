@@ -350,6 +350,39 @@ Check CORS — backend must be on port 8000, frontend on 3001. Both must be runn
 
 ---
 
+## WSL2 Memory Cap (required if RAM usage hits 90%+)
+
+By default WSL2 can consume all available RAM. Xyron loads Whisper (float16) + Kokoro ONNX + 3 wake word models + sentence-transformers simultaneously — this easily hits 12–15 GB. Without a cap, Windows starts swapping and everything slows to a crawl.
+
+Add this file on **Windows** (not WSL2):
+
+**File:** `C:\Users\<YourWindowsUsername>\.wslconfig`
+
+```ini
+[wsl2]
+memory=10GB
+processors=4
+swap=4GB
+```
+
+Adjust `memory` based on your total RAM:
+
+| Total RAM | Set memory= |
+|-----------|------------|
+| 16 GB | 10GB |
+| 32 GB | 20GB |
+| 8 GB | 6GB |
+
+After creating/editing the file, restart WSL2 from PowerShell:
+
+```powershell
+wsl --shutdown
+```
+
+Then reopen your WSL2 terminal. RAM usage will now stay within the cap.
+
+---
+
 ## Desktop App (optional)
 
 ```bash
