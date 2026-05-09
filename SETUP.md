@@ -4,26 +4,96 @@ Everything you need to run Xyron that isn't in the repo (large model files, syst
 
 ---
 
-## Prerequisites
+## Already Running? — Pull Latest Updates
 
-| Tool | Version | Install |
-|------|---------|---------|
-| Python | 3.10+ | [python.org](https://python.org) |
-| Node.js | 18+ | [nodejs.org](https://nodejs.org) |
-| CUDA Toolkit | 11.8+ (optional, for GPU) | [nvidia.com](https://developer.nvidia.com/cuda-downloads) |
-| espeak-ng | any | `sudo apt-get install espeak-ng` |
-| ffmpeg | any | `sudo apt-get install ffmpeg` |
+If you already have the project cloned and running (like Qasim), do this every time Tayyab pushes fixes:
+
+```bash
+cd Xyron
+git pull origin main
+```
+
+Then restart the backend:
+
+```bash
+cd backend
+source .venv/bin/activate
+python3 -m uvicorn api.main:app --reload --port 8000
+```
+
+That's it — no reinstall needed unless `requirements.txt` changed (check with `git diff HEAD~1 requirements.txt`).
+
+### First pull after May 9, 2026? — One extra step
+
+The Kokoro TTS model path changed. Run this once to put the model in the right place:
+
+```bash
+cd backend
+source .venv/bin/activate
+python3 -c "
+import os, shutil
+from huggingface_hub import hf_hub_download
+model  = hf_hub_download('hexgrad/Kokoro-82M-ONNX', 'kokoro-v1.0.onnx')
+voices = hf_hub_download('hexgrad/Kokoro-82M-ONNX', 'voices-v1.0.bin')
+dest   = os.path.expanduser('~/.xyron/models')
+os.makedirs(dest, exist_ok=True)
+shutil.copy(model, dest)
+shutil.copy(voices, dest)
+print('Kokoro ready:', os.listdir(dest))
+"
+```
+
+You should see `['kokoro-v1.0.onnx', 'voices-v1.0.bin']` printed. After that, restart the backend and Kokoro TTS will work.
 
 ---
 
-## 1. Clone & Backend Setup
+## Fresh Machine — Full Setup Checklist
+
+Follow these steps **in order**. Each step must succeed before moving to the next.
+
+- [ ] Step 1 — System dependencies
+- [ ] Step 2 — Clone repo and Python environment
+- [ ] Step 3 — Environment file (`.env`)
+- [ ] Step 4 — GPU setup (WSL2 only, skip if no GPU)
+- [ ] Step 5 — Kokoro TTS model download
+- [ ] Step 6 — Wake word models
+- [ ] Step 7 — Web dashboard
+- [ ] Step 8 — Start everything and verify
+
+---
+
+## Step 1 — System Dependencies
+
+```bash
+sudo apt-get update
+sudo apt-get install -y espeak-ng ffmpeg
+```
+
+| Tool | Version | Install |
+|------|---------|---------|
+| Python | 3.10+ | `sudo apt-get install python3 python3-venv` |
+| Node.js | 18+ | [nodejs.org](https://nodejs.org) or `sudo apt-get install nodejs npm` |
+| espeak-ng | any | `sudo apt-get install espeak-ng` |
+| ffmpeg | any | `sudo apt-get install ffmpeg` |
+
+Verify:
+```bash
+python3 --version   # 3.10+
+node --version      # 18+
+ffmpeg -version     # any
+espeak-ng --version # any
+```
+
+---
+
+## Step 2 — Clone & Backend Setup
 
 ```bash
 git clone https://github.com/TayyabAziz11/Xyron.git
 cd Xyron/backend
 
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
 pip install -r requirements.txt
 pip install openwakeword            # wake word detection (not in requirements.txt)
@@ -32,9 +102,9 @@ playwright install chromium         # browser control feature
 
 ---
 
-## 2. Environment File
+## Step 3 — Environment File
 
-Create `backend/.env` (copy this and fill in your keys):
+Create `backend/.env` — copy this exactly and fill in your `OPENAI_API_KEY`:
 
 ```env
 OPENAI_API_KEY=sk-...              # Required — get from platform.openai.com
@@ -57,100 +127,157 @@ SCREEN_CONTEXT_INTERVAL=300
 # Cost caps
 XYRON_MAX_GPT4O_PER_HOUR=0
 XYRON_MAX_MINI_PER_HOUR=200
+
+# Cross-machine overrides (optional — defaults work for single-machine setups)
+# XYRON_API_BASE=http://localhost:8000       # change if backend runs on a different host/port
+# XYRON_BACKEND_URL=http://localhost:8000    # used by the MCP server
+# OLLAMA_API_URL=http://localhost:11434/api/generate  # change if Ollama runs elsewhere
+# FS_SCAN_ROOTS=/home/user,/data            # comma-separated paths to index (WSL2: auto-detects /mnt/d-g)
+```
+
+No GPU? Change `ONNX_PROVIDER=CPUExecutionProvider` — everything still works, just slower.
+
+---
+
+## Step 4 — GPU Setup (WSL2 with NVIDIA GPU only)
+
+Skip this step if you have no GPU or are on native Linux/Mac — Xyron falls back to CPU automatically.
+
+### 4a — Register CUDA libraries
+
+```bash
+echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf
+sudo ldconfig
+
+# Verify libcuda is visible
+ldconfig -p | grep libcuda
+```
+
+### 4b — Install cuBLAS (required for Whisper GPU inference)
+
+```bash
+ldconfig -p | grep libcublas
+```
+
+If `libcublas.so.12` is **not listed**:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libcublas-12-0
+sudo ldconfig
+ldconfig -p | grep libcublas   # should now show libcublas.so.12
+```
+
+If `libcublas-12-0` is not found in apt, add the NVIDIA repo first:
+
+```bash
+# Ubuntu 22.04 — change ubuntu2204 → ubuntu2004 if on 20.04
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install -y libcublas-12-0
+sudo ldconfig
+```
+
+Or install the full CUDA toolkit (includes everything):
+
+```bash
+sudo apt-get install -y cuda-toolkit-12-0
+sudo ldconfig
+```
+
+### 4c — Install GPU ONNX runtime
+
+```bash
+pip uninstall onnxruntime -y
+pip install onnxruntime-gpu
+
+# Verify
+python3 -c "import onnxruntime; print(onnxruntime.get_available_providers())"
+# Should include: CUDAExecutionProvider
+```
+
+### 4d — Verify GPU is detected
+
+```bash
+python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Should print: True  NVIDIA <your GPU name>
+```
+
+When working, the backend logs will show:
+```
+[Whisper] GPU detected: NVIDIA <GPU> — using float16
+[Whisper] Model ready.
 ```
 
 ---
 
-## 3. Model Files (not in repo — too large for GitHub)
+## Step 5 — Kokoro TTS Model
 
-### Kokoro TTS — auto-downloads on first run
-
-Kokoro is the local text-to-speech engine. It downloads itself automatically from HuggingFace the first time the backend starts — no manual step needed.
-
-- **Model**: `hexgrad/Kokoro-82M-ONNX` (~100 MB total)
-- **Cached to**: `~/.cache/huggingface/hub/`
-- **Requires internet** on first boot, then works fully offline
-
-If the auto-download is slow or rate-limited, set `HF_TOKEN` in your `.env` or manually download:
+Kokoro is the local TTS engine. Download its model files into `~/.xyron/models/`:
 
 ```bash
-pip install huggingface_hub
+cd backend
+source .venv/bin/activate
+
 python3 -c "
+import os, shutil
 from huggingface_hub import hf_hub_download
-hf_hub_download('hexgrad/Kokoro-82M-ONNX', 'kokoro-v0_19.onnx')
-hf_hub_download('hexgrad/Kokoro-82M-ONNX', 'voices.bin')
+model  = hf_hub_download('hexgrad/Kokoro-82M-ONNX', 'kokoro-v1.0.onnx')
+voices = hf_hub_download('hexgrad/Kokoro-82M-ONNX', 'voices-v1.0.bin')
+dest   = os.path.expanduser('~/.xyron/models')
+os.makedirs(dest, exist_ok=True)
+shutil.copy(model, dest)
+shutil.copy(voices, dest)
+print('Kokoro ready:', os.listdir(dest))
 "
 ```
 
-### Whisper STT — auto-downloads on first run
+Expected output: `Kokoro ready: ['kokoro-v1.0.onnx', 'voices-v1.0.bin']`
 
-Faster-Whisper downloads the speech recognition model automatically on first use.
+Downloads ~100 MB on first run, cached afterwards. Kokoro works fully offline after this.
 
-- **Default model**: `small` (~500 MB) — good balance of speed/accuracy
-- **Cached to**: `~/.cache/huggingface/hub/`
-- To use a different size, set `WHISPER_MODEL=medium` (or `tiny`, `base`, `large`) in `.env`
+**Whisper STT** (`~500 MB`) downloads automatically on first voice use — no manual step needed.
 
-### Wake Word Models — auto-downloads on first run
+---
 
-OpenWakeWord downloads its base models (embedding + `hey_jarvis`) automatically.
+## Step 6 — Wake Word Models
 
-- **Custom Xyron wake models**: stored in `~/.xyron/wake_models/`
-- The trained `.onnx` files for "Hey Xyron" are **not in the repo** — ask Tayyab to share them, or use the default `hey_jarvis` wake word until you train your own.
-- To skip custom models and use `hey_jarvis`, leave `WAKE_MODELS_DIR` unset in `.env`
+### Default (no files needed)
 
-#### Using the default wake word (no custom model needed)
+OpenWakeWord downloads `hey_jarvis` automatically via `pip install openwakeword`. Just say **"Hey Jarvis"** to activate.
 
-The system falls back to `hey_jarvis` automatically if `~/.xyron/wake_models/` is empty or missing. Just say "Hey Jarvis" to activate.
+### Custom "Hey Xyron" models (get from Tayyab via USB)
 
-#### Getting the custom "Hey Xyron" models
+Tayyab will share 3 files. Place them here:
 
-Tayyab has already shared 3 files with you via USB. You need to place them in the right location inside WSL2.
-
-**The 3 files you received:**
-```
-hey_xyron.onnx
-wakeup_xyron.onnx
-xyron.onnx
-```
-
-**Step 1 — Create the folder in WSL2:**
+**Step 6a — Create the folder:**
 ```bash
 mkdir -p ~/.xyron/wake_models
 ```
 
-**Step 2 — Copy the files from your USB into WSL2.**
+**Step 6b — Copy from USB.**
+In WSL2, Windows drives appear as `/mnt/<letter>` — so USB drive `D:` = `/mnt/d`, `E:` = `/mnt/e`, etc.
 
-First find your USB drive letter (e.g. `D:`, `E:`, `F:`). In WSL2, Windows drives are mounted under `/mnt/` — so `D:` becomes `/mnt/d`, `E:` becomes `/mnt/e`, etc.
-
-If your USB is drive `D:` and the files are in a folder called `wake_models_xyron` on it:
 ```bash
+# Replace /mnt/d/wake_models_xyron with your actual USB path
 cp /mnt/d/wake_models_xyron/*.onnx ~/.xyron/wake_models/
 ```
 
-Adjust the drive letter and folder name to match where you put them on the USB.
-
-**Step 3 — Verify the files are in place:**
+**Step 6c — Verify:**
 ```bash
 ls -lh ~/.xyron/wake_models/
+# Should show: hey_xyron.onnx  wakeup_xyron.onnx  xyron.onnx
 ```
 
-You should see all 3 files:
+When loaded correctly, the backend logs show:
 ```
-hey_xyron.onnx
-wakeup_xyron.onnx
-xyron.onnx
+[WakeWord] Ready — models: hey_xyron(0.72)  wakeup_xyron(0.88)  xyron(0.78)  hey_jarvis(0.80)
 ```
-
-**Step 4 — Restart the backend.** You should now see in the logs:
-```
-[WakeWord] Ready — models: hey_xyron(0.72)  wakeup_xyron(0.50)  xyron(0.65)  hey_jarvis(0.80)
-```
-
-You can now say **"Hey Xyron"** to activate instead of "Hey Jarvis".
 
 ---
 
-## 4. Web Dashboard
+## Step 7 — Web Dashboard
 
 ```bash
 cd web
@@ -160,200 +287,88 @@ npm run dev          # runs on http://localhost:3001
 
 ---
 
-## 5. Desktop App (optional)
+## Step 8 — Start Everything and Verify
 
-```bash
-cd desktop-app
-npm install
-
-npm run dev:wsl      # WSL2 (sets up audio correctly)
-npm run dev          # native Linux / Mac
-```
-
----
-
-## 6. Run the Backend
-
+**Terminal 1 — Backend:**
 ```bash
 cd backend
 source .venv/bin/activate
 python3 -m uvicorn api.main:app --reload --port 8000
 ```
 
-First boot will take 30–60 seconds while Whisper and Kokoro download their models. After that, startup is instant.
+First boot: 30–60 seconds while Whisper downloads. After that, instant startup.
 
----
-
-## 7. Verify Everything Works
-
+**Terminal 2 — Web dashboard:**
 ```bash
-# Health check
-curl http://localhost:8000/api/v1/system/health
+cd web
+npm run dev
+```
 
-# List all registered tools
-curl http://localhost:8000/api/v1/system/registered-tools
+**Health check:**
+```bash
+curl http://localhost:8000/api/v1/system/health
 ```
 
 Open `http://localhost:3001/app/command-center` in your browser and tap the orb — it should start listening.
 
----
-
-## GPU Setup (optional but recommended)
-
-Xyron auto-detects your GPU on startup and shifts Whisper and the wake word models to it automatically — no code changes needed. When working correctly you'll see this in the backend logs:
-
+**Expected backend logs on healthy startup:**
 ```
-[Whisper] GPU detected: NVIDIA RTX A2000 — using float16
+[Whisper] GPU detected: NVIDIA <GPU> — using float16   (or: No CUDA — using CPU int8)
 [Whisper] Loading 'small' on cuda (float16)…
 [Whisper] Model ready.
-[Warmup] Whisper ready — device=cuda compute=float16
+[TTS] Kokoro loaded on CUDAExecutionProvider — 54 voices
+[WakeWord] Ready — models: hey_xyron(0.72)  wakeup_xyron(0.88)  xyron(0.78)  hey_jarvis(0.80)
 ```
-
-The RTX A2000 is fully supported and will run everything on float16 out of the box. If you see `cpu` instead of `cuda`, follow the steps below.
-
-### Step 1 — Install CUDA Toolkit
-
-Download and install from [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads). Version 11.8 or newer.
-
-After install, verify:
-```bash
-nvidia-smi        # should show your GPU and driver version
-nvcc --version    # should show CUDA version
-```
-
-### Step 2 — Register CUDA libraries (WSL2 only)
-
-On WSL2, CUDA libraries are installed on Windows but need to be registered inside the Linux environment:
-
-```bash
-# Register the WSL CUDA lib dir with the dynamic linker
-echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf
-sudo ldconfig
-
-# Verify libcuda is visible
-ldconfig -p | grep libcuda
-```
-
-Then check that **cuBLAS** is also present — Whisper needs it for actual inference:
-
-```bash
-ldconfig -p | grep libcublas
-```
-
-If `libcublas.so.12` is **not listed**, install it:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y libcublas-12-0
-sudo ldconfig
-
-# Confirm
-ldconfig -p | grep libcublas
-```
-
-If `libcublas-12-0` isn't found in apt, add the NVIDIA CUDA apt repo first:
-
-```bash
-# For Ubuntu 22.04 (change ubuntu2204 → ubuntu2004 if on 20.04)
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt-get update
-sudo apt-get install -y libcublas-12-0
-sudo ldconfig
-```
-
-Alternatively, install the full CUDA 12 toolkit (includes cuBLAS and everything else):
-
-```bash
-sudo apt-get install -y cuda-toolkit-12-0
-sudo ldconfig
-```
-
-After installing, **restart the backend** — Whisper will pick up the new libs on startup.
-
-### Step 3 — Install GPU-enabled ONNX runtime
-
-```bash
-pip uninstall onnxruntime -y
-pip install onnxruntime-gpu
-
-# Verify CUDA provider is available
-python3 -c "import onnxruntime; print(onnxruntime.get_available_providers())"
-# Should include: CUDAExecutionProvider
-```
-
-### Step 4 — Set `.env`
-
-```env
-ONNX_PROVIDER=CUDAExecutionProvider
-```
-
-This is already the default in the template above. If you don't have a GPU, change it to `CPUExecutionProvider`.
-
-### What shifts to GPU automatically
-
-| Component | GPU benefit |
-|-----------|-------------|
-| Whisper STT | float16 inference — ~3–5× faster transcription |
-| Wake word (OWW) | ONNX models run on CUDA — lower latency per frame |
-| Kokoro TTS | CPU-only (ONNX CPU is fast enough for TTS) |
-
-### Troubleshooting
-
-**Error: `Library libcublas.so.12 is not found or cannot be loaded`**
-
-This is the most common GPU issue on WSL2. It means your CUDA driver is present (so Whisper says "GPU detected") but the cuBLAS compute library is missing. Whisper transcribes nothing and the voice session silently breaks.
-
-Fix (run in WSL2 terminal):
-
-```bash
-# 1. Register WSL CUDA libs
-echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf
-sudo ldconfig
-
-# 2. Check if cuBLAS is now found
-ldconfig -p | grep libcublas
-
-# 3. If still missing — install it
-sudo apt-get update
-sudo apt-get install -y libcublas-12-0
-sudo ldconfig
-
-# 4. Confirm
-ldconfig -p | grep libcublas   # should show libcublas.so.12
-```
-
-Then restart the backend. You should now see `cuda (float16)` in startup logs.
 
 ---
 
-**Wake word: "Hey Xyron" doesn't trigger — only "Hey Jarvis" works**
+## Troubleshooting
 
-The 3 custom model files (`hey_xyron.onnx`, `wakeup_xyron.onnx`, `xyron.onnx`) are not in the repo. They need to be placed manually. See the **"Getting the custom Hey Xyron models"** section above under Model Files — it has the exact step-by-step copy commands for WSL2.
+**`Library libcublas.so.12 is not found`**
+Whisper detected your GPU but cuBLAS isn't installed. Follow Step 4b above.
 
-Until the files are in place, say **"Hey Jarvis"** — it works out of the box.
+**Wake word fires on background noise / "Hi" triggers it**
+Pull latest — this was fixed. `git pull && restart backend`.
+
+**Kokoro TTS always falls back to edge-tts**
+Run the Step 5 download script. The model files are missing from `~/.xyron/models/`.
+
+**Whisper returns Hindi or Portuguese garbage**
+Pull latest — this was fixed (language filter added). `git pull && restart backend`.
+
+**"Hey Xyron" doesn't trigger — only "Hey Jarvis" works**
+The `.onnx` files aren't in `~/.xyron/wake_models/`. Follow Step 6.
+
+**Still seeing `cpu` after GPU setup:**
+```bash
+python3 -c "import torch; print(torch.cuda.is_available())"
+```
+If `False`: check you're on WSL2 (not WSL1) and your Windows NVIDIA driver is 525+.
+
+**Frontend orb doesn't respond to voice:**
+Check CORS — backend must be on port 8000, frontend on 3001. Both must be running.
 
 ---
 
-**Still seeing `cpu` in logs after setup:**
+## Desktop App (optional)
 
 ```bash
-# Check that PyTorch can see CUDA (Whisper device detection uses torch)
-python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+cd desktop-app
+npm install
+npm run dev:wsl      # WSL2
+npm run dev          # native Linux / Mac
 ```
-
-If this returns `False`, your CUDA installation or WSL2 GPU passthrough isn't configured correctly. Check that you're running WSL2 (not WSL1) and that your Windows NVIDIA driver is up to date (525+).
 
 ---
 
-## Summary — What Downloads Automatically vs. What You Need Manually
+## What's Automatic vs. Manual
 
-| Component | Auto-download | Manual step |
-|-----------|--------------|-------------|
-| Kokoro TTS model (~100 MB) | Yes, on first backend start | None (or set HF_TOKEN) |
-| Whisper `small` model (~500 MB) | Yes, on first voice use | None |
-| OpenWakeWord base models | Yes, via `openwakeword` package | `pip install openwakeword` |
-| "Hey Xyron" custom wake models | **No** | Get from Tayyab → `~/.xyron/wake_models/` |
+| Component | Auto | Manual |
+|-----------|------|--------|
+| Whisper STT model (~500 MB) | Yes — first voice use | Nothing |
+| OpenWakeWord base (`hey_jarvis`) | Yes — via pip | `pip install openwakeword` |
+| Kokoro TTS model (~100 MB) | **No** | Run Step 5 script |
+| "Hey Xyron" wake models | **No** | Get from Tayyab → Step 6 |
 | Python packages | No | `pip install -r requirements.txt` |
-| Node packages | No | `npm install` in `web/` and `desktop-app/` |
-| `espeak-ng` | No | `sudo apt-get install espeak-ng` |
+| Node packages | No | `npm install` in `web/` |
+| espeak-ng / ffmpeg | No | `sudo apt-get install` |

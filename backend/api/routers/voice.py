@@ -213,10 +213,19 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             segments, info = model.transcribe(
                 str(tmp_path),
                 beam_size=5,
+                language="en",          # force English — prevents Hindi/Portuguese hallucination from TTS echo bleed
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
+            # Hallucination guard: non-English with low confidence = TTS echo or ambient noise.
+            # Machines without hardware echo cancellation (WSL2, USB mics) are most affected.
+            if info.language not in ("en", "ur") and info.language_probability < 0.80:
+                logger.info(
+                    "Whisper hallucination guard: lang=%s prob=%.2f — returning empty",
+                    info.language, info.language_probability,
+                )
+                return {"success": True, "data": {"text": "", "language": "en", "engine": "local"}}
             logger.info("Local Whisper: %r", text[:60])
             return {"success": True, "data": {"text": text, "language": info.language, "engine": "local"}}
         finally:
@@ -1175,7 +1184,7 @@ _MEETING_STOP_RE    = re.compile(r"stop\s+(?:meeting|recording|transcrib)", re.I
 _MEETING_SUMMARY_RE = re.compile(r"summarize\s+(?:what\s+was\s+said|the\s+meeting|meeting\s+so\s+far)", re.IGNORECASE)
 
 # ── Ollama fallback (Feature #8) ─────────────────────────────────────────────
-_OLLAMA_URL = "http://localhost:11434/api/generate"
+_OLLAMA_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 _OLLAMA_MODEL = "llama3"
 
 _VOICE_SYSTEM_PROMPT = (
@@ -3570,8 +3579,9 @@ async def respond_stream(body: _RespondStreamBody):
                     if tool_name == "_reminder_create":
                         try:
                             import httpx
+                            _api_base = os.getenv("XYRON_API_BASE", "http://localhost:8000")
                             r = httpx.post(
-                                "http://localhost:8000/api/v1/reminders",
+                                f"{_api_base}/api/v1/reminders",
                                 json={"text": tool_params.get("text", body.text)},
                                 timeout=5,
                             )

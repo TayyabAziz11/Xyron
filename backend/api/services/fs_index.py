@@ -29,13 +29,15 @@ logger = logging.getLogger(__name__)
 DB_DIR = Path.home() / ".ai-operator"
 DB_PATH = DB_DIR / "fs_index.db"
 
-SCAN_ROOTS: List[Path] = [
-    Path("/mnt/d"),
-    Path("/mnt/e"),
-    Path("/mnt/f"),
-    Path("/mnt/g"),
-    Path.home(),
-]
+# Build scan roots from env var or fall back to sensible defaults.
+# On WSL2, Windows drives appear as /mnt/d, /mnt/e etc — include only those that exist.
+# On native Linux/macOS, only ~/ is used unless FS_SCAN_ROOTS overrides.
+_env_roots = os.getenv("FS_SCAN_ROOTS", "")
+if _env_roots:
+    SCAN_ROOTS: List[Path] = [Path(p.strip()) for p in _env_roots.split(",") if p.strip()]
+else:
+    _candidates = [Path("/mnt/d"), Path("/mnt/e"), Path("/mnt/f"), Path("/mnt/g")]
+    SCAN_ROOTS = [p for p in _candidates if p.exists()] + [Path.home()]
 
 PRUNE_DIRS = {
     "node_modules",
