@@ -213,10 +213,19 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             segments, info = model.transcribe(
                 str(tmp_path),
                 beam_size=5,
+                language="en",          # force English — prevents Hindi/Portuguese hallucination from TTS echo bleed
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
+            # Hallucination guard: non-English with low confidence = TTS echo or ambient noise.
+            # Machines without hardware echo cancellation (WSL2, USB mics) are most affected.
+            if info.language not in ("en", "ur") and info.language_probability < 0.80:
+                logger.info(
+                    "Whisper hallucination guard: lang=%s prob=%.2f — returning empty",
+                    info.language, info.language_probability,
+                )
+                return {"success": True, "data": {"text": "", "language": "en", "engine": "local"}}
             logger.info("Local Whisper: %r", text[:60])
             return {"success": True, "data": {"text": text, "language": info.language, "engine": "local"}}
         finally:

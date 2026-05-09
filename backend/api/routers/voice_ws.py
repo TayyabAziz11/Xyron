@@ -307,14 +307,23 @@ async def ws_session(websocket: WebSocket) -> None:
 
     # ── Instant "Yes?" ACK ────────────────────────────────────────────────────
     ack_path = Path("/tmp/xyron-ack/on_it.wav")
+    ack_has_audio = False
     if ack_path.exists():
         try:
             ack_b64 = base64.b64encode(ack_path.read_bytes()).decode()
             await _send(websocket, {"type": "ack", "text": "Yes?", "audio": ack_b64})
+            ack_has_audio = True
         except Exception:
             pass
-    else:
+    if not ack_has_audio:
         await _send(websocket, {"type": "ack", "text": "Yes?"})
+
+    # Post-TTS deaf window: give the client time to finish playing the ack audio
+    # before we start recording. Without this, machines with no hardware echo
+    # cancellation (WSL2, USB mics) pick up the ack TTS in the mic and send it
+    # to Whisper, causing hallucinated transcriptions.
+    if ack_has_audio:
+        await asyncio.sleep(1.2)
 
     await _send(websocket, {"type": "listening"})
 
