@@ -104,13 +104,49 @@ The system falls back to `hey_jarvis` automatically if `~/.xyron/wake_models/` i
 
 #### Getting the custom "Hey Xyron" models
 
-Ask Tayyab to share the `~/.xyron/wake_models/` directory (contains `.onnx` files ~1–5 MB each). Place them at:
+Tayyab has already shared 3 files with you via USB. You need to place them in the right location inside WSL2.
 
+**The 3 files you received:**
 ```
-~/.xyron/wake_models/hey_xyron.onnx
-~/.xyron/wake_models/wakeup_xyron.onnx
-# etc.
+hey_xyron.onnx
+wakeup_xyron.onnx
+xyron.onnx
 ```
+
+**Step 1 — Create the folder in WSL2:**
+```bash
+mkdir -p ~/.xyron/wake_models
+```
+
+**Step 2 — Copy the files from your USB into WSL2.**
+
+First find your USB drive letter (e.g. `D:`, `E:`, `F:`). In WSL2, Windows drives are mounted under `/mnt/` — so `D:` becomes `/mnt/d`, `E:` becomes `/mnt/e`, etc.
+
+If your USB is drive `D:` and the files are in a folder called `wake_models_xyron` on it:
+```bash
+cp /mnt/d/wake_models_xyron/*.onnx ~/.xyron/wake_models/
+```
+
+Adjust the drive letter and folder name to match where you put them on the USB.
+
+**Step 3 — Verify the files are in place:**
+```bash
+ls -lh ~/.xyron/wake_models/
+```
+
+You should see all 3 files:
+```
+hey_xyron.onnx
+wakeup_xyron.onnx
+xyron.onnx
+```
+
+**Step 4 — Restart the backend.** You should now see in the logs:
+```
+[WakeWord] Ready — models: hey_xyron(0.72)  wakeup_xyron(0.50)  xyron(0.65)  hey_jarvis(0.80)
+```
+
+You can now say **"Hey Xyron"** to activate instead of "Hey Jarvis".
 
 ---
 
@@ -190,16 +226,50 @@ nvcc --version    # should show CUDA version
 On WSL2, CUDA libraries are installed on Windows but need to be registered inside the Linux environment:
 
 ```bash
-# Find where libcuda.so lives (path may vary by driver version)
-find /usr/lib/wsl -name "libcuda.so*" 2>/dev/null
-
-# Create the ldconfig entry
+# Register the WSL CUDA lib dir with the dynamic linker
 echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf
 sudo ldconfig
 
-# Verify
+# Verify libcuda is visible
 ldconfig -p | grep libcuda
 ```
+
+Then check that **cuBLAS** is also present — Whisper needs it for actual inference:
+
+```bash
+ldconfig -p | grep libcublas
+```
+
+If `libcublas.so.12` is **not listed**, install it:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libcublas-12-0
+sudo ldconfig
+
+# Confirm
+ldconfig -p | grep libcublas
+```
+
+If `libcublas-12-0` isn't found in apt, add the NVIDIA CUDA apt repo first:
+
+```bash
+# For Ubuntu 22.04 (change ubuntu2204 → ubuntu2004 if on 20.04)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install -y libcublas-12-0
+sudo ldconfig
+```
+
+Alternatively, install the full CUDA 12 toolkit (includes cuBLAS and everything else):
+
+```bash
+sudo apt-get install -y cuda-toolkit-12-0
+sudo ldconfig
+```
+
+After installing, **restart the backend** — Whisper will pick up the new libs on startup.
 
 ### Step 3 — Install GPU-enabled ONNX runtime
 
@@ -230,7 +300,43 @@ This is already the default in the template above. If you don't have a GPU, chan
 
 ### Troubleshooting
 
+**Error: `Library libcublas.so.12 is not found or cannot be loaded`**
+
+This is the most common GPU issue on WSL2. It means your CUDA driver is present (so Whisper says "GPU detected") but the cuBLAS compute library is missing. Whisper transcribes nothing and the voice session silently breaks.
+
+Fix (run in WSL2 terminal):
+
+```bash
+# 1. Register WSL CUDA libs
+echo "/usr/lib/wsl/lib" | sudo tee /etc/ld.so.conf.d/wsl-cuda.conf
+sudo ldconfig
+
+# 2. Check if cuBLAS is now found
+ldconfig -p | grep libcublas
+
+# 3. If still missing — install it
+sudo apt-get update
+sudo apt-get install -y libcublas-12-0
+sudo ldconfig
+
+# 4. Confirm
+ldconfig -p | grep libcublas   # should show libcublas.so.12
+```
+
+Then restart the backend. You should now see `cuda (float16)` in startup logs.
+
+---
+
+**Wake word: "Hey Xyron" doesn't trigger — only "Hey Jarvis" works**
+
+The 3 custom model files (`hey_xyron.onnx`, `wakeup_xyron.onnx`, `xyron.onnx`) are not in the repo. They need to be placed manually. See the **"Getting the custom Hey Xyron models"** section above under Model Files — it has the exact step-by-step copy commands for WSL2.
+
+Until the files are in place, say **"Hey Jarvis"** — it works out of the box.
+
+---
+
 **Still seeing `cpu` in logs after setup:**
+
 ```bash
 # Check that PyTorch can see CUDA (Whisper device detection uses torch)
 python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
