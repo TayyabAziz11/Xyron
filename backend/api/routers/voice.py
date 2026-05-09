@@ -359,7 +359,7 @@ _KOKORO_VOICES: list[dict] = [
     {"id": "bm_lewis",   "label": "Lewis",   "group": "British Male",    "desc": "Smooth, confident"},
     {"id": "bm_daniel",  "label": "Daniel",  "group": "British Male",    "desc": "Calm, measured"},
 ]
-_KOKORO_MODELS_DIR = "/home/tayyab/.xyron/models"
+_KOKORO_MODELS_DIR = os.path.expanduser("~/.xyron/models")
 _kokoro_instance = None        # module-level singleton, lazy-loaded once
 _kokoro_lock = __import__("threading").Lock()
 
@@ -807,6 +807,12 @@ _PROFILE_SWITCH_RE = re.compile(
 # ── Takeover mode trigger ─────────────────────────────────────────────────────
 _TAKEOVER_TRIGGER_RE = re.compile(
     r'\b(?:takeover|take\s+over|take\s+control|focus\s+mode|workspace\s+mode|xyron\s+takeover|takeover\s+mode|work\s+mode|let[\'s]*\s+go|grind\s+mode|grind\s+time|time\s+to\s+grind|beast\s+mode)\b',
+    re.IGNORECASE,
+)
+
+# ── Stand-down / exit takeover trigger ───────────────────────────────────────
+_STANDDOWN_TRIGGER_RE = re.compile(
+    r'\b(?:stand\s+down|stand-down|exit\s+takeover|release\s+control|return\s+control|stop\s+takeover|deactivate|power\s+down|shut\s+down\s+takeover|end\s+takeover|xyron\s+stop|stop\s+it|that\'?s\s+enough)\b',
     re.IGNORECASE,
 )
 
@@ -2318,6 +2324,18 @@ async def respond_stream(body: _RespondStreamBody):
                 yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': confirm})}\n\n"
                 try:
                     _get_history().log(body.text, confirm, "takeover_mode", body.session_id)
+                except Exception:
+                    pass
+                return
+
+            # ── LAYER 0d3: Stand-down / exit takeover ────────────────────────
+            if _STANDDOWN_TRIGGER_RE.search(body.text.strip()):
+                confirm = "Control returned. Until next time."
+                yield f"data: {json.dumps({'type': 'action', 'tool': 'stand_down', 'params': {}, 'spoken': confirm})}\n\n"
+                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': confirm})}\n\n"
+                yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': confirm})}\n\n"
+                try:
+                    _get_history().log(body.text, confirm, "stand_down", body.session_id)
                 except Exception:
                     pass
                 return
