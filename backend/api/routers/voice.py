@@ -459,7 +459,13 @@ def _sanitize_tts_text(text: str) -> str:
     # Percentage
     text = _re.sub(r'(\d+)\s*%', r'\1 percent', text)
 
-    # Remove phonemizer-hostile characters, keep sentence punctuation
+    # Normalize unicode → ASCII where possible (smart quotes, em-dashes, etc.)
+    # then strip anything non-ASCII so espeak-ng phonemizer never sees it.
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+
+    # Remove remaining phonemizer-hostile characters, keep sentence punctuation
     text = _re.sub(r"[^\w\s.,!?'\-]", " ", text)
 
     # Collapse whitespace
