@@ -87,7 +87,14 @@ async def startup() -> None:
             k = _get_kokoro()
             if k is not None:
                 _kokoro_to_wav("Ready.", "nova", 1.0)
-                _l.info("[Warmup] Kokoro ready — provider=%s",
+                # Pre-synthesize all time-of-day boss greeting variants into the TTS cache.
+                # First user activation hits cache → instant response (no GPU cold-start wait).
+                for _tod in ("morning", "afternoon", "evening"):
+                    _kokoro_to_wav(
+                        f"Good {_tod}, boss. I'm Xyron, ready and at your service. Just give the word.",
+                        "onyx", 1.0,
+                    )
+                _l.info("[Warmup] Kokoro ready — provider=%s (greeting cache warm)",
                         _os.environ.get("ONNX_PROVIDER", "CPU"))
         except Exception as exc:
             _l.warning("[Warmup] Kokoro: %s", exc)
@@ -101,10 +108,9 @@ async def startup() -> None:
             _l.warning("[Warmup] IntentRouter: %s", exc)
         # 4. WakeWordService — loads OWW + tiny Whisper wake model
         try:
-            from voice.wake_word_service import wake_word_service as _wws, preload_wake_model
-            preload_wake_model()
+            from voice.wake_word_service import wake_word_service as _wws
             import time as _wt; _wt.sleep(1)  # allow OWW background thread to finish
-            _l.info("[Warmup] WakeWordService ready — oww=%s wake_model=tiny", _wws._oww_ready)
+            _l.info("[Warmup] WakeWordService ready — oww=%s", _wws._oww_ready)
         except Exception as exc:
             _l.warning("[Warmup] WakeWordService: %s", exc)
         # 5. Pre-generate TTS ack cache for instant playback (On it / Opening / Done)

@@ -16,6 +16,9 @@ import {
   getApiBase,
   AudioQueue,
   streamAndSpeak,
+  setPendingAudio,
+  clearPendingAudio,
+  isAudioActivated,
 } from '@/lib/voice-core'
 
 // ── Audio utility: Float32Array (16kHz mono) → WAV Blob ────────────────────────
@@ -290,11 +293,12 @@ export function useVoiceSession() {
 
   // ── TTS for fast-paths (greeting, identity, system) ───────────────────────
 
-  const speakResponse = useCallback(async (raw: string): Promise<void> => {
+  const speakResponse = useCallback(async (raw: string, externalSignal?: AbortSignal): Promise<void> => {
     const text = stripMarkdown(raw)
     if (!text) return
     const API_BASE = getApiBase()
     const { voice, speed, voiceEnabled, volume } = readAssistantSettings()
+    console.log('[SPEAKRESP] entry — len:', text.length, 'voiceEnabled:', voiceEnabled, 'vol:', volume, 'activated:', isAudioActivated())
     if (!voiceEnabled) return
 
     window.dispatchEvent(new Event('xyron:tts-start'))
@@ -307,8 +311,11 @@ export function useVoiceSession() {
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
+          if (externalSignal?.aborted) break
+          console.log('[SPEAKRESP] fetch attempt', attempt + 1)
           const ctrl    = new AbortController()
-          const timeout = setTimeout(() => ctrl.abort(), 7_000)
+          const timeout = setTimeout(() => ctrl.abort(), 30_000)
+          externalSignal?.addEventListener('abort', () => ctrl.abort(), { once: true })
           let resp: Response
           try {
             resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
@@ -316,32 +323,51 @@ export function useVoiceSession() {
               body: JSON.stringify({ text, voice, speed }), signal: ctrl.signal,
             })
           } finally { clearTimeout(timeout) }
+          console.log('[SPEAKRESP] fetch status:', resp!.status, 'ok:', resp!.ok)
           if (resp!.ok) {
-            const url = URL.createObjectURL(await resp!.blob())
+            const blob = await resp!.blob()
+            console.log('[SPEAKRESP] blob size:', blob.size, 'type:', blob.type)
+            const url = URL.createObjectURL(blob)
             await new Promise<void>((resolve) => {
               const audio  = new Audio(url)
               audio.volume = volume
               let resolved = false
               const safeResolve = () => { if (!resolved) { resolved = true; resolve() } }
               const cleanup     = () => URL.revokeObjectURL(url)
-              const t = setTimeout(() => { cleanup(); safeResolve() }, (Math.max(6, text.length / 8) / speed) * 1000 + 10_000)
-              audio.onended = () => { clearTimeout(t); cleanup(); safeResolve() }
-              audio.onerror = () => { clearTimeout(t); cleanup(); safeResolve() }
+              const t = setTimeout(() => { console.warn('[SPEAKRESP] safety timeout fired'); cleanup(); safeResolve() }, (Math.max(6, text.length / 8) / speed) * 1000 + 10_000)
+              audio.onended = () => { console.log('[SPEAKRESP] audio ended naturally'); clearTimeout(t); cleanup(); safeResolve() }
+              audio.onerror = (e) => { console.error('[SPEAKRESP] audio onerror:', e); clearTimeout(t); cleanup(); safeResolve() }
               // Pre-prime: resolve at 85% playback — mic restarts before TTS fully ends
               audio.ontimeupdate = () => {
                 if (!resolved && audio.duration > 0 && audio.currentTime / audio.duration >= 0.85) {
                   audio.ontimeupdate = null
-                  console.log('[FLOW] tts_near_end — pre-priming mic')
+                  console.log('[FLOW] tts_near_end — pre-priming mic', audio.currentTime.toFixed(2), '/', audio.duration.toFixed(2))
                   safeResolve()   // audio keeps playing; onended cleans up url
                 }
               }
-              audio.play().catch(() => { clearTimeout(t); cleanup(); safeResolve() })
+              console.log('[SPEAKRESP] calling audio.play(), readyState:', audio.readyState)
+              audio.play()
+                .then(() => console.log('[SPEAKRESP] play() resolved — audio is playing'))
+                .catch((err: unknown) => {
+                  const errName = err instanceof Error ? err.name : String(err)
+                  console.error('[SPEAKRESP] play() error:', errName, err instanceof Error ? err.message : '')
+                  if (err instanceof DOMException && err.name === 'NotAllowedError') {
+                    // Single-slot: replaces any stale greeting from a previous false wake.
+                    // Resolve immediately — do NOT hang; pending audio replays on next click.
+                    setPendingAudio(() => { audio.play().catch(() => { clearTimeout(t); cleanup(); safeResolve() }) })
+                    clearTimeout(t)
+                    safeResolve()
+                  } else {
+                    clearTimeout(t); cleanup(); safeResolve()
+                  }
+                })
             })
             return
           }
-        } catch { /* retry */ }
+        } catch (e) { console.warn('[SPEAKRESP] attempt error:', e) }
       }
       // TTS failed — text is shown on screen; skip browser speech synthesis to avoid robotic fallback voice
+      console.warn('[SPEAKRESP] all TTS attempts failed — silent')
     } finally {
       window.dispatchEvent(new Event('xyron:tts-end'))
     }
@@ -1494,6 +1520,23 @@ export function useVoiceSession() {
   // ── Public: start session (greet, then wait for mic tap) ─────────────────
 
   const startSession = useCallback(async () => {
+    // Discard any stale pending audio from false wakes before activateAudio()'s
+    // 50ms timer can replay it (prevents double-greeting on orb clicks).
+    clearPendingAudio()
+
+    // Allow takeover from soft states caused by false wakes:
+    //   greeting  — false wake waiting to speak
+    //   listening — false wake already moved to mic-open loop
+    // Hard states (transcribing / processing / speaking) block — user is mid-turn.
+    const cur = stateRef.current
+    if (cur === 'greeting' || cur === 'listening') {
+      if (cur === 'listening') {
+        vad.pause()
+        isRunningRef.current = false
+      }
+      stateRef.current = 'idle'
+      setSessionState('idle')
+    }
     if (stateRef.current !== 'idle') return
     setError(null)
     setMessages([])
@@ -1511,12 +1554,29 @@ export function useVoiceSession() {
     const GREETING = buildGreeting(mode)
     addMsg('assistant', GREETING)
     console.log(`[VOICE] greeting with mode=${mode} voice=${voice}`)
-    try {
+
+    // Orb-click: pointerdown fires before click → audio already activated, no wait.
+    // Wake-word: no user gesture yet → wait up to 1500ms for activation, then proceed.
+    if (!isAudioActivated()) {
+      console.log('[SESSION] waiting for audio activation (wake-word path)...')
       await Promise.race([
-        speakResponse(GREETING),
-        new Promise<void>((r) => setTimeout(r, 5_000)),
+        new Promise<void>(r => window.addEventListener('xyron:audio-unlocked', () => r(), { once: true })),
+        new Promise<void>(r => setTimeout(r, 1500)),
       ])
-    } catch { /* ok */ }
+      console.log('[SESSION] audio activation wait done, activated now:', isAudioActivated())
+    }
+
+    console.log('[SESSION] calling speakResponse for greeting, activated:', isAudioActivated())
+    const greetingAbort = new AbortController()
+    const greetingTimer = setTimeout(() => {
+      console.warn('[SESSION] greeting timeout — aborting fetch to prevent late play')
+      greetingAbort.abort()
+    }, 10_000)
+    try {
+      await speakResponse(GREETING, greetingAbort.signal)
+    } catch { /* ok */ } finally {
+      clearTimeout(greetingTimer)
+    }
     if (!activeRef.current) return  // stopped during greeting
     transition('idle')
     console.log('[VOICE] session started — auto-starting listen')

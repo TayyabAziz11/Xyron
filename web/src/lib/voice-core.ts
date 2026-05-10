@@ -743,6 +743,66 @@ export function getApiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 }
 
+// ── Audio unlock ─────────────────────────────────────────────────────────────
+//
+// Chrome blocks audio.play() until the first user gesture. Strategy:
+//   • Single-slot pending audio (last-wins). Each new blocked clip replaces
+//     the previous so stale greetings from false wakes never accumulate.
+//   • First pointerdown/keydown anywhere on the page calls activateAudio()
+//     and replays only the most-recent blocked clip.
+
+let _audioActivated  = false
+let _pendingReplay:  (() => void) | null = null   // single slot — last-wins
+
+export function activateAudio() {
+  if (_audioActivated) return
+  _audioActivated = true
+  if (typeof window !== 'undefined')
+    window.dispatchEvent(new Event('xyron:audio-unlocked'))
+  // 50ms delay: lets any startSession() call clear stale pending audio first
+  // (pointerdown fires before click, so startSession's clearPendingAudio runs in this window).
+  setTimeout(() => {
+    const fn = _pendingReplay
+    _pendingReplay = null
+    fn?.()
+  }, 50)
+}
+
+/** Queue the most-recent blocked audio for replay on first user gesture. */
+export function setPendingAudio(fn: () => void) {
+  _pendingReplay = fn   // replaces previous — old stale clips are discarded
+}
+
+/** Discard any queued pending audio (called on fresh session start). */
+export function clearPendingAudio() {
+  _pendingReplay = null
+}
+
+/** True once any user gesture (click/key) has unlocked audio on this page. */
+export function isAudioActivated(): boolean { return _audioActivated }
+
+// Attach once, client-side only. Any tap/click/key on the page unlocks audio.
+if (typeof document !== 'undefined') {
+  const _autoUnlock = () => activateAudio()
+  document.addEventListener('pointerdown', _autoUnlock, { once: true, passive: true })
+  document.addEventListener('keydown',     _autoUnlock, { once: true, passive: true })
+}
+
+function _playOrQueue(
+  el: HTMLAudioElement,
+  onBlocked: () => void,
+  onError: () => void,
+): void {
+  el.play().catch((err: unknown) => {
+    if (err instanceof DOMException && err.name === 'NotAllowedError') {
+      _pendingReplay = () => { el.play().catch(onError) }   // last-wins
+      onBlocked()
+    } else {
+      onError()
+    }
+  })
+}
+
 // ── AudioQueue ────────────────────────────────────────────────────────────────
 //
 // Sequential audio playback with eager TTS fetch. Key design:
@@ -853,7 +913,11 @@ export class AudioQueue {
       const t    = setTimeout(done, 25_000)   // safety timeout
       a.onended  = () => { clearTimeout(t); done() }
       a.onerror  = () => { clearTimeout(t); done() }
-      a.play().catch(() => { clearTimeout(t); done() })
+      _playOrQueue(
+        a,
+        /* onBlocked */ () => { /* audio queued for replay — timeout still running */ },
+        /* onError   */ () => { clearTimeout(t); done() },
+      )
     })
 
     if (this.aborted) this.playing = false
