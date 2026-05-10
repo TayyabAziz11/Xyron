@@ -87,7 +87,14 @@ async def startup() -> None:
             k = _get_kokoro()
             if k is not None:
                 _kokoro_to_wav("Ready.", "nova", 1.0)
-                _l.info("[Warmup] Kokoro ready — provider=%s",
+                # Pre-synthesize all time-of-day boss greeting variants into the TTS cache.
+                # First user activation hits cache → instant response (no GPU cold-start wait).
+                for _tod in ("morning", "afternoon", "evening"):
+                    _kokoro_to_wav(
+                        f"Good {_tod}, boss. I'm Xyron, ready and at your service. Just give the word.",
+                        "onyx", 1.0,
+                    )
+                _l.info("[Warmup] Kokoro ready — provider=%s (greeting cache warm)",
                         _os.environ.get("ONNX_PROVIDER", "CPU"))
         except Exception as exc:
             _l.warning("[Warmup] Kokoro: %s", exc)

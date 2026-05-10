@@ -17,11 +17,16 @@ from typing import Optional
 @lru_cache(maxsize=1)
 def _win_username() -> str:
     """Find the real Windows username by scanning /mnt/c/Users/*/Desktop."""
-    skip = {"public", "default", "default user", "all users"}
+    skip = {"public", "default", "default user", "all users", "wsiaccount"}
     try:
-        for desktop in sorted(Path("/mnt/c/Users").glob("*/Desktop")):
-            if desktop.parent.name.lower() not in skip:
-                return desktop.parent.name
+        candidates = [
+            d for d in Path("/mnt/c/Users").glob("*/Desktop")
+            if d.parent.name.lower() not in skip
+        ]
+        if candidates:
+            # Pick the account with the most Desktop items — that's the active user.
+            candidates.sort(key=lambda d: (-len(list(d.iterdir())), d.parent.name.lower()))
+            return candidates[0].parent.name
     except Exception:
         pass
     return "User"

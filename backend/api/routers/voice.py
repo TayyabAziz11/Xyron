@@ -101,6 +101,9 @@ def _clean_for_speech(text: str, max_chars: int = 300) -> str:
     if not text:
         return ""
     t = text.strip()
+    # Backslashes cause espeak-ng to split output lines → phonemizer line-count mismatch → Kokoro retry.
+    # Replace all backslashes with spaces so paths become pronounceable words.
+    t = t.replace("\\", " ")
     # Code blocks
     t = re.sub(r"```[\s\S]*?```", "See the screen for code.", t)
     t = re.sub(r"`[^`]+`", "", t)
@@ -371,6 +374,8 @@ _KOKORO_VOICES: list[dict] = [
 _KOKORO_MODELS_DIR = os.path.expanduser("~/.xyron/models")
 _kokoro_instance = None        # module-level singleton, lazy-loaded once
 _kokoro_lock = __import__("threading").Lock()
+_tts_cache: dict[tuple[str, str, float], bytes] = {}  # (text, voice, speed) → WAV bytes
+_TTS_CACHE_MAXSIZE = 64
 
 
 def _get_kokoro():
@@ -479,6 +484,7 @@ def _sanitize_tts_text(text: str) -> str:
 def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
     """Generate WAV via Kokoro (local, offline, ~100-400ms after warm-up)."""
     import io, wave, numpy as np
+    global _tts_cache
     k = _get_kokoro()
     if k is None:
         return None
@@ -490,6 +496,10 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
         speed = 0.92
     # Pass native Kokoro IDs (af_*, am_*, bf_*, bm_*) through; map OpenAI aliases
     kokoro_voice = voice if (voice and voice[:3] in ("af_", "am_", "bf_", "bm_")) else _KOKORO_VOICE_MAP.get(voice, "af_nova")
+    # Check cache — warmup pre-populates this for greeting phrases
+    cache_key = (text, kokoro_voice, speed)
+    if cache_key in _tts_cache:
+        return _tts_cache[cache_key]
     samples, sample_rate = k.create(text, voice=kokoro_voice, speed=speed, lang="en-us")
     # Normalize to full loudness — Kokoro often outputs at 20-40% amplitude
     peak = float(np.max(np.abs(samples)))
@@ -506,7 +516,11 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm.tobytes())
-    return buf.getvalue()
+    wav_bytes = buf.getvalue()
+    if len(_tts_cache) >= _TTS_CACHE_MAXSIZE:
+        _tts_cache.pop(next(iter(_tts_cache)))
+    _tts_cache[cache_key] = wav_bytes
+    return wav_bytes
 
 
 # edge-tts voice mapping: OpenAI names → Microsoft Neural voices
