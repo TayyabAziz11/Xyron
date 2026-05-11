@@ -1,5 +1,15 @@
 'use client'
 
+function genUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
+  })
+}
+
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useMicVAD } from '@ricky0123/vad-react'
 import { readAssistantSettings, buildGreeting } from '@/hooks/useAssistantSettings'
@@ -227,7 +237,7 @@ export function useVoiceSession() {
 
   const addMsg = useCallback(
     (role: ConvMessage['role'], text: string, status: ConvMessage['status'] = 'done'): string => {
-      const id = crypto.randomUUID()
+      const id = genUUID()
       setMessages((prev) => {
         const next = [...prev, { id, role, text, status, timestamp: new Date() }]
         historyRef.current = next
@@ -859,6 +869,11 @@ export function useVoiceSession() {
           onToolAction: (tool, params, _spoken) => {
             if (tool === 'takeover_mode') {
               window.dispatchEvent(new Event('xyron:takeover'))
+              return // hook handles VS Code launch after sequence completes
+            }
+            if (tool === 'stand_down') {
+              window.dispatchEvent(new Event('xyron:standdown'))
+              return
             }
             fetch(`${API_BASE}/api/v1/system/execute-tool`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1541,7 +1556,7 @@ export function useVoiceSession() {
     setError(null)
     setMessages([])
     historyRef.current     = []
-    sessionIdRef.current   = crypto.randomUUID()
+    sessionIdRef.current   = genUUID()
     activeRef.current      = true
     isRunningRef.current   = false
     isStreamingRef.current = false

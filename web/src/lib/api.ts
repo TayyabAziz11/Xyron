@@ -9,9 +9,10 @@ import type {
   SystemStatus,
   VoiceTranscriptionResult,
   Draft,
+  SystemMetrics,
 } from './types'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API_BASE = typeof window !== 'undefined' ? '' : (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')
 
 class ApiError extends Error {
   constructor(
@@ -111,6 +112,10 @@ export const api = {
         .then((r) => r.json())
         .then((body: ApiResponse<VoiceTranscriptionResult>) => body.data)
     },
+  },
+
+  system: {
+    metrics: () => apiGet<SystemMetrics>('/api/v1/system/metrics'),
   },
 
   drafts: {

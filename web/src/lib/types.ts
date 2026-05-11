@@ -1,5 +1,23 @@
 // Xyron — shared TypeScript types (mirrors Pydantic schemas)
 
+export interface SystemMetrics {
+  cpu_pct:        number
+  cpu_cores:      number
+  cpu_freq_mhz:   number | null
+  ram_pct:        number
+  ram_used_gb:    number
+  ram_total_gb:   number
+  swap_pct:       number
+  disk_pct:       number
+  disk_used_gb:   number
+  disk_total_gb:  number
+  net_bytes_sent: number
+  net_bytes_recv: number
+  temp_c:         number | null
+  uptime_s:       number
+  uptime_str:     string
+}
+
 export interface ApiResponse<T> {
   success: boolean
   data: T

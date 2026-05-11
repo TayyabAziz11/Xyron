@@ -13,7 +13,7 @@ export interface HistoryEntry {
   session_id: string | null
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:8000'
 
 export function useHistory() {
   const [entries,  setEntries]  = useState<HistoryEntry[]>([])

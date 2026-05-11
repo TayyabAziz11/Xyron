@@ -13,7 +13,8 @@ export function ConversationThread({ messages }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = bottomRef.current?.parentElement
+    if (el) el.scrollTop = el.scrollHeight
   }, [messages.length])
 
   if (!messages.length) {

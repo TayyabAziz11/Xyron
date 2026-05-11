@@ -119,7 +119,7 @@ export function CommandBar({ onSubmit, loading = false, className, onTranscript 
     form.append('audio', blob, 'recording.webm')
 
     try {
-      const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+      const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:8000'
       const resp = await fetch(`${API_BASE}/api/v1/voice/transcribe`, {
         method: 'POST',
         body: form,

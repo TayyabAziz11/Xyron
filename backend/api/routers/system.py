@@ -389,6 +389,79 @@ async def system_health_endpoint():
     return {"success": result.success, "message": result.text, "data": result.data}
 
 
+@router.get("/metrics")
+async def system_metrics_endpoint():
+    """Return real-time CPU, RAM, disk, network I/O and uptime — polled by the dashboard."""
+    import time
+    try:
+        import psutil
+    except ImportError:
+        return {"success": False, "data": None, "message": "psutil not installed"}
+
+    GiB = 1024 ** 3
+    MiB = 1024 ** 2
+
+    cpu_pct   = psutil.cpu_percent(interval=0.3)
+    cpu_cores = psutil.cpu_count(logical=True) or 1
+    cpu_freq  = psutil.cpu_freq()
+
+    vm        = psutil.virtual_memory()
+    sw        = psutil.swap_memory()
+
+    # disk — aggregate all real partitions
+    disk_total_gb = disk_used_gb = 0.0
+    try:
+        for part in psutil.disk_partitions(all=False):
+            try:
+                u = psutil.disk_usage(part.mountpoint)
+                disk_total_gb += u.total / GiB
+                disk_used_gb  += u.used  / GiB
+            except (PermissionError, OSError):
+                pass
+    except Exception:
+        pass
+    disk_pct = round(disk_used_gb / disk_total_gb * 100, 1) if disk_total_gb else 0
+
+    # network I/O (cumulative counters — caller can diff)
+    net  = psutil.net_io_counters()
+
+    # temperatures (not available on all platforms / WSL2)
+    temp_c: float | None = None
+    try:
+        temps = psutil.sensors_temperatures()
+        if temps:
+            for key in ("coretemp", "cpu_thermal", "k10temp", "acpitz"):
+                if key in temps and temps[key]:
+                    temp_c = round(temps[key][0].current, 1)
+                    break
+    except (AttributeError, NotImplementedError):
+        pass
+
+    # uptime
+    uptime_s = int(time.time() - psutil.boot_time())
+    h, rem   = divmod(uptime_s, 3600)
+    m, s     = divmod(rem, 60)
+
+    data = {
+        "cpu_pct":          round(cpu_pct, 1),
+        "cpu_cores":        cpu_cores,
+        "cpu_freq_mhz":     round(cpu_freq.current, 0) if cpu_freq else None,
+        "ram_pct":          round(vm.percent, 1),
+        "ram_used_gb":      round(vm.used  / GiB, 1),
+        "ram_total_gb":     round(vm.total / GiB, 1),
+        "swap_pct":         round(sw.percent, 1),
+        "disk_pct":         disk_pct,
+        "disk_used_gb":     round(disk_used_gb, 1),
+        "disk_total_gb":    round(disk_total_gb, 1),
+        "net_bytes_sent":   net.bytes_sent,
+        "net_bytes_recv":   net.bytes_recv,
+        "temp_c":           temp_c,
+        "uptime_s":         uptime_s,
+        "uptime_str":       f"{h}h {m:02d}m {s:02d}s",
+    }
+    return {"success": True, "data": data, "message": "ok"}
+
+
 @router.get("/running-apps")
 async def running_apps_endpoint():
     """Return list of currently running applications."""

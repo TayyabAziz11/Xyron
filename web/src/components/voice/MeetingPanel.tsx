@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Mic, MicOff, FileText, Loader2, Radio } from 'lucide-react'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:8000'
 
 interface MeetingStatus {
   active:     boolean

@@ -2,414 +2,286 @@
 
 import { useState, useEffect } from 'react'
 import { Mic, Volume2, VolumeX, CheckCircle, XCircle, Play, ChevronDown, ChevronRight } from 'lucide-react'
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/Card'
-import { StatusDot } from '@/components/ui/StatusDot'
-import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
-import { PageTransition } from '@/components/layout/PageTransition'
 import { useApi } from '@/hooks/useApi'
 import { api } from '@/lib/api'
 import {
-  useAssistantSettings,
-  MODE_OPTIONS,
-  type OpenAIVoice,
-  type BehaviorMode,
+  useAssistantSettings, MODE_OPTIONS,
+  type OpenAIVoice, type BehaviorMode,
 } from '@/hooks/useAssistantSettings'
+import { cn } from '@/lib/utils'
 
 interface KokoroVoice { id: string; label: string; desc: string }
 interface KokoroGroup { name: string; voices: KokoroVoice[] }
 
+const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:8000'
+
 const ENV_VARS = ['OPENAI_API_KEY', 'REPO_ROOT', 'API_PORT', 'CORS_ORIGINS']
 
-function Toggle({
-  checked,
-  onChange,
-  disabled,
-}: {
-  checked: boolean
-  onChange: () => void
-  disabled?: boolean
-}) {
+// ── Shared UI ─────────────────────────────────────────────────────────────────
+
+function CyberPanel({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  return <div className={`cyber-panel p-4 ${className}`}>{children}</div>
+}
+
+function ST({ label }: { label: string }) {
   return (
-    <button
-      type="button"
-      onClick={onChange}
-      disabled={disabled}
-      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-40 ${
-        checked ? 'bg-brand' : 'bg-surface-border'
-      }`}
-      role="switch"
-      aria-checked={checked}
-    >
-      <span
-        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-          checked ? 'translate-x-4' : 'translate-x-1'
-        }`}
-      />
+    <div className="mb-3 flex items-center gap-2">
+      <span className="font-mono text-[10px] font-semibold tracking-[0.2em] text-[#ff2020]">{label}</span>
+      <div className="flex-1 h-px bg-[rgba(255,32,32,0.2)]" />
+    </div>
+  )
+}
+
+function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: () => void; disabled?: boolean }) {
+  return (
+    <button type="button" onClick={onChange} disabled={disabled} role="switch" aria-checked={checked}
+      className={cn(
+        'relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-40',
+        checked ? 'bg-[#ff2020] shadow-[0_0_8px_rgba(255,32,32,0.5)]' : 'bg-[rgba(255,255,255,0.1)]',
+      )}>
+      <span className={cn(
+        'inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform',
+        checked ? 'translate-x-4' : 'translate-x-1',
+      )} />
     </button>
   )
 }
 
+function Row({ label, sub, children }: { label: string; sub?: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-[rgba(255,32,32,0.08)] py-3 last:border-0">
+      <div>
+        <p className="font-mono text-[11px] text-text-secondary">{label}</p>
+        {sub && <p className="font-mono text-[10px] text-text-muted">{sub}</p>}
+      </div>
+      <div className="flex-shrink-0">{children}</div>
+    </div>
+  )
+}
+
+// ── Page ─────────────────────────────────────────────────────────────────────
+
 export default function SettingsPage() {
-  const { data: health, loading: healthLoading }   = useApi(() => api.health.ping())
-  const { data: status, loading: statusLoading }   = useApi(() => api.health.status())
-  const { settings, saveSettings }                 = useAssistantSettings()
+  const { data: health }  = useApi(() => api.health.ping())
+  const { data: status }  = useApi(() => api.health.status())
+  const { settings, saveSettings } = useAssistantSettings()
 
-  const [previewing, setPreviewing] = useState<string | null>(null)
-  const [previewErr, setPreviewErr] = useState<string | null>(null)
-  const [voiceGroups, setVoiceGroups] = useState<KokoroGroup[]>([])
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(['American Female']))
-
-  const API_BASE =
-    typeof window !== 'undefined'
-      ? (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000')
-      : 'http://localhost:8000'
+  const [previewing, setPreviewing]     = useState<string | null>(null)
+  const [previewErr, setPreviewErr]     = useState<string | null>(null)
+  const [voiceGroups, setVoiceGroups]   = useState<KokoroGroup[]>([])
+  const [expandedGrp, setExpandedGrp]   = useState<Set<string>>(new Set(['American Female']))
 
   useEffect(() => {
     fetch(`${API_BASE}/api/v1/voice/voices`)
       .then(r => r.json())
       .then(d => { if (d?.data?.groups) setVoiceGroups(d.data.groups) })
       .catch(() => {})
-  }, [API_BASE])
+  }, [])
 
   async function previewVoice(voice: string) {
     if (previewing) return
-    setPreviewing(voice)
-    setPreviewErr(null)
+    setPreviewing(voice); setPreviewErr(null)
     try {
       const label = voice.includes('_') ? voice.split('_')[1] : voice
       const resp = await fetch(`${API_BASE}/api/v1/voice/synthesize`, {
-        method:  'POST',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          text:  `Hi, I'm ${label.charAt(0).toUpperCase() + label.slice(1)}, your Xyron assistant voice.`,
-          voice,
-          speed: settings.speed,
-        }),
+        body: JSON.stringify({ text: `Hi! I'm ${label}, your XYRON voice.`, voice }),
       })
-      if (!resp.ok) throw new Error('TTS failed')
+      if (!resp.ok) throw new Error(await resp.text())
       const blob = await resp.blob()
       const url  = URL.createObjectURL(blob)
-      await new Promise<void>((resolve) => {
-        const audio   = new Audio(url)
-        audio.onended = () => { URL.revokeObjectURL(url); resolve() }
-        audio.onerror = () => { URL.revokeObjectURL(url); resolve() }
-        audio.play().catch(() => resolve())
-      })
-    } catch {
-      setPreviewErr('Preview failed — make sure the backend is running.')
-    } finally {
+      const audio = new Audio(url)
+      audio.onended = () => { URL.revokeObjectURL(url); setPreviewing(null) }
+      audio.onerror = () => { setPreviewing(null) }
+      await audio.play()
+    } catch (e) {
+      setPreviewErr(e instanceof Error ? e.message : 'Preview failed')
       setPreviewing(null)
     }
   }
 
-  function toggleGroup(name: string) {
-    setExpandedGroups(prev => {
-      const next = new Set(prev)
-      next.has(name) ? next.delete(name) : next.add(name)
-      return next
-    })
-  }
+  const isHealthy = health?.status === 'ok'
 
   return (
-    <PageTransition>
-      <div className="max-w-2xl mx-auto space-y-6">
+    <div className="space-y-5 p-5">
+      <div>
+        <h1 className="text-sm font-black tracking-[0.2em] text-[#ff2020]">SYSTEM SETTINGS</h1>
+        <p className="font-mono text-[10px] text-text-muted">Configure XYRON AI Operator</p>
+      </div>
 
-        {/* System Status */}
-        <Card>
-          <CardHeader>
-            <CardTitle>System Status</CardTitle>
-            {!healthLoading && (
-              <StatusDot status={health?.status === 'ok' ? 'online' : 'offline'} />
-            )}
-          </CardHeader>
-          <CardContent className="pt-0 space-y-3">
-            {healthLoading || statusLoading ? (
-              <div className="flex justify-center py-8"><LoadingSpinner /></div>
-            ) : status ? (
-              <dl className="space-y-2">
-                {[
-                  ['Python',       status.python_version],
-                  ['Repo root',    status.repo_root],
-                  ['MCP servers',  status.mcp_servers.join(', ') || 'none'],
-                  ['API healthy',  status.healthy ? 'Yes' : 'No'],
-                ].map(([label, value]) => (
-                  <div key={label} className="flex items-center justify-between py-1.5 border-b border-surface-border last:border-0">
-                    <dt className="text-xs text-text-muted">{label}</dt>
-                    <dd className="text-xs text-text-secondary font-mono">{value}</dd>
-                  </div>
-                ))}
-              </dl>
-            ) : (
-              <p className="text-sm text-status-error">API offline — start the backend server</p>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Directory Checks */}
-        {status && (
-          <Card>
-            <CardHeader><CardTitle>Directory Checks</CardTitle></CardHeader>
-            <CardContent className="pt-0">
-              <dl className="space-y-2">
-                {[
-                  ['Logs dir',              status.logs_dir_exists],
-                  ['Pending approvals dir', status.pending_approval_dir_exists],
-                  ['Secrets dir',           status.secrets_dir_exists],
-                  ['Skills dir',            status.skills_dir_exists],
-                ].map(([label, ok]) => (
-                  <div key={label as string} className="flex items-center justify-between py-1.5 border-b border-surface-border last:border-0">
-                    <dt className="text-xs text-text-muted">{label}</dt>
-                    <dd className="flex items-center gap-1">
-                      {ok
-                        ? <CheckCircle className="h-3.5 w-3.5 text-status-success" />
-                        : <XCircle    className="h-3.5 w-3.5 text-status-error" />}
-                      <span className={`text-xs ${ok ? 'text-status-success' : 'text-status-error'}`}>
-                        {ok ? 'Found' : 'Missing'}
-                      </span>
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Voice Selection */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Voice</CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 space-y-4">
-            {/* Voice enabled toggle */}
-            <div className="flex items-center justify-between rounded-lg border border-surface-border bg-surface-overlay px-3 py-2.5">
-              <div className="flex items-center gap-2">
-                {settings.voiceEnabled
-                  ? <Volume2 className="h-4 w-4 text-brand-light" />
-                  : <VolumeX className="h-4 w-4 text-text-muted" />}
-                <span className="text-sm text-text-secondary">Voice responses</span>
-              </div>
-              <Toggle
-                checked={settings.voiceEnabled}
-                onChange={() => saveSettings({ voiceEnabled: !settings.voiceEnabled })}
-              />
-            </div>
-
-            <p className="text-xs text-text-muted">
-              Powered by Kokoro ONNX (local, offline). Select a voice — click ▶ to preview.
-            </p>
-            {voiceGroups.length === 0 ? (
-              <div className="flex justify-center py-4"><LoadingSpinner /></div>
-            ) : (
-              <div className="space-y-2">
-                {voiceGroups.map((group) => {
-                  const expanded = expandedGroups.has(group.name)
-                  return (
-                    <div key={group.name} className="rounded-lg border border-surface-border overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => toggleGroup(group.name)}
-                        className="w-full flex items-center justify-between px-3 py-2 bg-surface-overlay hover:bg-surface-raised transition-colors"
-                      >
-                        <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">{group.name}</span>
-                        {expanded
-                          ? <ChevronDown className="h-3.5 w-3.5 text-text-muted" />
-                          : <ChevronRight className="h-3.5 w-3.5 text-text-muted" />}
-                      </button>
-                      {expanded && (
-                        <div className="divide-y divide-surface-border">
-                          {group.voices.map((v) => {
-                            const active = settings.voice === v.id
-                            return (
-                              <div
-                                key={v.id}
-                                className={`flex items-center justify-between px-3 py-2 cursor-pointer transition-colors ${
-                                  active
-                                    ? 'bg-brand/8'
-                                    : 'bg-surface-raised hover:bg-surface-overlay'
-                                }`}
-                                onClick={() => saveSettings({ voice: v.id as OpenAIVoice })}
-                              >
-                                <div className="flex items-center gap-2.5">
-                                  <div className={`h-2.5 w-2.5 rounded-full border-2 flex-shrink-0 ${
-                                    active ? 'border-brand bg-brand' : 'border-surface-border'
-                                  }`} />
-                                  <div>
-                                    <p className={`text-sm font-medium leading-tight ${active ? 'text-brand-light' : 'text-text-secondary'}`}>
-                                      {v.label}
-                                    </p>
-                                    <p className="text-xs text-text-muted">{v.desc}</p>
-                                  </div>
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={(e) => { e.stopPropagation(); previewVoice(v.id) }}
-                                  disabled={previewing !== null}
-                                  className="flex items-center gap-1 px-2 py-0.5 rounded bg-surface-border text-xs text-text-muted
-                                    hover:text-text-secondary hover:bg-surface-overlay transition-colors disabled:opacity-40"
-                                >
-                                  {previewing === v.id
-                                    ? <span className="animate-pulse">…</span>
-                                    : <><Play className="h-3 w-3" /> Play</>}
-                                </button>
-                              </div>
-                            )
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-            {previewErr && (
-              <p className="text-xs text-status-error">{previewErr}</p>
-            )}
-
-            {/* Volume slider */}
-            <div className="space-y-2">
-              <div className="flex justify-between">
-                <p className="text-sm text-text-secondary">Volume</p>
-                <span className="text-xs text-text-muted font-mono">{Math.round(settings.volume * 100)}%</span>
-              </div>
-              <input
-                type="range"
-                min={0.1}
-                max={1.0}
-                step={0.05}
-                value={settings.volume}
-                onChange={(e) => saveSettings({ volume: Number(e.target.value) })}
-                className="w-full h-1.5 rounded-full accent-brand cursor-pointer"
-              />
-              <div className="flex justify-between text-xs text-text-muted">
-                <span>Quiet</span>
-                <span>Max</span>
-              </div>
-            </div>
-
-            {/* Speed slider */}
-            <div className="pt-1 space-y-2">
-              <div className="flex justify-between">
-                <p className="text-sm text-text-secondary">Speech speed</p>
-                <span className="text-xs text-text-muted font-mono">{settings.speed.toFixed(2)}×</span>
-              </div>
-              <input
-                type="range"
-                min={0.75}
-                max={1.5}
-                step={0.05}
-                value={settings.speed}
-                onChange={(e) => saveSettings({ speed: Number(e.target.value) })}
-                className="w-full h-1.5 rounded-full accent-brand cursor-pointer"
-              />
-              <div className="flex justify-between text-xs text-text-muted">
-                <span>Slower</span>
-                <span>Normal</span>
-                <span>Faster</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Behavior Mode */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Behavior Mode</CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 space-y-3">
-            <p className="text-xs text-text-muted">
-              Controls the greeting and tone of Xyron voice sessions.
-            </p>
-            <div className="grid grid-cols-3 gap-2">
-              {MODE_OPTIONS.map((m) => {
-                const active = settings.mode === m.id
-                return (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() => saveSettings({ mode: m.id as BehaviorMode })}
-                    className={`flex flex-col items-center gap-1.5 rounded-lg border px-3 py-3 text-center transition-all ${
-                      active
-                        ? 'border-brand/60 bg-brand/8'
-                        : 'border-surface-border bg-surface-overlay hover:border-brand/30'
-                    }`}
-                  >
-                    <p className={`text-sm font-semibold ${active ? 'text-brand-light' : 'text-text-secondary'}`}>
-                      {m.label}
-                    </p>
-                    <p className="text-xs text-text-muted leading-tight">{m.desc}</p>
-                  </button>
-                )
-              })}
-            </div>
-            {/* Greeting preview */}
-            <div className="rounded-lg bg-surface-overlay border border-surface-border px-3 py-2.5">
-              <p className="text-xs text-text-muted mb-1">Greeting preview</p>
-              <p className="text-xs text-text-secondary italic">
-                &ldquo;{MODE_OPTIONS.find((m) => m.id === settings.mode)?.greeting}&rdquo;
+      {/* API Status */}
+      <CyberPanel>
+        <ST label="SYSTEM STATUS" />
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <div className="flex items-center gap-2.5 rounded border border-[rgba(255,32,32,0.15)] bg-[rgba(255,32,32,0.03)] p-3">
+            {isHealthy
+              ? <CheckCircle className="h-4 w-4 flex-shrink-0 text-[#00ff88]" />
+              : <XCircle     className="h-4 w-4 flex-shrink-0 text-[#ef4444]" />}
+            <div>
+              <p className="font-mono text-[11px] text-text-secondary">API BACKEND</p>
+              <p className="font-mono text-[10px]" style={{ color: isHealthy ? '#00ff88' : '#ef4444' }}>
+                {isHealthy ? 'CONNECTED — localhost:8000' : 'OFFLINE'}
               </p>
             </div>
-          </CardContent>
-        </Card>
+          </div>
+          {status && (
+            <div className="rounded border border-[rgba(255,32,32,0.15)] bg-[rgba(255,32,32,0.03)] p-3">
+              <p className="font-mono text-[10px] text-text-muted">PYTHON {status.python_version}</p>
+              <p className="font-mono text-[10px] text-text-muted truncate">{status.repo_root}</p>
+              <p className="font-mono text-[10px]" style={{ color: status.healthy ? '#00ff88' : '#ef4444' }}>
+                {status.healthy ? 'ALL SYSTEMS NOMINAL' : 'DEGRADED'}
+              </p>
+            </div>
+          )}
+        </div>
+      </CyberPanel>
 
-        {/* Voice Commands reference */}
-        <Card>
-          <CardHeader><CardTitle>Voice Commands</CardTitle></CardHeader>
-          <CardContent className="pt-0">
-            <div className="flex items-center gap-3 rounded-lg bg-surface-overlay border border-surface-border px-4 py-3">
-              <Mic className="h-4 w-4 text-brand-light" />
-              <div>
-                <p className="text-sm text-text-secondary font-medium">Continuous voice session</p>
-                <p className="text-xs text-text-muted">Start from the Command Center. Say "stop", "bye", or "end session" to exit.</p>
+      {/* TTS / Voice behaviour */}
+      <CyberPanel>
+        <ST label="VOICE BEHAVIOUR" />
+        <Row label="VOICE OUTPUT" sub="Enable spoken AI responses">
+          <Toggle checked={settings.voiceEnabled} onChange={() => saveSettings({ voiceEnabled: !settings.voiceEnabled })} />
+        </Row>
+        <Row label="VOLUME" sub="TTS output volume">
+          <div className="flex items-center gap-2">
+            <input type="range" min="0" max="1" step="0.05"
+              value={settings.volume ?? 1}
+              onChange={e => saveSettings({ volume: parseFloat(e.target.value) })}
+              className="w-20 accent-[#ff2020]" />
+            <span className="font-mono text-[10px] tabular-nums text-text-muted w-8">
+              {Math.round((settings.volume ?? 1) * 100)}%
+            </span>
+          </div>
+        </Row>
+
+        {/* Behaviour mode */}
+        <div className="pt-3">
+          <p className="mb-2 font-mono text-[10px] text-text-muted">BEHAVIOUR MODE</p>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {MODE_OPTIONS.map(opt => (
+              <button key={opt.id} onClick={() => saveSettings({ mode: opt.id })}
+                className={cn(
+                  'rounded border p-2 text-left transition-all',
+                  settings.mode === opt.id
+                    ? 'border-[#ff2020] bg-[rgba(255,32,32,0.08)]'
+                    : 'border-[rgba(255,32,32,0.15)] hover:border-[rgba(255,32,32,0.3)]',
+                )}>
+                <p className="font-mono text-[10px] font-bold"
+                  style={{ color: settings.mode === opt.id ? '#ff2020' : '#94a3b8' }}>
+                  {opt.label}
+                </p>
+                <p className="mt-0.5 font-mono text-[9px] text-text-muted leading-tight">{opt.desc}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+      </CyberPanel>
+
+      {/* OpenAI voice */}
+      <CyberPanel>
+        <ST label="OPENAI TTS VOICE" />
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+          {(['alloy','echo','fable','onyx','nova','shimmer'] as OpenAIVoice[]).map(v => (
+            <button key={v} onClick={() => saveSettings({ voice: v })}
+              className={cn(
+                'rounded border py-2 font-mono text-[10px] uppercase transition-all',
+                settings.voice === v
+                  ? 'border-[#ff2020] bg-[rgba(255,32,32,0.1)] text-[#ff2020]'
+                  : 'border-[rgba(255,32,32,0.15)] text-text-muted hover:border-[rgba(255,32,32,0.3)] hover:text-text-secondary',
+              )}>
+              {v}
+            </button>
+          ))}
+        </div>
+      </CyberPanel>
+
+      {/* Kokoro voices */}
+      {voiceGroups.length > 0 && (
+        <CyberPanel>
+          <ST label="KOKORO LOCAL TTS VOICES" />
+          {previewErr && (
+            <p className="mb-2 font-mono text-[10px] text-[#ef4444]">{previewErr}</p>
+          )}
+          <div className="space-y-2">
+            {voiceGroups.map(grp => {
+              const open = expandedGrp.has(grp.name)
+              return (
+                <div key={grp.name} className="rounded border border-[rgba(255,32,32,0.15)]">
+                  <button onClick={() => {
+                      setExpandedGrp(prev => {
+                        const s = new Set(prev)
+                        open ? s.delete(grp.name) : s.add(grp.name)
+                        return s
+                      })
+                    }}
+                    className="flex w-full items-center justify-between px-3 py-2 hover:bg-[rgba(255,32,32,0.04)]">
+                    <span className="font-mono text-[10px] text-text-secondary">{grp.name}</span>
+                    {open ? <ChevronDown className="h-3.5 w-3.5 text-text-muted" />
+                           : <ChevronRight className="h-3.5 w-3.5 text-text-muted" />}
+                  </button>
+                  {open && (
+                    <div className="grid grid-cols-1 gap-1 border-t border-[rgba(255,32,32,0.1)] p-2 sm:grid-cols-2">
+                      {grp.voices.map(v => (
+                        <div key={v.id}
+                          className={cn(
+                            'flex items-center justify-between gap-2 rounded border px-2 py-1.5 transition-all',
+                            settings.voice === v.id
+                              ? 'border-[#ff2020] bg-[rgba(255,32,32,0.08)]'
+                              : 'border-[rgba(255,32,32,0.1)] hover:border-[rgba(255,32,32,0.25)]',
+                          )}>
+                          <button className="min-w-0 flex-1 text-left" onClick={() => saveSettings({ voice: v.id })}>
+                            <p className="font-mono text-[10px]"
+                              style={{ color: settings.voice === v.id ? '#ff2020' : '#94a3b8' }}>
+                              {v.label}
+                            </p>
+                            <p className="font-mono text-[9px] text-text-muted truncate">{v.desc}</p>
+                          </button>
+                          <button onClick={() => previewVoice(v.id)} disabled={!!previewing}
+                            className="flex-shrink-0 rounded border border-[rgba(255,32,32,0.2)] p-1 text-[#ff2020] disabled:opacity-40 hover:bg-[rgba(255,32,32,0.08)]">
+                            {previewing === v.id
+                              ? <Volume2 className="h-3.5 w-3.5 animate-pulse" />
+                              : <Play    className="h-3.5 w-3.5" />}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </CyberPanel>
+      )}
+
+      {/* MCP Servers */}
+      {status?.mcp_servers && status.mcp_servers.length > 0 && (
+        <CyberPanel>
+          <ST label="ACTIVE MCP SERVERS" />
+          <div className="space-y-1.5">
+            {status.mcp_servers.map(s => (
+              <div key={s} className="flex items-center gap-2">
+                <span className="h-1.5 w-1.5 rounded-full bg-[#00ff88] shadow-[0_0_4px_rgba(0,255,136,0.8)]" />
+                <span className="font-mono text-[11px] text-text-secondary">{s}</span>
               </div>
-            </div>
-          </CardContent>
-        </Card>
+            ))}
+          </div>
+        </CyberPanel>
+      )}
 
-        {/* Environment Variables */}
-        <Card>
-          <CardHeader><CardTitle>Environment Variables</CardTitle></CardHeader>
-          <CardContent className="pt-0">
-            <p className="text-xs text-text-muted mb-3">
-              Showing which keys are expected (values are never displayed).
-            </p>
-            <ul className="space-y-2">
-              {ENV_VARS.map((key) => (
-                <li key={key} className="flex items-center gap-2 py-1.5 border-b border-surface-border last:border-0">
-                  <code className="text-xs font-mono text-text-secondary flex-1">{key}</code>
-                  <span className="text-xs text-text-muted">backend/.env</span>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-
-        {/* About */}
-        <Card>
-          <CardHeader><CardTitle>About Xyron</CardTitle></CardHeader>
-          <CardContent className="pt-0 space-y-2">
-            <div className="flex justify-between py-1.5 border-b border-surface-border">
-              <span className="text-xs text-text-muted">Version</span>
-              <span className="text-xs text-text-secondary">1.0.0</span>
+      {/* Env vars checklist */}
+      <CyberPanel>
+        <ST label="ENVIRONMENT CONFIGURATION" />
+        <div className="space-y-2">
+          {ENV_VARS.map(k => (
+            <div key={k} className="flex items-center gap-2.5">
+              <span className="font-mono text-[10px] w-36 flex-shrink-0 text-text-muted">{k}</span>
+              <div className="flex-1 h-px bg-[rgba(255,32,32,0.08)]" />
+              <span className="font-mono text-[10px] text-text-muted italic">set in backend/.env</span>
             </div>
-            <div className="flex justify-between py-1.5 border-b border-surface-border">
-              <span className="text-xs text-text-muted">API</span>
-              <span className="text-xs text-text-secondary font-mono">http://localhost:8000</span>
-            </div>
-            <div className="flex justify-between py-1.5">
-              <span className="text-xs text-text-muted">Docs</span>
-              <a
-                href="http://localhost:8000/docs"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-xs text-brand-light hover:underline"
-              >
-                OpenAPI
-              </a>
-            </div>
-          </CardContent>
-        </Card>
-
-      </div>
-    </PageTransition>
+          ))}
+        </div>
+      </CyberPanel>
+    </div>
   )
 }

@@ -1,6 +1,7 @@
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: ['172.25.229.111'],
   // Required for SharedArrayBuffer → enables Silero VAD's threaded ONNX WASM
   async headers() {
     return [

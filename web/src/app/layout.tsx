@@ -1,8 +1,23 @@
 import type { Metadata } from 'next'
+import { Orbitron, Share_Tech_Mono } from 'next/font/google'
 import './globals.css'
 
+const orbitron = Orbitron({
+  subsets: ['latin'],
+  weight: ['400', '500', '600', '700', '900'],
+  variable: '--font-orbitron',
+  display: 'swap',
+})
+
+const shareTechMono = Share_Tech_Mono({
+  subsets: ['latin'],
+  weight: '400',
+  variable: '--font-sharetech',
+  display: 'swap',
+})
+
 export const metadata: Metadata = {
-  title: 'Xyron — Voice Driven AI OS',
+  title: 'XYRON AI SYSTEM — v2.0.0 OMEGA',
   description: 'Xyron — Voice Driven AI OS. Automate your work with a voice-first AI assistant.',
   icons: {
     icon: [
@@ -15,16 +30,10 @@ export const metadata: Metadata = {
   },
 }
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body>
-        {children}
-      </body>
+    <html lang="en" className={`${orbitron.variable} ${shareTechMono.variable}`}>
+      <body className="font-sans">{children}</body>
     </html>
   )
 }

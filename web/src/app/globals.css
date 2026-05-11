@@ -3,81 +3,153 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: dark;
+  --cyber-red: #ff2020;
+  --cyber-red-dark: #cc0000;
+  --cyber-cyan: #00ffff;
+  --cyber-green: #00ff88;
+  --cyber-dark: #0a0a0a;
+  --border-red: rgba(255, 32, 32, 0.3);
+  --glow-red: 0 0 12px rgba(255, 32, 32, 0.3), 0 0 24px rgba(255, 32, 32, 0.1);
 }
 
 * {
   box-sizing: border-box;
 }
 
-html,
-body {
-  height: 100%;
+html {
+  scroll-behavior: smooth;
 }
 
 body {
-  background-color: #08080f;
+  background-color: #0a0a0a;
   color: #f1f5f9;
-  font-family: Inter, system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  font-family: 'Orbitron', system-ui, sans-serif;
 }
 
-::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+/* ── Scrollbar ─────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #0a0a0a; }
+::-webkit-scrollbar-thumb { background: rgba(255, 32, 32, 0.4); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 32, 32, 0.7); }
+
+/* ── Cyber panel base ──────────────────────────────────── */
+.cyber-panel {
+  background: rgba(13, 13, 13, 0.95);
+  border: 1px solid rgba(255, 32, 32, 0.3);
+  box-shadow: 0 0 12px rgba(255, 32, 32, 0.15);
+  border-radius: 6px;
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
 }
 
-::-webkit-scrollbar-track {
-  background: transparent;
+.cyber-panel:hover {
+  border-color: rgba(255, 32, 32, 0.5);
+  box-shadow: 0 0 20px rgba(255, 32, 32, 0.25);
 }
 
-::-webkit-scrollbar-thumb {
-  background: #1e1e30;
-  border-radius: 2px;
+/* ── Neon text helpers ─────────────────────────────────── */
+.neon-red {
+  color: #ff2020;
+  text-shadow: 0 0 8px rgba(255, 32, 32, 0.9), 0 0 20px rgba(255, 32, 32, 0.5);
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #2a2a40;
+.neon-cyan {
+  color: #00ffff;
+  text-shadow: 0 0 8px rgba(0, 255, 255, 0.9), 0 0 20px rgba(0, 255, 255, 0.5);
 }
 
-/* ── Takeover glitch effect ───────────────────────────────────────────────── */
-
-@keyframes glitch-r {
-  0%   { clip-path: inset(12% 0 72% 0); transform: translateX(-4px) }
-  25%  { clip-path: inset(55% 0 20% 0); transform: translateX(3px) }
-  50%  { clip-path: inset(30% 0 45% 0); transform: translateX(-2px) }
-  75%  { clip-path: inset(80% 0 5%  0); transform: translateX(5px) }
-  100% { clip-path: inset(0%  0 90% 0); transform: translateX(0px) }
+.neon-green {
+  color: #00ff88;
+  text-shadow: 0 0 8px rgba(0, 255, 136, 0.9);
 }
 
-@keyframes glitch-g {
-  0%   { clip-path: inset(60% 0 10% 0); transform: translateX(3px) }
-  25%  { clip-path: inset(20% 0 60% 0); transform: translateX(-4px) }
-  50%  { clip-path: inset(75% 0 5%  0); transform: translateX(2px) }
-  75%  { clip-path: inset(10% 0 40% 0); transform: translateX(-3px) }
-  100% { clip-path: inset(45% 0 25% 0); transform: translateX(0px) }
+/* ── Scanlines overlay ─────────────────────────────────── */
+.scanlines {
+  position: relative;
+  overflow: hidden;
 }
 
-@keyframes glitch-b {
-  0%   { clip-path: inset(35% 0 40% 0); transform: translateX(5px) }
-  25%  { clip-path: inset(70% 0 15% 0); transform: translateX(-2px) }
-  50%  { clip-path: inset(5%  0 80% 0); transform: translateX(4px) }
-  75%  { clip-path: inset(50% 0 30% 0); transform: translateX(-5px) }
-  100% { clip-path: inset(20% 0 55% 0); transform: translateX(0px) }
+.scanlines::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.04) 2px,
+    rgba(0, 0, 0, 0.04) 4px
+  );
+  pointer-events: none;
+  z-index: 2;
 }
 
-.glitch-r {
-  background: rgba(255, 0, 0, 0.15);
-  animation: glitch-r 0.16s steps(4) forwards;
+/* ── Terminal text ─────────────────────────────────────── */
+.terminal-text {
+  font-family: 'Share Tech Mono', monospace;
+  color: #00ff88;
 }
-.glitch-g {
-  background: rgba(0, 255, 100, 0.10);
-  animation: glitch-g 0.16s steps(4) forwards;
-  animation-delay: 0.02s;
+
+/* ── Progress bar ──────────────────────────────────────── */
+.progress-bar-fill {
+  animation: progressFill 1.5s ease-out forwards;
 }
-.glitch-b {
-  background: rgba(60, 80, 255, 0.15);
-  animation: glitch-b 0.16s steps(4) forwards;
-  animation-delay: 0.04s;
+
+@keyframes progressFill {
+  from { width: 0% }
+  to   { width: var(--tw-progress-width, 0%) }
+}
+
+/* ── Hide scrollbar on nav tabs ────────────────────────── */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* ── Orb glow ──────────────────────────────────────────── */
+.orb-glow {
+  background: radial-gradient(circle, #ff2020 0%, #cc0000 40%, rgba(204,0,0,0.2) 70%, transparent 100%);
+  border-radius: 50%;
+  animation: pulseOrb 2.5s ease-in-out infinite;
+}
+
+@keyframes pulseOrb {
+  0%, 100% { transform: scale(1); opacity: 0.85; box-shadow: 0 0 30px rgba(255,32,32,0.5), 0 0 60px rgba(255,32,32,0.2); }
+  50%       { transform: scale(1.1); opacity: 1;    box-shadow: 0 0 50px rgba(255,32,32,0.8), 0 0 90px rgba(255,32,32,0.4); }
+}
+
+/* ── Takeover button ───────────────────────────────────── */
+.btn-takeover {
+  background: linear-gradient(135deg, #cc0000, #ff2020);
+  border: 1px solid rgba(255,32,32,0.6);
+  animation: pulseRed 2s ease-in-out infinite;
+  transition: transform 0.15s ease;
+}
+
+.btn-takeover:hover { transform: scale(1.02); }
+.btn-takeover:active { transform: scale(0.98); }
+
+@keyframes pulseRed {
+  0%, 100% { box-shadow: 0 0 20px rgba(255,32,32,0.5), 0 0 40px rgba(255,32,32,0.2); }
+  50%       { box-shadow: 0 0 40px rgba(255,32,32,0.9), 0 0 80px rgba(255,32,32,0.5); }
+}
+
+/* ── Pipeline flow dot ─────────────────────────────────── */
+.pipeline-dot {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ff2020;
+  box-shadow: 0 0 8px rgba(255,32,32,0.8);
+  animation: flowDot 2.5s linear infinite;
+}
+
+.pipeline-dot-2 { animation-delay: 0.8s; }
+.pipeline-dot-3 { animation-delay: 1.6s; }
+
+@keyframes flowDot {
+  0%   { left: -8%;  opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { left: 108%; opacity: 0; }
 }

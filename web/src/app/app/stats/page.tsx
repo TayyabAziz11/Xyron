@@ -1,203 +1,201 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
-import { motion } from 'framer-motion'
-import { BarChart2, Zap, Clock, TrendingUp, RefreshCw, Loader2 } from 'lucide-react'
-import { PageTransition } from '@/components/layout/PageTransition'
+import { useState, useEffect } from 'react'
+import { RefreshCw, Cpu, MemoryStick, HardDrive, Thermometer } from 'lucide-react'
+import { useApi } from '@/hooks/useApi'
+import { useSystemMetrics } from '@/hooks/useSystemMetrics'
+import { api } from '@/lib/api'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
-
-interface StatsData {
-  tool_frequency:  Record<string, number>
-  top_tools_now:   string[]
-  activity_24h:    string
-  hourly_patterns: Record<string, Record<string, number>>
-  error?:          string
+function CyberPanel({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  return <div className={`cyber-panel p-4 ${className}`}>{children}</div>
 }
 
-function StatCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
+function ST({ label, live = false }: { label: string; live?: boolean }) {
   return (
-    <div className="rounded-xl border border-surface-border bg-surface-raised p-4">
-      <p className="text-xs font-medium uppercase tracking-wider text-text-muted mb-1">{label}</p>
-      <p className="text-2xl font-bold text-text-primary">{value}</p>
-      {sub && <p className="text-xs text-text-muted mt-0.5">{sub}</p>}
+    <div className="mb-3 flex items-center gap-2">
+      {live && (
+        <span className="relative flex h-2 w-2 flex-shrink-0">
+          <span className="absolute inline-flex h-2 w-2 animate-ping rounded-full bg-[#ff2020] opacity-75" />
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-[#ff2020]" />
+        </span>
+      )}
+      <span className="font-mono text-[10px] font-semibold tracking-[0.2em] text-[#ff2020]">{label}</span>
+      <div className="flex-1 h-px bg-[rgba(255,32,32,0.2)]" />
     </div>
   )
 }
 
-function ToolBar({ tool, count, max }: { tool: string; count: number; max: number }) {
-  const pct = max > 0 ? (count / max) * 100 : 0
+function MBar({ label, value, color = '#ff2020' }: { label: string; value: number; color?: string }) {
   return (
-    <div className="flex items-center gap-3">
-      <span className="w-36 truncate text-xs font-mono text-text-secondary">{tool}</span>
-      <div className="flex-1 h-2 rounded-full bg-surface-overlay overflow-hidden">
-        <motion.div
-          className="h-full rounded-full bg-brand"
-          initial={{ width: 0 }}
-          animate={{ width: `${pct}%` }}
-          transition={{ duration: 0.5, ease: 'easeOut' }}
-        />
+    <div className="space-y-1">
+      <div className="flex justify-between">
+        <span className="font-mono text-[11px] text-text-muted">{label}</span>
+        <span className="font-mono text-[11px] tabular-nums text-text-secondary">{value}%</span>
       </div>
-      <span className="w-8 text-right text-xs text-text-muted">{count}</span>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]">
+        <div className="h-full rounded-full transition-all duration-700"
+          style={{ width: `${value}%`, background: color, boxShadow: `0 0 6px ${color}` }} />
+      </div>
     </div>
+  )
+}
+
+function Tile({ icon: Icon, label, value, sub, color = '#ff2020' }: {
+  icon: React.ElementType; label: string; value: string; sub?: string; color?: string
+}) {
+  return (
+    <CyberPanel className="flex items-center gap-3">
+      <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded border"
+        style={{ borderColor: `${color}40`, background: `${color}10` }}>
+        <Icon className="h-5 w-5" style={{ color }} />
+      </div>
+      <div className="min-w-0">
+        <p className="font-mono text-[10px] tracking-widest text-text-muted">{label}</p>
+        <p className="font-mono text-lg font-bold leading-tight tabular-nums" style={{ color }}>{value}</p>
+        {sub && <p className="font-mono text-[10px] text-text-muted">{sub}</p>}
+      </div>
+    </CyberPanel>
   )
 }
 
 export default function StatsPage() {
-  const [stats,   setStats]   = useState<StatsData | null>(null)
-  const [loading, setLoading] = useState(false)
+  const { data: metrics, error: metricsErr } = useSystemMetrics(2000)
+  const { data: commands, refetch } = useApi(() => api.commands.list(200), { interval: 30_000 })
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const r    = await fetch(`${API_BASE}/api/v1/memory/stats`)
-      const data = await r.json()
-      setStats(data)
-    } catch { /* silent */ } finally { setLoading(false) }
-  }, [])
+  const [cs, setCs] = useState({ total: 0, completed: 0, failed: 0, rate: 0, topAgent: '' })
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    if (!commands) return
+    const total     = commands.length
+    const completed = commands.filter(c => c.status === 'completed').length
+    const failed    = commands.filter(c => c.status === 'failed').length
+    const agents    = commands.map(c => c.agent).filter(Boolean) as string[]
+    const freq      = agents.reduce<Record<string, number>>((a, v) => ({ ...a, [v]: (a[v] ?? 0) + 1 }), {})
+    const topAgent  = Object.entries(freq).sort((a, b) => b[1] - a[1])[0]?.[0] ?? ''
+    setCs({ total, completed, failed, rate: total ? Math.round((completed / total) * 100) : 0, topAgent })
+  }, [commands])
 
-  const freq       = stats?.tool_frequency ?? {}
-  const sortedFreq = Object.entries(freq).sort((a, b) => b[1] - a[1])
-  const maxCount   = sortedFreq[0]?.[1] ?? 1
-  const totalCalls = sortedFreq.reduce((s, [, c]) => s + c, 0)
-  const uniqueTools = sortedFreq.length
+  const buckets = Array<number>(7).fill(0)
+  if (commands) {
+    const now = Date.now()
+    commands.forEach(c => {
+      const h = Math.floor((now - new Date(c.created_at).getTime()) / 3_600_000)
+      if (h >= 0 && h < 7) buckets[6 - h]++
+    })
+  }
+  const maxB = Math.max(...buckets, 1)
 
   return (
-    <PageTransition>
-      <div className="flex h-screen flex-col overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-surface-border px-6 py-4">
-          <div className="flex items-center gap-3">
-            <BarChart2 className="h-5 w-5 text-brand" />
-            <h1 className="text-lg font-semibold text-text-primary">Usage Stats</h1>
-          </div>
-          <button
-            onClick={load}
-            className="flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface-raised px-3 py-1.5 text-sm text-text-secondary hover:text-text-primary transition-colors"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-            Refresh
-          </button>
+    <div className="space-y-5 p-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-sm font-black tracking-[0.2em] text-[#ff2020]">SYSTEM ANALYTICS</h1>
+          <p className="font-mono text-[10px] text-text-muted">Real-time hardware + command intelligence</p>
         </div>
+        <button onClick={refetch}
+          className="flex items-center gap-2 rounded border border-[rgba(255,32,32,0.3)] px-3 py-1.5 font-mono text-[10px] text-[#ff2020] transition-all hover:bg-[rgba(255,32,32,0.08)]">
+          <RefreshCw className="h-3 w-3" /> REFRESH
+        </button>
+      </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
-          {loading && !stats && (
-            <div className="flex items-center justify-center py-16 text-text-muted">
-              <Loader2 className="h-5 w-5 animate-spin mr-2" />
-              Loading stats…
+      <div>
+        <ST label="LIVE SYSTEM METRICS" live />
+        {metricsErr ? (
+          <p className="font-mono text-[11px] text-[#ef4444]">Backend offline — metrics unavailable</p>
+        ) : (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <Tile icon={Cpu}         label="CPU USAGE"  value={`${metrics?.cpu_pct ?? '—'}%`}
+              sub={`${metrics?.cpu_cores ?? '?'} cores`} color="#ff2020" />
+            <Tile icon={MemoryStick} label="RAM USAGE"  value={`${metrics?.ram_pct ?? '—'}%`}
+              sub={metrics ? `${metrics.ram_used_gb}/${metrics.ram_total_gb} GB` : ''} color="#00ffff" />
+            <Tile icon={HardDrive}   label="DISK USAGE" value={`${metrics?.disk_pct ?? '—'}%`}
+              sub={metrics ? `${metrics.disk_used_gb}/${metrics.disk_total_gb} GB` : ''} color="#f59e0b" />
+            <Tile icon={Thermometer} label="CPU TEMP"
+              value={metrics?.temp_c != null ? `${metrics.temp_c}°C` : 'N/A'}
+              sub="core temp" color="#00ff88" />
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <CyberPanel>
+          <ST label="RESOURCE UTILIZATION" live />
+          <div className="space-y-3">
+            <MBar label="CPU"  value={metrics?.cpu_pct  ?? 0} color="#ff2020" />
+            <MBar label="RAM"  value={metrics?.ram_pct  ?? 0} color="#00ffff" />
+            <MBar label="DISK" value={metrics?.disk_pct ?? 0} color="#f59e0b" />
+            <MBar label="SWAP" value={metrics?.swap_pct ?? 0} color="#00ff88" />
+          </div>
+          {metrics && (
+            <div className="mt-3 grid grid-cols-2 gap-2 border-t border-[rgba(255,32,32,0.1)] pt-3">
+              {[
+                { l: 'UPTIME',   v: metrics.uptime_str },
+                { l: 'CPU FREQ', v: metrics.cpu_freq_mhz ? `${metrics.cpu_freq_mhz} MHz` : 'N/A' },
+                { l: 'NET SENT', v: `${(metrics.net_bytes_sent / 1_048_576).toFixed(1)} MB` },
+                { l: 'NET RECV', v: `${(metrics.net_bytes_recv / 1_048_576).toFixed(1)} MB` },
+              ].map(({ l, v }) => (
+                <div key={l}>
+                  <p className="font-mono text-[9px] text-text-muted">{l}</p>
+                  <p className="font-mono text-[11px] font-bold tabular-nums text-text-secondary">{v}</p>
+                </div>
+              ))}
             </div>
           )}
+        </CyberPanel>
 
-          {stats && (
-            <>
-              {/* Summary cards */}
-              <div className="grid grid-cols-3 gap-4">
-                <StatCard label="Total Commands" value={totalCalls} sub="all time" />
-                <StatCard label="Unique Tools" value={uniqueTools} sub="ever used" />
-                <StatCard label="Active Now" value={stats.top_tools_now.length > 0 ? stats.top_tools_now[0] : '—'} sub="top tool this hour" />
+        <CyberPanel>
+          <ST label="COMMAND STATISTICS" />
+          <div className="mb-4 grid grid-cols-3 gap-2">
+            {[
+              { l: 'TOTAL',     v: cs.total,     color: '#ff2020' },
+              { l: 'COMPLETED', v: cs.completed, color: '#00ff88' },
+              { l: 'FAILED',    v: cs.failed,    color: '#ef4444' },
+            ].map(({ l, v, color }) => (
+              <div key={l} className="rounded border py-2 text-center"
+                style={{ borderColor: `${color}30`, background: `${color}08` }}>
+                <p className="font-mono text-xl font-black tabular-nums" style={{ color }}>{v}</p>
+                <p className="font-mono text-[9px] text-text-muted">{l}</p>
               </div>
-
-              {/* Activity summary */}
-              {stats.activity_24h && (
-                <div className="rounded-xl border border-brand/20 bg-brand/5 px-4 py-3">
-                  <div className="flex items-center gap-2 mb-1.5">
-                    <TrendingUp className="h-4 w-4 text-brand" />
-                    <span className="text-xs font-semibold uppercase tracking-wider text-brand">24h Summary</span>
-                  </div>
-                  <p className="text-sm text-text-primary leading-relaxed">{stats.activity_24h}</p>
-                </div>
-              )}
-
-              {/* Top tools now */}
-              {stats.top_tools_now.length > 0 && (
-                <div>
-                  <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-text-muted">Top Tools This Hour</p>
-                  <div className="flex flex-wrap gap-2">
-                    {stats.top_tools_now.map((t, i) => (
-                      <span
-                        key={t}
-                        className={`rounded-full px-3 py-1 text-xs font-mono font-medium border ${
-                          i === 0
-                            ? 'border-brand/40 bg-brand/10 text-brand'
-                            : 'border-surface-border bg-surface-raised text-text-secondary'
-                        }`}
-                      >
-                        {i === 0 && <Zap className="inline h-3 w-3 mr-1 -mt-0.5" />}
-                        {t}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Tool frequency chart */}
-              {sortedFreq.length > 0 && (
-                <div>
-                  <p className="mb-4 text-xs font-semibold uppercase tracking-wider text-text-muted">Tool Usage Frequency</p>
-                  <div className="space-y-3">
-                    {sortedFreq.slice(0, 15).map(([tool, count]) => (
-                      <ToolBar key={tool} tool={tool} count={count} max={maxCount} />
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Hourly patterns heatmap (top 5 tools) */}
-              {Object.keys(stats.hourly_patterns).length > 0 && (
-                <div>
-                  <p className="mb-4 text-xs font-semibold uppercase tracking-wider text-text-muted">Hourly Patterns (last 7 days)</p>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr>
-                          <th className="text-left pr-3 pb-2 font-medium text-text-muted w-36">Tool</th>
-                          {Array.from({ length: 24 }, (_, h) => (
-                            <th key={h} className="pb-2 font-medium text-text-muted text-center w-7">
-                              {h % 6 === 0 ? `${h}h` : ''}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {Object.entries(stats.hourly_patterns)
-                          .sort((a, b) =>
-                            Object.values(b[1]).reduce((s, v) => s + v, 0) -
-                            Object.values(a[1]).reduce((s, v) => s + v, 0)
-                          )
-                          .slice(0, 8)
-                          .map(([tool, hours]) => {
-                            const hourMax = Math.max(...Object.values(hours), 1)
-                            return (
-                              <tr key={tool}>
-                                <td className="pr-3 py-0.5 font-mono text-text-secondary truncate max-w-[9rem]">{tool}</td>
-                                {Array.from({ length: 24 }, (_, h) => {
-                                  const cnt = hours[String(h).padStart(2, '0')] ?? 0
-                                  const opacity = cnt > 0 ? 0.2 + (cnt / hourMax) * 0.8 : 0
-                                  return (
-                                    <td key={h} className="py-0.5 text-center">
-                                      <div
-                                        className="mx-auto h-4 w-5 rounded-sm"
-                                        style={{ backgroundColor: cnt > 0 ? `rgba(99,102,241,${opacity})` : 'transparent' }}
-                                        title={cnt > 0 ? `${tool} at ${h}:00 — ${cnt}×` : undefined}
-                                      />
-                                    </td>
-                                  )
-                                })}
-                              </tr>
-                            )
-                          })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </div>
+            ))}
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex justify-between">
+              <span className="font-mono text-[10px] text-text-muted">SUCCESS RATE</span>
+              <span className="font-mono text-[10px] text-[#00ff88]">{cs.rate}%</span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]">
+              <div className="h-full rounded-full bg-[#00ff88] transition-all duration-700"
+                style={{ width: `${cs.rate}%`, boxShadow: '0 0 6px rgba(0,255,136,0.5)' }} />
+            </div>
+            {cs.topAgent && (
+              <p className="pt-1 font-mono text-[10px] text-text-muted">
+                TOP AGENT: <span className="text-[#00ffff]">{cs.topAgent.toUpperCase()}</span>
+              </p>
+            )}
+          </div>
+        </CyberPanel>
       </div>
-    </PageTransition>
+
+      <CyberPanel>
+        <ST label="COMMAND FREQUENCY — LAST 7 HOURS" />
+        <div className="flex h-24 items-end gap-2">
+          {buckets.map((n, i) => {
+            const h = new Date(); h.setHours(h.getHours() - (6 - i))
+            return (
+              <div key={i} className="flex flex-1 flex-col items-center gap-1">
+                {n > 0 && <span className="font-mono text-[9px] text-[#ff2020] tabular-nums">{n}</span>}
+                <div className="w-full rounded-t transition-all duration-700"
+                  style={{
+                    height: `${Math.max((n / maxB) * 64, n > 0 ? 4 : 2)}px`,
+                    background: n > 0 ? 'linear-gradient(to top,#cc0000,#ff4444)' : 'rgba(255,32,32,0.1)',
+                    boxShadow: n > 0 ? '0 0 4px rgba(255,32,32,0.4)' : 'none',
+                  }} />
+                <span className="font-mono text-[8px] text-text-muted">{h.getHours()}H</span>
+              </div>
+            )
+          })}
+        </div>
+      </CyberPanel>
+    </div>
   )
 }

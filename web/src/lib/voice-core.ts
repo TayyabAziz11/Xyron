@@ -739,8 +739,8 @@ export function speakBrowser(text: string): Promise<void> {
 // ── API base URL ──────────────────────────────────────────────────────────────
 
 export function getApiBase(): string {
-  if (typeof window === 'undefined') return 'http://localhost:8000'
-  return process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+  if (typeof window === 'undefined') return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  return ''
 }
 
 // ── Audio unlock ─────────────────────────────────────────────────────────────
