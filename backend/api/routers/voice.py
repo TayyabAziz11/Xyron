@@ -12,11 +12,27 @@ import uuid
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from typing import Optional
 from pydantic import BaseModel
 from ..constants.prompts import CORE_IDENTITY
+from ..services.cognitive_state import cognitive_state
 
 router = APIRouter(prefix="/api/v1/voice", tags=["voice"])
 logger = logging.getLogger(__name__)
+
+# ── Emotion detection state ───────────────────────────────────────────────────
+_emotion_detector = None   # AudioEmotionDetector instance, lazy-initialized
+_last_emotion_result: Optional[object] = None  # last EmotionResult, updated per STT call
+
+
+def _get_emotion_detector():
+    """Return shared AudioEmotionDetector instance (created on first call)."""
+    global _emotion_detector
+    if _emotion_detector is None:
+        _ensure_paths()
+        from voice.emotion_detector import AudioEmotionDetector
+        _emotion_detector = AudioEmotionDetector()
+    return _emotion_detector
 
 # ── Lazy service imports (avoid circular deps at module load) ─────────────────
 def _get_history():
@@ -230,6 +246,13 @@ async def transcribe_audio(audio: UploadFile = File(...)):
                 )
                 return {"success": True, "data": {"text": "", "language": "en", "engine": "local"}}
             logger.info("Local Whisper: %r", text[:60])
+            # ── Emotion detection ──────────────────────────────────────────────
+            global _last_emotion_result
+            try:
+                _last_emotion_result = _get_emotion_detector().detect(audio_bytes)
+                cognitive_state.update(last_user_emotion=_last_emotion_result.emotion)
+            except Exception as _emo_exc:
+                logger.warning("[EmotionDetector] skipped: %s", _emo_exc)
             return {"success": True, "data": {"text": text, "language": info.language, "engine": "local"}}
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -241,6 +264,24 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
     # ── 3. Empty fallback ─────────────────────────────────────────────────────
     return {"success": True, "data": {"text": "", "language": "en", "engine": "none"}}
+
+
+# ── Emotion state endpoint ─────────────────────────────────────────────────────
+
+@router.get("/emotion")
+async def get_last_emotion():
+    """Return the most recently detected user emotion from the last STT call.
+
+    Reads from the module-level _last_emotion_result updated by /transcribe.
+    Returns null emotion fields if no detection has run yet.
+    """
+    if _last_emotion_result is None:
+        return {"emotion": None, "confidence": None, "features": {}}
+    return {
+        "emotion": _last_emotion_result.emotion,
+        "confidence": round(_last_emotion_result.confidence, 3),
+        "features": {k: round(float(v), 4) for k, v in _last_emotion_result.features.items()},
+    }
 
 
 # ── Wake word detection ───────────────────────────────────────────────────────
@@ -874,10 +915,10 @@ _MORNING_RE = re.compile(
 
 # ── Jarvis / Home Mode ────────────────────────────────────────────────────────
 _JARVIS_HOME_RE = re.compile(
-    r"(?:xyron[\s,]+)?i(?:'m|\\s+am)\s+(?:home|back)"
+    r"(?:xyron[\s,]+)?i(?:'m|\s+am)\s+(?:home|back)"
     r"|i\s+just\s+(?:got|arrived)\s+(?:home|back)"
     r"|welcome\s+me\s+home"
-    r"|i(?:'ve|\\s+have)\s+arrived\s+home",
+    r"|i(?:'ve|\s+have)\s+arrived\s+home",
     re.IGNORECASE,
 )
 

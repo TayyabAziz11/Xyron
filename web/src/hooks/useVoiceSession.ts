@@ -726,6 +726,18 @@ export function useVoiceSession() {
       }
     }
 
+    // ── I'm Home protocol ─────────────────────────────────────────────────
+    if (/(?:xyron[\s,]+)?i(?:'m|\s+am)\s+(?:home|back)|i\s+just\s+(?:got|arrived)\s+(?:home|back)|welcome\s+me\s+home|i(?:'ve|\s+have)\s+arrived\s+home/i.test(transcript)) {
+      console.log('[VOICE] route: im-home protocol')
+      addMsg('user', transcript)
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('xyron:im-home'))
+      }
+      transition('idle')
+      isRunningRef.current = false
+      return
+    }
+
     // ── Stop command ──────────────────────────────────────────────────────
     if (isStopPhrase(transcript)) {
       console.log('[VOICE] route: stop command')
@@ -926,9 +938,11 @@ export function useVoiceSession() {
 
           onModeChange: (mode) => {
             currentModeRef.current = mode
+            if (mode === 'jarvis' && typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('xyron:im-home'))
+            }
             const modeMessages: Record<string, string> = {
               morning:       'Morning routine started — weather, calendar, and music opened.',
-              jarvis:        'Welcome home — system stats ready.',
               entertainment: 'Entertainment mode — opening content for you.',
             }
             const hint = modeMessages[mode]

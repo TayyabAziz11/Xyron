@@ -31,6 +31,8 @@ import { useTasks }            from '@/hooks/useTasks'
 import { useProactive }        from '@/hooks/useProactive'
 import { useTakeoverMode }     from '@/hooks/useTakeoverMode'
 import TakeoverOrchestrator    from '@/components/takeover/TakeoverOrchestrator'
+import ImHomeProtocol          from '@/components/im-home/ImHomeProtocol'
+import { useImHomeProtocol }   from '@/hooks/useImHomeProtocol'
 import type { Command, Draft } from '@/lib/types'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,6 +57,8 @@ const STATUS_COLOR: Record<string, string> = {
   running:   '#ff2020',
   queued:    '#94a3b8',
 }
+
+const IM_HOME_RE = /(?:xyron[\s,]+)?i(?:'m|\s+am)\s+(?:home|back)|i\s+just\s+(?:got|arrived)\s+(?:home|back)|welcome\s+me\s+home|i(?:'ve|\s+have)\s+arrived\s+home/i
 
 // ── Animated Orb ─────────────────────────────────────────────────────────────
 
@@ -296,6 +300,7 @@ export default function CommandCenterPage() {
   const [activeTab, setActiveTab] = useState<'voice'|'history'|'tasks'|'macros'|'notes'|'meeting'>('voice')
   const { notifications, dismiss: dismissNotif } = useProactive()
   const { phase: takeoverPhase, systemLine: takeoverLine, controlLevel: takeoverLevel, showDirective: takeoverDirective, stopTakeover } = useTakeoverMode()
+  const { phase: imHomePhase, data: imHomeData, logs: imHomeLogs, dismiss: dismissImHome } = useImHomeProtocol()
   const [currentDraft, setCurrentDraft]   = useState<Draft | null>(null)
   const [textInput, setTextInput]         = useState('')
   const [activeProfile, setActiveProfile] = useState('assistant')
@@ -348,6 +353,10 @@ export default function CommandCenterPage() {
 
   const handleTextSubmit = useCallback(async (text: string) => {
     setCurrentDraft(null)
+    if (IM_HOME_RE.test(text.trim())) {
+      window.dispatchEvent(new CustomEvent('xyron:im-home'))
+      return
+    }
     await submit(text)
     refetch()
   }, [submit, refetch])
@@ -841,6 +850,9 @@ export default function CommandCenterPage() {
 
       {/* Cinematic takeover */}
       <TakeoverOrchestrator phase={takeoverPhase} systemLine={takeoverLine} controlLevel={takeoverLevel} showDirective={takeoverDirective} onClose={stopTakeover} />
+
+      {/* I'm Home protocol overlay */}
+      <ImHomeProtocol phase={imHomePhase} data={imHomeData} logs={imHomeLogs} onDismiss={dismissImHome} />
     </PageTransition>
   )
 }

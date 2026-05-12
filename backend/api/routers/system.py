@@ -979,3 +979,201 @@ async def calendar_events(days_ahead: int = 1):
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, registry.execute, "list_events", {"days_ahead": days_ahead}, {})
     return {"success": result.success, "spoken": result.spoken, "message": result.text, "data": result.data}
+
+
+# ── I'm Home Briefing Endpoint ─────────────────────────────────────────────────
+
+_WMO_CODES: dict[int, str] = {
+    0: "clear sky",       1: "mainly clear",      2: "partly cloudy",       3: "overcast",
+    45: "foggy",          48: "freezing fog",
+    51: "light drizzle",  53: "drizzle",           55: "heavy drizzle",
+    56: "icy drizzle",    57: "heavy icy drizzle",
+    61: "light rain",     63: "rain",              65: "heavy rain",
+    66: "freezing rain",  67: "heavy freezing rain",
+    71: "light snow",     73: "snow",              75: "heavy snow",         77: "snow grains",
+    80: "light showers",  81: "showers",           82: "violent showers",
+    85: "snow showers",   86: "heavy snow showers",
+    95: "thunderstorm",   96: "thunderstorm with hail", 99: "severe thunderstorm",
+}
+
+@router.get("/home-briefing")
+async def home_briefing():
+    """Aggregate real-time data for the I'm Home cinematic protocol.
+
+    Returns system metrics, Karachi weather (Open-Meteo), and AI news (HN Algolia).
+    All external calls have 4s timeouts and fail gracefully.
+    """
+    import time as _time
+    import asyncio as _asyncio
+
+    # wttr.in extended weather codes → human description
+    _WTTR_CODES: dict[int, str] = {
+        113: "sunny",          116: "partly cloudy",  119: "cloudy",
+        122: "overcast",       143: "hazy",            248: "foggy",
+        260: "freezing fog",   176: "light showers",   179: "sleet showers",
+        182: "light sleet",    200: "thundery nearby", 227: "blowing snow",
+        230: "blizzard",       263: "light drizzle",   266: "light drizzle",
+        281: "freezing drizzle", 284: "heavy freezing drizzle",
+        293: "light rain",     296: "light rain",      299: "moderate rain",
+        302: "moderate rain",  305: "heavy rain",      308: "heavy rain",
+        311: "freezing rain",  317: "light sleet",     320: "moderate sleet",
+        323: "light snow",     326: "light snow",      329: "moderate snow",
+        332: "moderate snow",  335: "heavy snow",      338: "heavy snow",
+        350: "ice pellets",    353: "light showers",   356: "heavy showers",
+        359: "torrential rain", 362: "sleet showers",  368: "snow showers",
+        371: "heavy snow showers", 386: "thundery rain", 389: "heavy thunderstorm",
+        392: "snowy thunderstorm", 395: "heavy snowy thunderstorm",
+    }
+
+    async def _fetch_weather() -> dict:
+        """Primary: wttr.in (real observation data). Fallback: Open-Meteo (model data)."""
+        import httpx
+
+        async def _wttr(client: httpx.AsyncClient) -> dict | None:
+            r = await client.get("https://wttr.in/Karachi?format=j1", timeout=5.0)
+            if r.status_code != 200:
+                return None
+            d   = r.json()
+            cc  = d.get("current_condition", [{}])[0]
+            code = int(cc.get("weatherCode", 0))
+            desc = cc.get("weatherDesc", [{}])[0].get("value", "")
+            if not desc:
+                desc = _WTTR_CODES.get(code, "clear")
+            # wttr rain chance: from hourly[0] or nearest3Hours
+            rain_pct = None
+            try:
+                rain_pct = int(d["weather"][0]["hourly"][0].get("chanceofrain", 0))
+            except Exception:
+                pass
+            return {
+                "temp_c":      int(cc.get("temp_C", 0)),
+                "humidity":    int(cc.get("humidity", 0)),
+                "wind_kmh":    int(cc.get("windspeedKmph", 0)),
+                "rain_pct":    rain_pct,
+                "code":        code,
+                "description": desc.lower(),
+            }
+
+        async def _openmeteo(client: httpx.AsyncClient) -> dict | None:
+            r = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": 24.8607, "longitude": 67.0011,
+                    "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
+                    "daily": "precipitation_probability_max",
+                    "timezone": "Asia/Karachi", "forecast_days": 1,
+                },
+                timeout=5.0,
+            )
+            if r.status_code != 200:
+                return None
+            data  = r.json()
+            c     = data.get("current", {})
+            daily = data.get("daily", {})
+            code  = int(c.get("weather_code") or 0)
+            rain_list = daily.get("precipitation_probability_max") or []
+            return {
+                "temp_c":      c.get("temperature_2m"),
+                "humidity":    c.get("relative_humidity_2m"),
+                "wind_kmh":    c.get("wind_speed_10m"),
+                "rain_pct":    rain_list[0] if rain_list else None,
+                "code":        code,
+                "description": _WMO_CODES.get(code, "clear"),
+            }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                result = await _wttr(client)
+                if result and result.get("temp_c"):
+                    return result
+                result2 = await _openmeteo(client)
+                if result2 and result2.get("temp_c"):
+                    return result2
+        except Exception:
+            pass
+        return {"temp_c": None, "humidity": None, "wind_kmh": None, "rain_pct": None, "code": None, "description": "unavailable"}
+
+    async def _fetch_news() -> list:
+        """Fetch latest AI news from HN Algolia (most-recent-first) with Dev.to fallback."""
+        import httpx
+
+        async def _hn(client: httpx.AsyncClient) -> list:
+            r = await client.get(
+                "https://hn.algolia.com/api/v1/search_by_date",
+                params={
+                    "query": "AI LLM GPT Claude Gemini Anthropic OpenAI Mistral agent",
+                    "tags": "story",
+                    "hitsPerPage": 8,
+                    "attributesToRetrieve": "title,url,points",
+                },
+            )
+            if r.status_code != 200:
+                return []
+            hits = r.json().get("hits", [])
+            # Filter out empty titles and non-AI stories
+            return [
+                {"title": h["title"], "url": h.get("url", ""), "points": h.get("points", 0)}
+                for h in hits
+                if h.get("title") and len(h["title"]) > 20
+            ][:6]
+
+        async def _devto(client: httpx.AsyncClient) -> list:
+            r = await client.get(
+                "https://dev.to/api/articles",
+                params={"tag": "ai", "per_page": 5, "top": 1},
+            )
+            if r.status_code != 200:
+                return []
+            arts = r.json()
+            return [
+                {"title": a.get("title", ""), "url": a.get("url", ""), "points": a.get("positive_reactions_count", 0)}
+                for a in arts if a.get("title")
+            ][:5]
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                hn_results = await _hn(client)
+                if hn_results:
+                    return hn_results
+                # HN returned nothing useful — try Dev.to
+                return await _devto(client)
+        except Exception:
+            pass
+        return []
+
+    def _system_metrics() -> dict:
+        try:
+            import psutil
+            GiB = 1024 ** 3
+            cpu = psutil.cpu_percent(interval=0.2)
+            vm  = psutil.virtual_memory()
+            up  = int(_time.time() - psutil.boot_time())
+            h, rem = divmod(up, 3600)
+            m, s   = divmod(rem, 60)
+            processes = len(psutil.pids())
+            return {
+                "cpu_pct": round(cpu, 1),
+                "ram_pct": round(vm.percent, 1),
+                "ram_used_gb": round(vm.used / GiB, 1),
+                "ram_total_gb": round(vm.total / GiB, 1),
+                "uptime_s": up,
+                "uptime_str": f"{h}h {m:02d}m {s:02d}s",
+                "process_count": processes,
+            }
+        except Exception:
+            return {"cpu_pct": 0, "ram_pct": 0, "ram_used_gb": 0, "ram_total_gb": 16, "uptime_s": 0, "uptime_str": "unknown", "process_count": 0}
+
+    weather, news, system = await _asyncio.gather(
+        _fetch_weather(), _fetch_news(), _asyncio.get_event_loop().run_in_executor(None, _system_metrics)
+    )
+
+    return {
+        "success": True,
+        "data": {
+            "system": system,
+            "weather": weather,
+            "news": news,
+            "timestamp": _time.time(),
+        },
+        "message": "ok",
+    }

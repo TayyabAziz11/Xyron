@@ -28,7 +28,7 @@ from .config import settings
 if settings.onnx_provider and not _os.environ.get("ONNX_PROVIDER"):
     _os.environ["ONNX_PROVIDER"] = settings.onnx_provider
     logging.getLogger(__name__).info("[Config] ONNX_PROVIDER=%s", settings.onnx_provider)
-from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset
+from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment
 
 logger = logging.getLogger(__name__)
 
@@ -176,3 +176,4 @@ app.include_router(automation.router, prefix="/api/v1/automation", tags=["automa
 app.include_router(memory.router)
 app.include_router(voice_ws.router)
 app.include_router(dataset.router)
+app.include_router(environment.router)

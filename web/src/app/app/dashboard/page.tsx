@@ -8,6 +8,8 @@ import {
 import { BrainCanvas } from '@/components/dashboard/BrainCanvas'
 import { ParticleCanvas } from '@/components/dashboard/ParticleCanvas'
 import { useSystemMetrics } from '@/hooks/useSystemMetrics'
+import { useEnvironment } from '@/hooks/useEnvironment'
+import EnvironmentPanel from '@/components/system/EnvironmentPanel'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -116,6 +118,7 @@ export default function DashboardPage() {
   const [dateStr, setDateStr] = useState('')
   const terminalRef = useRef<HTMLDivElement>(null)
   const { data: metrics } = useSystemMetrics(2000)
+  const environment = useEnvironment()
 
   // live date string
   useEffect(() => {
@@ -553,6 +556,12 @@ export default function DashboardPage() {
             <button className="mt-3 w-full rounded border border-[rgba(0,255,255,0.3)] py-1.5 font-mono text-[10px] tracking-widest text-[#00ffff] transition-all hover:bg-[rgba(0,255,255,0.06)]">
               OPTIMIZE ENVIRONMENT
             </button>
+          </CyberPanel>
+
+          {/* Live Environment Monitor */}
+          <CyberPanel>
+            <SectionTitle label="LIVE ENVIRONMENT" live />
+            <EnvironmentPanel data={environment} />
           </CyberPanel>
         </div>
       </div>
