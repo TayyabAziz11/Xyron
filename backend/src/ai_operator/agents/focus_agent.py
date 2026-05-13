@@ -44,17 +44,8 @@ class FocusAgent(BaseAgent):
 
     def _enter_focus(self, command: str) -> AgentResult:
         try:
-            from cognition.cognitive_state import cognitive_state
-            from cognition.state_transitions import transition_to_processing
-            cognitive_state.update(
-                active_ui_mode="focus",
-                mood_bias="focused" if hasattr(__import__("cognition.cognitive_state", fromlist=["MoodBias"]).MoodBias, "FOCUSED") else "alert",
-            )
-        except Exception:
-            pass
-        try:
             from cognition.cognitive_state import cognitive_state, MoodBias
-            cognitive_state.update(mood_bias=MoodBias.ALERT)
+            cognitive_state.update(active_ui_mode="focus", mood_bias=MoodBias.ALERT)
         except Exception:
             pass
         logger.info("[FocusAgent] entered focus mode")
