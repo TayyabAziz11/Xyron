@@ -36,8 +36,6 @@ playwright>=1.44.0
 sentence-transformers>=3.0.0
 openai>=1.0.0
 
-# Phase 1 — Semantic memory (ChromaDB vector store, persists to ~/.ai-operator/chroma)
-chromadb>=0.5.0
 
 # Volume control — native Windows COM (works on native Windows Python only; WSL2 uses PowerShell fallback)
 # On Windows: pip install pycaw comtypes
