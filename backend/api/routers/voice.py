@@ -250,7 +250,10 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             global _last_emotion_result
             try:
                 _last_emotion_result = _get_emotion_detector().detect(audio_bytes)
-                cognitive_state.update(last_user_emotion=_last_emotion_result.emotion)
+                cognitive_state.update(
+                    last_user_emotion=_last_emotion_result.emotion,
+                    emotion_intensity=_last_emotion_result.confidence,
+                )
             except Exception as _emo_exc:
                 logger.warning("[EmotionDetector] skipped: %s", _emo_exc)
             return {"success": True, "data": {"text": text, "language": info.language, "engine": "local"}}

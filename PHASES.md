@@ -26,6 +26,7 @@ A living record of every implementation phase. Updated as work ships.
 - Response generator with OpenAI + per-agent template fallback (`response_generator.py`)
 - Wake word service (`wake_word_service.py`)
 - Instant greeting via Kokoro warmup cache + abort-on-timeout
+- **Emotion detection from audio** — `AudioEmotionDetector` in `voice/emotion_detector.py` runs after every Whisper transcription; writes `last_user_emotion` + `emotion_intensity` to `CognitiveState` (rule-based: pitch, RMS energy, ZCR, speech rate → 6 emotion labels)
 
 ---
 
@@ -131,6 +132,25 @@ A living record of every implementation phase. Updated as work ships.
 
 **DSP Integration**
 - `audio_fx` injected into `_kokoro_to_wav()` in `voice.py` — processes every Kokoro output before playback
+
+---
+
+---
+
+## Architecture Notes
+
+### cognitive_state.py — canonical location
+The canonical `CognitiveState` singleton lives in **`backend/cognition/`** (owned by friend's branch).
+`backend/api/services/cognitive_state.py` is a shim that re-exports it — do not modify the shim directly.
+All routers import from `..services.cognitive_state` and will keep working once the shim is in place.
+
+---
+
+## Collaboration Rules
+
+**Before starting any new phase — send a message first.**
+We built Phases 5/6/7/10 while Phase 0 was being planned. No conflict happened but parallel work wastes time.
+The rule: post intent in the repo (or direct message) before writing code for a new phase.
 
 ---
 
