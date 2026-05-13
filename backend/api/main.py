@@ -6,6 +6,7 @@ Agent registry is initialized at startup.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -143,6 +144,17 @@ async def startup() -> None:
     except Exception as _exc:
         import logging
         logging.getLogger(__name__).warning("Background service startup failed: %s", _exc)
+
+    # Phase 9 — start Dev Observer background loop
+    try:
+        _backend_path2 = str(settings.repo_root / "backend")
+        if _backend_path2 not in sys.path:
+            sys.path.insert(0, _backend_path2)
+        from dev.dev_observer import observer_loop
+        asyncio.create_task(observer_loop())
+        logging.getLogger(__name__).info("[DEV_OBSERVER] background task started")
+    except Exception as _exc2:
+        logging.getLogger(__name__).warning("[DEV_OBSERVER] startup skipped: %s", _exc2)
 
 
 # CORS — allow the Next.js dashboard

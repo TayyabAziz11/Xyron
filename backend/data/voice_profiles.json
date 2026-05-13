@@ -1,0 +1,71 @@
+{
+  "active_profile": "echo",
+  "fx_enabled": true,
+  "profiles": {
+    "onyx": {
+      "display_name": "Onyx",
+      "description": "Deep, authoritative, cinematic",
+      "kokoro_voice": "am_adam",
+      "speed": 0.88,
+      "fx_preset": "cinematic",
+      "personality_style": "commanding",
+      "intro_phrases": [
+        "Systems initialized.",
+        "Xyron online.",
+        "All channels active."
+      ]
+    },
+    "echo": {
+      "display_name": "Echo",
+      "description": "Clear, resonant, precise",
+      "kokoro_voice": "af_heart",
+      "speed": 0.92,
+      "fx_preset": "subtle",
+      "personality_style": "direct",
+      "intro_phrases": [
+        "Ready.",
+        "Standing by.",
+        "Awaiting input."
+      ]
+    },
+    "shimmer": {
+      "display_name": "Shimmer",
+      "description": "Bright, warm, expressive",
+      "kokoro_voice": "af_bella",
+      "speed": 0.96,
+      "fx_preset": "warm",
+      "personality_style": "friendly",
+      "intro_phrases": [
+        "Hello, ready to help.",
+        "I'm here.",
+        "What do you need?"
+      ]
+    },
+    "omega": {
+      "display_name": "Omega",
+      "description": "Slow, majestic, synthetic",
+      "kokoro_voice": "am_michael",
+      "speed": 0.78,
+      "fx_preset": "cinematic",
+      "personality_style": "omniscient",
+      "intro_phrases": [
+        "Omega online.",
+        "All parameters nominal.",
+        "Processing complete."
+      ]
+    },
+    "operator": {
+      "display_name": "Operator",
+      "description": "Flat, efficient, no-nonsense",
+      "kokoro_voice": "af_heart",
+      "speed": 1.05,
+      "fx_preset": "crisp",
+      "personality_style": "tactical",
+      "intro_phrases": [
+        "Go.",
+        "Online.",
+        "Ready."
+      ]
+    }
+  }
+}

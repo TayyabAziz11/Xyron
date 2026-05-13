@@ -758,7 +758,7 @@ export default function CommandCenterPage() {
                 <motion.div
                   initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
                   transition={{ duration: 0.3, ease: 'easeOut' }}>
-                  <CodeAssistantPanel onInjectPrompt={(text) => { setTextInput(text); setActiveTab('voice') }} />
+                  <CodeAssistantPanel onInjectPrompt={(text: string) => { setTextInput(text); setActiveTab('voice') }} />
                 </motion.div>
               )}
             </AnimatePresence>
