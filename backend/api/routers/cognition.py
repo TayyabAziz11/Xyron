@@ -232,3 +232,26 @@ async def complete_goal(goal_id: str) -> GoalResponse:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Reflection endpoints ──────────────────────────────────────────────────────
+
+@router.get("/reflection/latest")
+async def reflection_latest() -> list[dict]:
+    """Return the most recent reflection insight stored in semantic memory."""
+    try:
+        from cognition.memory.semantic_store import semantic_store
+        return semantic_store.recall("reflection session summary", n=1)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/reflection/trigger")
+async def reflection_trigger() -> dict:
+    """Manually trigger one reflection cycle (for testing)."""
+    try:
+        from cognition.reflection import reflection_engine
+        result = await reflection_engine.run_reflection_cycle()
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

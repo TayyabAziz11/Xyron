@@ -142,8 +142,7 @@ async def startup() -> None:
             screen_context_service.start(_s.openai_api_key)
             proactive_service.start(_s.openai_api_key)
     except Exception as _exc:
-        import logging
-        logging.getLogger(__name__).warning("Background service startup failed: %s", _exc)
+        logger.warning("Background service startup failed: %s", _exc)
 
     # Phase 9 — start Dev Observer background loop
     try:
@@ -152,9 +151,17 @@ async def startup() -> None:
             sys.path.insert(0, _backend_path2)
         from dev.dev_observer import observer_loop
         asyncio.create_task(observer_loop())
-        logging.getLogger(__name__).info("[DEV_OBSERVER] background task started")
+        logger.info("[DEV_OBSERVER] background task started")
     except Exception as _exc2:
-        logging.getLogger(__name__).warning("[DEV_OBSERVER] startup skipped: %s", _exc2)
+        logger.warning("[DEV_OBSERVER] startup skipped: %s", _exc2)
+
+    # Phase 12 — start Self-Reflection Engine background loop
+    try:
+        from cognition.reflection import reflection_engine
+        asyncio.create_task(reflection_engine.start_loop(interval_minutes=30))
+        logger.info("[REFLECTION] background loop started (30-min interval)")
+    except Exception as _exc3:
+        logger.warning("[REFLECTION] startup skipped: %s", _exc3)
 
 
 # CORS — allow the Next.js dashboard
