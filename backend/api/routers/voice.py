@@ -1262,7 +1262,7 @@ _MEETING_SUMMARY_RE = re.compile(r"summarize\s+(?:what\s+was\s+said|the\s+meetin
 
 # ── Ollama fallback (Feature #8) ─────────────────────────────────────────────
 _OLLAMA_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
-_OLLAMA_MODEL = "llama3"
+_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
 _VOICE_SYSTEM_PROMPT = (
     CORE_IDENTITY + "\n\n"

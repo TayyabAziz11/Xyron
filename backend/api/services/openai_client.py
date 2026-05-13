@@ -208,15 +208,15 @@ openai_client = OpenAIClient()
 
 # ── Offline fallback stub (plug Ollama here later) ────────────────────────────
 
-def offline_generate(prompt: str) -> Optional[str]:
-    """
-    Local LLM fallback — NOT implemented yet.
-
-    When you're ready to add Ollama:
-        import ollama
-        resp = ollama.chat(model="mistral", messages=[{"role":"user","content":prompt}])
-        return resp["message"]["content"]
-    """
-    # TODO: plug in Ollama / llama.cpp here
-    logger.debug("[Offline] Local LLM not configured — no response")
-    return None
+def offline_generate(prompt: str, *, complex: bool = False) -> Optional[str]:
+    """Local Ollama fallback. Uses llama3.2:3b for quick tasks, mistral:7b for complex ones."""
+    model = "mistral:7b" if complex else "llama3.2:3b"
+    try:
+        import ollama as _ollama
+        resp = _ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
+        text = resp["message"]["content"].strip()
+        logger.debug("[Ollama:%s] response length=%d", model, len(text))
+        return text or None
+    except Exception as exc:
+        logger.warning("[Ollama:%s] failed: %s", model, exc)
+        return None
