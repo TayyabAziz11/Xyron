@@ -19,6 +19,11 @@ from .linkedin_agent import LinkedInAgent
 from .reporting_agent import ReportingAgent
 from .integration_agent import IntegrationAgent
 from .approval_agent import ApprovalAgent
+# Phase 7 — agent hierarchy
+from .focus_agent import FocusAgent
+from .memory_agent import MemoryAgent
+from .sentinel_agent import SentinelAgent
+from .planner_agent import PlannerAgent
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,12 @@ def register_all() -> None:
     More specific agents (single-domain) are registered first.
     The fallback/catch-all agents go last.
     """
+    # Phase 7 — cognitive agents registered first (highest specificity)
+    router.register(FocusAgent())
+    router.register(SentinelAgent())
+    router.register(MemoryAgent())
+    router.register(PlannerAgent())
+    # Domain agents
     router.register(EmailAgent())
     router.register(LinkedInAgent())
     router.register(ApprovalAgent())

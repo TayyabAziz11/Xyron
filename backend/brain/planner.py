@@ -107,5 +107,20 @@ class Planner:
         return plan.combined_response() or "Done."
 
 
+    def plan_goal(self, goal_description: str) -> list[str]:
+        """
+        Delegate goal decomposition to planner_agent.
+        Returns an ordered list of step strings, or [] if agent unavailable.
+        """
+        try:
+            from src.ai_operator.agents.router import router as _router
+            result = _router.route_direct("planner_agent", f"plan {goal_description}")
+            if result and result.success:
+                return result.metadata.get("steps", [])
+        except Exception as exc:
+            logger.debug("[Planner] plan_goal delegation error: %s", exc)
+        return []
+
+
 # Module-level singleton
 planner = Planner()

@@ -73,6 +73,22 @@ class CommandRouter:
         """Return names of all registered agents."""
         return [a.name for a in self._agents]
 
+    def route_direct(self, agent_name: str, command: str, **kwargs) -> Optional[AgentResult]:
+        """
+        Route directly to a named agent — bypasses the can_handle() loop.
+        Returns None if no agent with that name is registered.
+        Used by brain/planner.py to delegate goal decomposition to planner_agent.
+        """
+        for agent in self._agents:
+            if agent.name == agent_name:
+                logger.info("Direct route '%s...' → %s", command[:40], agent_name)
+                start = time.monotonic()
+                result = agent.run(command, **kwargs)
+                result.duration_ms = int((time.monotonic() - start) * 1000)
+                return result
+        logger.warning("route_direct: agent %r not registered", agent_name)
+        return None
+
 
 # Module-level singleton — import and use this everywhere
 router = CommandRouter()
