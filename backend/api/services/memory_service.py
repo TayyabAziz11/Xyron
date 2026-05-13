@@ -393,6 +393,17 @@ class MemoryService:
         except Exception:
             pass  # never crash on memory extraction
 
+    # ── Semantic recall (ChromaDB) ────────────────────────────────────────────
+
+    def semantic_recall(self, query: str, n: int = 5) -> list[dict]:
+        """Return semantically similar memories from ChromaDB."""
+        try:
+            from cognition.memory.semantic_store import semantic_store
+            return semantic_store.recall(query, n)
+        except Exception as exc:
+            logger.warning("[MemoryService] semantic_recall error: %s", exc)
+            return []
+
     # ── Routing state (per-session, in-memory only) ───────────────────────────
     # Keeps track of which model was last used, conversation depth, and a
     # rolling window of complexity scores — fed into model_router.RouteContext.
