@@ -1260,9 +1260,7 @@ _MEETING_START_RE   = re.compile(r"start\s+(?:meeting|recording|transcrib)", re.
 _MEETING_STOP_RE    = re.compile(r"stop\s+(?:meeting|recording|transcrib)", re.IGNORECASE)
 _MEETING_SUMMARY_RE = re.compile(r"summarize\s+(?:what\s+was\s+said|the\s+meeting|meeting\s+so\s+far)", re.IGNORECASE)
 
-# ── Ollama fallback (Feature #8) ─────────────────────────────────────────────
-_OLLAMA_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
-_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
 
 _VOICE_SYSTEM_PROMPT = (
     CORE_IDENTITY + "\n\n"
@@ -3924,23 +3922,15 @@ async def respond_stream(body: _RespondStreamBody):
             # Follow-up suggestion disabled — was making an extra GPT call after every response.
 
         except Exception as exc:
-            # ── Feature #8: Ollama local LLM fallback ────────────────────────
+            # Ollama local LLM fallback — used when OpenAI errors or is unavailable
             if "openai" in str(exc).lower() or "connection" in str(exc).lower() or "api" in str(exc).lower():
                 try:
-                    import httpx as _hx
-                    payload = {
-                        "model":  _OLLAMA_MODEL,
-                        "prompt": body.text,
-                        "stream": False,
-                    }
-                    r = _hx.post(_OLLAMA_URL, json=payload, timeout=30)
-                    if r.status_code == 200:
-                        ollama_text = r.json().get("response", "")
-                        if ollama_text:
-                            ollama_text = ollama_text.strip()
-                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': ollama_text})}\n\n"
-                            yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': ollama_text, 'source': 'ollama'})}\n\n"
-                            return
+                    from api.services.openai_client import offline_generate as _offline
+                    ollama_text = _offline(prompt=body.text, complex=len(body.text.split()) > 15)
+                    if ollama_text:
+                        yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': ollama_text})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done',  'turn_id': turn_id, 'full_text': ollama_text, 'source': 'ollama'})}\n\n"
+                        return
                 except Exception as _ollama_exc:
                     logger.debug("Ollama fallback failed: %s", _ollama_exc)
             logger.exception("respond-stream error")
