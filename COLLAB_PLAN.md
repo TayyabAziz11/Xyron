@@ -1,6 +1,6 @@
 # Xyron Collaboration Plan — Tayyab × Qasim
 
-> **Last updated:** 2026-05-12
+> **Last updated:** 2026-05-13
 > **Goal:** Evolve Xyron from a command-router into a cognitively-aware, emotionally-responsive, ambient AI assistant.
 
 ---
@@ -12,11 +12,14 @@ Before you start, know the ground truth:
 | Folder | Status | Notes |
 |---|---|---|
 | `backend/brain/` | ✅ Exists | orchestrator, memory_manager, planner — Qasim's Phase 0 extends this |
-| `backend/cognition/` | ❌ Does NOT exist | Qasim creates it in Phase 0 |
+| `backend/cognition/` | ✅ Exists | Phase 0 (Qasim): cognitive_state.py, state_transitions.py, memory/ |
 | `backend/src/ai_operator/agents/` | ✅ Exists | 6 agents (approval, email, integration, linkedin, reporting, base) |
 | `backend/agents/` (root) | ❌ Does NOT exist | If plan says "backend/agents/", it means `backend/src/ai_operator/agents/` |
 | `backend/voice/` | ✅ Exists | TTS: Kokoro→edge-tts→pyttsx3, Whisper STT, wake word |
 | `backend/utils/` | ✅ Exists | Only path_utils.py — add to it |
+| `backend/dev/` | ✅ Exists | Phase 9: file_intelligence, project_memory, terminal_intelligence, dev_observer |
+| `backend/data/project_memory/` | ✅ Exists | Phase 9: per-project JSON memory files (auto-created) |
+| `backend/cognition/memory/` | ✅ Exists | Phase 1: semantic_store.py + memory_bridge.py (Qasim) |
 | `web/src/components/` | ✅ Exists | 50+ components, Tayyab adds to this |
 
 ---
@@ -50,7 +53,7 @@ feat/phase-5-environment-monitor   (Tayyab)
 feat/phase-6-adaptive-ui-modes     (Tayyab)
 feat/phase-7-agent-hierarchy       (Qasim)
 feat/phase-8-code-assistant        (Tayyab)
-feat/phase-9-offline-ollama        (Qasim)
+feat/phase-9-dev-intelligence      (Tayyab) ← DONE
 feat/phase-10-elevenlabs-voice     (Tayyab)
 feat/phase-11-urdu-support         (shared)
 feat/phase-12-self-reflection      (Qasim)
@@ -67,7 +70,7 @@ Week 1:   Qasim → Phase 0      Tayyab → Phase 2
 Week 2:   Qasim → Phase 1      Tayyab → Phase 4
 Week 3:   Qasim → Phase 3      Tayyab → Phase 5
 Week 4:   Qasim → Phase 7      Tayyab → Phase 6
-Week 5:   Qasim → Phase 9      Tayyab → Phase 8
+Week 5:   Qasim → Phase 9 ✅   Tayyab → Phase 8 ✅
 Week 6:   Qasim → Phase 12     Tayyab → Phase 10
 Week 7:   Phase 11 — BOTH together
 ```
@@ -80,9 +83,10 @@ Phase 0 must merge to main BEFORE Tayyab's Phase 2 can use cognitive state. Ever
 
 # QASIM'S PLAN
 
-## Phase 0 — Cognitive State Engine
+## Phase 0 — Cognitive State Engine ✅ DONE
 
 **Branch:** `feat/phase-0-cognitive-state`
+**Status:** Merged to main (commit `4530df6`). CognitiveState singleton live. All routers read/write via `cognitive_state.update()`.
 **Depends on:** Nothing (start immediately)
 **Blocks:** All other phases that read AI state
 
@@ -177,9 +181,10 @@ No new packages needed for Phase 0.
 
 ---
 
-## Phase 1 — Memory Architecture (ChromaDB)
+## Phase 1 — Memory Architecture (ChromaDB) ✅ DONE
 
 **Branch:** `feat/phase-1-memory-chromadb`
+**Status:** Merged to main via PR #8 (commit `37b42b7`). ChromaDB + all-MiniLM-L6-v2 live. `chromadb>=0.5.0` added to requirements.txt.
 **Depends on:** Phase 0 merged
 **Install:** `pip install chromadb sentence-transformers`
 
@@ -347,56 +352,106 @@ class FocusAgent(BaseAgent):
 
 ---
 
-## Phase 9 — Offline Mode (Ollama Fallback)
+## Phase 9 — Persistent Contextual Dev Intelligence ✅ DONE
 
-**Branch:** `feat/phase-9-offline-ollama`
-**Depends on:** Phase 7 merged
-**Install:** `pip install ollama` + install Ollama binary locally
+**Branch:** `main` (committed directly — `8d55ba6`)
+**Depends on:** Phase 8 merged
+**Status:** Fully live. All 10 tasks shipped. No new packages needed beyond Ollama (already used in Phase 8).
 
-### What to build
+### What was built
 
-Add Ollama as a fallback in `response_generator.py` when OpenAI is unreachable.
+Xyron upgraded from "code-aware assistant" to "persistent autonomous development intelligence."
 
-### Files to modify
+When VS Code/Cursor is active, Xyron now understands the **full engineering session** — not just the current command.
 
-```
-backend/voice/response_generator.py   ← add Tier 3: Ollama
-backend/api/services/openai_client.py ← add is_available() health check
-backend/api/services/model_router.py  ← route to Ollama when OpenAI unavailable
-```
+---
 
-### Fallback chain in `response_generator.py`
+### New files (all in `backend/dev/`)
 
-```
-Tier 1: OpenAI (gpt-4o or gpt-4o-mini)           ← current
-Tier 2: Ollama (llama3.2:3b — fast, small)        ← NEW: offline fallback
-Tier 3: Template strings (per-agent fallbacks)    ← current last resort
-```
+| File | What it does |
+|---|---|
+| `backend/dev/file_intelligence.py` | Reads active file, detects language/framework, extracts symbols, TODOs, imports, issues. Hash-cached. Max 300KB. |
+| `backend/dev/project_memory.py` | Persistent JSON memory per project — stack, git branch, recurring errors, recent files, session summaries. Atomic writes. |
+| `backend/dev/terminal_intelligence.py` | 16-pattern regex classifier for npm/pip/Python/TypeScript/Docker/git errors. Falls back to `mistral:7b` for low-confidence cases. |
+| `backend/dev/dev_observer.py` | Background asyncio loop (5s interval). Emits passive insights via SSE. Max 1 insight per 60s. |
 
-### Ollama setup
+---
 
-```bash
-# User runs this once:
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull llama3.2:3b    # 2GB — fast responses, good quality
-ollama pull mistral:7b     # optional: better quality
-```
+### New API endpoints (`/api/v1/dev/`)
 
-### Model selection logic
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/active-file-context` | GET | Full analysis of active file |
+| `/project-memory` | GET | Project memory for active/given project |
+| `/project-memory/update` | POST | Update architecture notes, tasks, etc. |
+| `/project-memory/session-summary` | POST | Append a session summary |
+| `/analyze-terminal` | POST | Classify a terminal error + suggest fix |
+| `/terminal-output` | POST | Receive terminal output from frontend/wrapper |
+| `/latest-terminal-error` | GET | Most recent error for the active project |
+| `/observer-stream` | GET | SSE stream of passive insights |
+| `/patch-preview` | POST | Show patch preview (auto-apply is disabled — safety) |
 
-```python
-# In model_router.py
-async def get_response_model() -> str:
-    if await openai_client.is_available():
-        return "openai/gpt-4o-mini"
-    if await ollama_available():
-        return "ollama/llama3.2:3b"
-    return "template"
-```
+---
 
-### Cognitive state integration
+### Modified files
 
-Set `cognitive_state.update(active_model="ollama")` when in offline mode so the UI can show an "Offline Mode" indicator (Tayyab's Phase 6 reads this).
+**`backend/src/ai_operator/agents/dev_agent.py`**
+Before answering, DevAgent now injects:
+- Active file context (language, framework, symbols, issues)
+- Project memory summary (stack, errors, past fixes, last session)
+- Latest terminal error (type, cause, suggested fix)
+
+Contextual phrase resolution:
+- `"explain this"` → uses active file
+- `"what went wrong"` → uses latest terminal error
+- `"fix it"` / `"fix the error"` → uses terminal error + active file
+- `"summarize this project"` → uses project memory
+
+**`backend/voice/voice_command_router.py`**
+Same contextual resolution as DevAgent, applied to voice commands before routing.
+System commands (volume, music, open app, shutdown, etc.) are NEVER hijacked.
+
+**`backend/api/main.py`**
+Starts `observer_loop()` as an `asyncio.create_task()` at startup.
+
+---
+
+### Frontend (`web/src/components/code/CodeAssistantPanel.tsx`)
+
+5 new live sections added to the Code Assistant panel:
+
+1. **Active File Intelligence** — language, framework, summary, symbols (tags), TODOs, issues
+2. **Project Memory** — stack tags, git branch, recurring errors with counts, recent files, last session summary
+3. **Terminal Intelligence** — error type, severity badge, cause, fix, one-click copy commands
+4. **Passive Insights Feed** — live SSE from observer, severity-colored badges, animated entries
+5. **Dev Context Status** — project, file, language, context freshness timestamp
+
+All sections only render when `code_mode = true`.
+
+---
+
+### Observability — log prefixes
+
+| Prefix | Where |
+|---|---|
+| `[DEV_CONTEXT]` | dev router endpoints |
+| `[ACTIVE_FILE]` | file_intelligence.py |
+| `[PROJECT_MEMORY]` | project_memory.py |
+| `[TERMINAL_INTEL]` | terminal_intelligence.py |
+| `[DEV_OBSERVER]` | dev_observer.py |
+| `[DEV_AGENT_CONTEXT]` | dev_agent.py |
+| `[PASSIVE_INSIGHT]` | observer insight emission |
+
+Each log includes: `latency_ms`, `project`, `file`, `cache_hit`, `action`, `confidence`.
+
+---
+
+### What Qasim can build next (Phase 10+)
+
+- **Phase 3 (Goals & Personality)** — uses project memory to set `active_goal` in CognitiveState
+- **Session summary automation** — after each coding session, call `POST /dev/project-memory/session-summary`
+- **ChromaDB semantic search across project memory** — store session summaries in semantic_store, recall by meaning
+- **Self-reflection loop** — DevObserver reads session_summaries and proposes next steps autonomously
 
 ---
 
@@ -750,9 +805,10 @@ export function useUIMode() {
 
 ---
 
-## Phase 8 — Code Assistant Mode
+## Phase 8 — Code Assistant Mode ✅ DONE
 
 **Branch:** `feat/phase-8-code-assistant`
+**Status:** Merged to main (commit `c028e8b`). DevAgent, CodeAssistantPanel, environment monitor, voice routing all live.
 **Depends on:** Phase 5 (environment monitor for active window detection), Phase 6 (UI modes)
 
 ### What to build
