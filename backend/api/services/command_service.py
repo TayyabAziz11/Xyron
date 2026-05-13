@@ -438,6 +438,11 @@ class CommandService:
         """
         try:
             self.update_status(command_id, CommandStatus.running)
+            try:
+                from cognition.state_transitions import transition_to_processing
+                transition_to_processing()
+            except Exception:
+                pass
 
             # ── 1. AI tool calling via central registry ───────────────────────
             tool_name: str | None  = None
@@ -499,6 +504,11 @@ class CommandService:
                             memory_service.set_last_action(tool_name, tool_params, result_text)
                         except Exception:
                             pass
+                        try:
+                            from cognition.state_transitions import transition_to_idle
+                            transition_to_idle()
+                        except Exception:
+                            pass
                         used_registry = True
 
             except Exception as ai_exc:
@@ -558,9 +568,19 @@ class CommandService:
                 action_url=action_url,
                 action_app=action_app,
             )
+            try:
+                from cognition.state_transitions import transition_to_idle
+                transition_to_idle()
+            except Exception:
+                pass
         except Exception as exc:
             logger.exception("Command %s execution failed", command_id)
             self.update_status(command_id, CommandStatus.failed, error=str(exc))
+            try:
+                from cognition.state_transitions import transition_to_idle
+                transition_to_idle()
+            except Exception:
+                pass
 
     def get(self, command_id: str) -> Optional[Command]:
         return self._store.get(command_id)
