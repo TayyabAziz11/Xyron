@@ -6,30 +6,38 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ..services.cognitive_state import cognitive_state, VALID_EMOTIONS
+from cognition.cognitive_state import cognitive_state
+from ..services.cognitive_state import VALID_EMOTIONS, VALID_ATTENTION
 
 router = APIRouter(prefix="/api/v1/cognition", tags=["cognition"])
-
-VALID_ATTENTION = frozenset({"IDLE", "LISTENING", "PROCESSING", "SPEAKING"})
 
 
 class CognitiveStateResponse(BaseModel):
     attention: str
+    mood_bias: str
     last_user_emotion: str
     emotion_intensity: float
     active_goal: Optional[str]
     current_task: Optional[str]
+    context_summary: str
     active_ui_mode: str
+    turn_count: int
+    last_updated: float
 
 
 def _build_response() -> CognitiveStateResponse:
+    snap = cognitive_state.snapshot()
     return CognitiveStateResponse(
-        attention=cognitive_state.attention,
-        last_user_emotion=cognitive_state.last_user_emotion,
-        emotion_intensity=cognitive_state.emotion_intensity,
-        active_goal=cognitive_state.active_goal,
-        current_task=cognitive_state.current_task,
-        active_ui_mode=cognitive_state.active_ui_mode,
+        attention=snap["attention"],
+        mood_bias=snap["mood_bias"],
+        last_user_emotion=snap["last_user_emotion"],
+        emotion_intensity=snap["emotion_intensity"],
+        active_goal=snap["active_goal"],
+        current_task=snap["current_task"],
+        context_summary=snap["context_summary"],
+        active_ui_mode=snap["active_ui_mode"],
+        turn_count=snap["turn_count"],
+        last_updated=snap["last_updated"],
     )
 
 
@@ -41,8 +49,10 @@ async def get_cognitive_state() -> CognitiveStateResponse:
 @router.patch("/state")
 async def patch_cognitive_state(payload: dict[str, Any]) -> CognitiveStateResponse:
     """Dev/test endpoint — set any cognitive state field directly."""
-    allowed = {"attention", "last_user_emotion", "emotion_intensity",
-               "active_goal", "current_task", "active_ui_mode"}
+    allowed = {
+        "attention", "mood_bias", "last_user_emotion", "emotion_intensity",
+        "active_goal", "current_task", "context_summary", "active_ui_mode",
+    }
     for key, value in payload.items():
         if key not in allowed:
             continue
@@ -50,7 +60,7 @@ async def patch_cognitive_state(payload: dict[str, Any]) -> CognitiveStateRespon
     return _build_response()
 
 
-# ── Convenience endpoints for quick emotion/attention testing ─────────────────
+# ── Convenience endpoints ─────────────────────────────────────────────────────
 
 class EmotionUpdate(BaseModel):
     emotion: str

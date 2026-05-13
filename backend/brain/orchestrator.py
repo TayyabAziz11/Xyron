@@ -81,6 +81,19 @@ class Orchestrator:
     ) -> OrchestratorDecision:
         t = transcript.strip()
 
+        # Read cognitive state — inform routing and mark as processing
+        try:
+            from cognition.cognitive_state import cognitive_state as _cs
+            from cognition.state_transitions import transition_to_processing
+            _active_goal = _cs.active_goal
+            _mood        = _cs.mood_bias
+            transition_to_processing()
+            logger.debug("[ORCHESTRATOR] state — attention=PROCESSING goal=%r mood=%s",
+                         _active_goal, _mood)
+        except Exception:
+            _active_goal = None
+            _mood        = None
+
         # 1. Stop
         if _STOP_RE.search(t):
             logger.info("[ORCHESTRATOR] STOP transcript=%r", t[:60])

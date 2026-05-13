@@ -1,32 +1,24 @@
-"""Shared cognitive state singleton — live session data for the voice AI."""
-from __future__ import annotations
+"""
+Shim — re-exports the canonical cognitive state from the cognition package.
 
-from dataclasses import dataclass
-from typing import Any, Optional
+All routers that do `from ..services.cognitive_state import cognitive_state`
+continue to work without changes. New code should import directly from
+`cognition.cognitive_state` instead.
+"""
+from cognition.cognitive_state import (  # noqa: F401
+    AttentionLevel,
+    CognitiveState,
+    MoodBias,
+    cognitive_state,
+)
 
-
-VALID_EMOTIONS = frozenset({
+# Kept here for Tayyab's cognition router backward-compatibility.
+VALID_EMOTIONS: frozenset[str] = frozenset({
     "neutral", "happy", "laughing", "joyful", "excited",
     "stressed", "tired", "sad", "curious", "focused",
     "surprised", "bored",
 })
 
-@dataclass
-class CognitiveState:
-    attention: str = "IDLE"
-    last_user_emotion: str = "neutral"
-    emotion_intensity: float = 0.5
-    active_goal: Optional[str] = None
-    current_task: Optional[str] = None
-    active_ui_mode: str = "default"
-
-    def update(self, **kwargs: Any) -> None:
-        """Update one or more state fields by name."""
-        for key, value in kwargs.items():
-            if not hasattr(self, key):
-                raise AttributeError(f"CognitiveState has no field {key!r}")
-            setattr(self, key, value)
-
-
-# Module-level singleton shared across all routers.
-cognitive_state = CognitiveState()
+VALID_ATTENTION: frozenset[str] = frozenset({
+    "IDLE", "LISTENING", "PROCESSING", "SPEAKING",
+})
