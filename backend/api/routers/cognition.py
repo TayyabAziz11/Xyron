@@ -23,6 +23,10 @@ class CognitiveStateResponse(BaseModel):
     active_ui_mode: str
     turn_count: int
     last_updated: float
+    # Phase 8 — Code Assistant Mode
+    code_mode: bool = False
+    active_project: Optional[str] = None
+    active_file: Optional[str] = None
 
 
 def _build_response() -> CognitiveStateResponse:
@@ -38,6 +42,9 @@ def _build_response() -> CognitiveStateResponse:
         active_ui_mode=snap["active_ui_mode"],
         turn_count=snap["turn_count"],
         last_updated=snap["last_updated"],
+        code_mode=snap.get("code_mode", False),
+        active_project=snap.get("active_project"),
+        active_file=snap.get("active_file"),
     )
 
 
@@ -52,6 +59,7 @@ async def patch_cognitive_state(payload: dict[str, Any]) -> CognitiveStateRespon
     allowed = {
         "attention", "mood_bias", "last_user_emotion", "emotion_intensity",
         "active_goal", "current_task", "context_summary", "active_ui_mode",
+        "code_mode", "active_project", "active_file",
     }
     for key, value in payload.items():
         if key not in allowed:

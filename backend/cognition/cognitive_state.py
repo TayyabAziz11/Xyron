@@ -40,6 +40,10 @@ class CognitiveState:
     active_ui_mode:   str            = "default"
     turn_count:       int            = 0
     last_updated:     float          = field(default_factory=time.time)
+    # Phase 8 — Code Assistant Mode
+    code_mode:        bool           = False
+    active_project:   Optional[str]  = None
+    active_file:      Optional[str]  = None
     _lock:            threading.RLock = field(
         default_factory=threading.RLock, repr=False, compare=False,
     )

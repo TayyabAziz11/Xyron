@@ -28,7 +28,7 @@ from .config import settings
 if settings.onnx_provider and not _os.environ.get("ONNX_PROVIDER"):
     _os.environ["ONNX_PROVIDER"] = settings.onnx_provider
     logging.getLogger(__name__).info("[Config] ONNX_PROVIDER=%s", settings.onnx_provider)
-from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity
+from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity, dev
 
 logger = logging.getLogger(__name__)
 
@@ -179,3 +179,4 @@ app.include_router(dataset.router)
 app.include_router(environment.router)
 app.include_router(voice_identity.router)
 app.include_router(cognition.router)
+app.include_router(dev.router)

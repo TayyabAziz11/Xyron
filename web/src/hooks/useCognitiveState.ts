@@ -3,12 +3,19 @@
 import { useEffect, useRef, useState } from 'react'
 
 export interface CognitiveState {
-  attention: 'IDLE' | 'LISTENING' | 'PROCESSING' | 'SPEAKING'
-  last_user_emotion: string   // neutral | happy | laughing | joyful | excited | stressed | tired | sad | curious | focused | surprised | bored
-  emotion_intensity: number   // 0.0 – 1.0
+  attention: 'IDLE' | 'LISTENING' | 'PROCESSING' | 'SPEAKING' | 'FOCUSED'
+  mood_bias: 'neutral' | 'alert' | 'calm' | 'stressed'
+  last_user_emotion: string
+  emotion_intensity: number
   active_goal: string | null
   current_task: string | null
+  context_summary: string
   active_ui_mode: string
+  turn_count: number
+  last_updated: number
+  code_mode: boolean
+  active_project: string | null
+  active_file: string | null
 }
 
 export function useCognitiveState(): CognitiveState | null {

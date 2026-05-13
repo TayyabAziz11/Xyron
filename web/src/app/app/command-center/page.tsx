@@ -35,6 +35,7 @@ import ImHomeProtocol          from '@/components/im-home/ImHomeProtocol'
 import { useImHomeProtocol }   from '@/hooks/useImHomeProtocol'
 import type { Command, Draft } from '@/lib/types'
 import { ThoughtStream } from '@/components/ambient'
+import { CodeAssistantPanel } from '@/components/code/CodeAssistantPanel'
 import { useCognitiveState } from '@/hooks/useCognitiveState'
 import { useThoughtGenerator } from '@/hooks/useThoughtGenerator'
 
@@ -413,6 +414,9 @@ export default function CommandCenterPage() {
       @keyframes waveBar    { 0%{transform:scaleY(0.4)} 100%{transform:scaleY(1)} }
       @keyframes svgWave    { 0%{d:path("M0,12 C20,4 40,20 60,12 C80,4 100,20 120,12 C140,4 160,20 180,12 C200,4 220,20 240,12")} 50%{d:path("M0,12 C20,20 40,4 60,12 C80,20 100,4 120,12 C140,20 160,4 180,12 C200,20 220,4 240,12")} 100%{d:path("M0,12 C20,4 40,20 60,12 C80,4 100,20 120,12 C140,4 160,20 180,12 C200,4 220,20 240,12")} }
       .no-scrollbar::-webkit-scrollbar{display:none} .no-scrollbar{-ms-overflow-style:none;scrollbar-width:none}
+      @keyframes devScan { 0%{top:0;opacity:0.6} 100%{top:100%;opacity:0} }
+      .focus-mode-bg { animation: focusBgPulse 4s ease-in-out infinite; }
+      @keyframes focusBgPulse { 0%,100%{filter:brightness(1)} 50%{filter:brightness(0.92)} }
     `
     document.head.appendChild(s)
   }, [])
@@ -420,7 +424,22 @@ export default function CommandCenterPage() {
   return (
     <PageTransition>
       {/* ── Inline styles for orb rings ── */}
-      <div className="relative space-y-4 p-4 pb-6">
+      <div className="relative space-y-4 p-4 pb-6" style={cogStateCC?.code_mode ? { filter: 'contrast(1.04)' } : undefined}>
+
+        {/* Focus mode terminal overlay — subtle, non-distracting */}
+        <AnimatePresence>
+          {cogStateCC?.code_mode && (
+            <motion.div
+              key="focus-overlay"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="pointer-events-none fixed inset-0 z-0"
+              style={{
+                background: 'radial-gradient(ellipse at 50% 0%, rgba(255,32,32,0.03) 0%, transparent 60%)',
+                mixBlendMode: 'screen',
+              }}
+            />
+          )}
+        </AnimatePresence>
 
         {/* ── Floating Voice Active button ── */}
         <AnimatePresence>
@@ -455,6 +474,20 @@ export default function CommandCenterPage() {
             <span className="h-1.5 w-1.5 rounded-full bg-[#00ff88] animate-pulse" style={{ boxShadow: '0 0 6px #00ff88' }} />
             <span className="font-mono text-[10px] text-[#00ff88] font-bold">OPERATIONAL</span>
           </div>
+
+          {/* DEV MODE indicator */}
+          <AnimatePresence>
+            {cogStateCC?.code_mode && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.85 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
+                className="flex items-center gap-1.5 rounded-full border border-[rgba(255,32,32,0.5)] bg-[rgba(255,32,32,0.1)] px-3 py-1.5"
+                style={{ boxShadow: '0 0 12px rgba(255,32,32,0.25)' }}>
+                <Code2 className="h-3 w-3 text-[#ff2020]" />
+                <span className="font-mono text-[9px] font-bold tracking-widest text-[#ff2020]">DEV MODE ACTIVE</span>
+                <div className="h-1.5 w-1.5 rounded-full bg-[#ff2020] animate-pulse" />
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           <div className="flex items-center gap-3">
             <div className="text-right">
@@ -718,6 +751,17 @@ export default function CommandCenterPage() {
 
           {/* ── RIGHT COLUMN ── */}
           <div className="lg:col-span-2 flex flex-col gap-4">
+
+            {/* Code assistant panel — shown when code_mode active */}
+            <AnimatePresence>
+              {cogStateCC?.code_mode && (
+                <motion.div
+                  initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: 0.3, ease: 'easeOut' }}>
+                  <CodeAssistantPanel onInjectPrompt={(text) => { setTextInput(text); setActiveTab('voice') }} />
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* Last result */}
             <div className="rounded-xl border border-[rgba(255,32,32,0.15)] bg-[rgba(0,0,0,0.5)] overflow-hidden">

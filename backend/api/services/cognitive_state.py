@@ -12,7 +12,7 @@ from cognition.cognitive_state import (  # noqa: F401
     cognitive_state,
 )
 
-# Kept here for Tayyab's cognition router backward-compatibility.
+# Kept here for cognition router backward-compatibility.
 VALID_EMOTIONS: frozenset[str] = frozenset({
     "neutral", "happy", "laughing", "joyful", "excited",
     "stressed", "tired", "sad", "curious", "focused",

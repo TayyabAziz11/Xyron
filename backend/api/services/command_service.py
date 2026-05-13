@@ -58,9 +58,30 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
 ]
 
 
+_CODE_INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
+    (["explain this", "explain the", "what does this", "how does this", "walk me through"], "dev", "explain"),
+    (["write a function", "write a class", "write code", "generate code", "implement"], "dev", "write"),
+    (["write tests", "unit test", "add tests", "test this"], "dev", "test"),
+    (["debug this", "fix this bug", "find the bug", "why is it failing"], "dev", "debug"),
+    (["refactor", "clean this up", "restructure"], "dev", "refactor"),
+    (["architect", "how should i structure", "best architecture", "system design"], "dev", "architect"),
+    (["optimize this", "make this faster", "performance issue", "speed up"], "dev", "optimize"),
+]
+
+
 def classify_intent(text: str) -> CommandIntent:
-    """Keyword-based intent classifier (fast fallback)."""
+    """Keyword-based intent classifier. Checks code intents first when code_mode is active."""
     text_lower = text.lower()
+
+    try:
+        from ..services.cognitive_state import cognitive_state
+        if cognitive_state.code_mode:
+            for keywords, agent, skill in _CODE_INTENT_PATTERNS:
+                if any(kw in text_lower for kw in keywords):
+                    return CommandIntent(agent=agent, skill=skill, confidence="code_mode_match")
+    except Exception:
+        pass
+
     for keywords, agent, skill in INTENT_PATTERNS:
         if any(kw in text_lower for kw in keywords):
             return CommandIntent(agent=agent, skill=skill, confidence="keyword_match")
