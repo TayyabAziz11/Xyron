@@ -34,6 +34,9 @@ import TakeoverOrchestrator    from '@/components/takeover/TakeoverOrchestrator'
 import ImHomeProtocol          from '@/components/im-home/ImHomeProtocol'
 import { useImHomeProtocol }   from '@/hooks/useImHomeProtocol'
 import type { Command, Draft } from '@/lib/types'
+import { ThoughtStream } from '@/components/ambient'
+import { useCognitiveState } from '@/hooks/useCognitiveState'
+import { useThoughtGenerator } from '@/hooks/useThoughtGenerator'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -301,6 +304,9 @@ export default function CommandCenterPage() {
   const { notifications, dismiss: dismissNotif } = useProactive()
   const { phase: takeoverPhase, systemLine: takeoverLine, controlLevel: takeoverLevel, showDirective: takeoverDirective, stopTakeover } = useTakeoverMode()
   const { phase: imHomePhase, data: imHomeData, logs: imHomeLogs, dismiss: dismissImHome } = useImHomeProtocol()
+  const [showThoughts, setShowThoughts]   = useState(false)
+  const cogStateCC = useCognitiveState()
+  const thoughts   = useThoughtGenerator(cogStateCC)
   const [currentDraft, setCurrentDraft]   = useState<Draft | null>(null)
   const [textInput, setTextInput]         = useState('')
   const [activeProfile, setActiveProfile] = useState('assistant')
@@ -853,6 +859,19 @@ export default function CommandCenterPage() {
 
       {/* I'm Home protocol overlay */}
       <ImHomeProtocol phase={imHomePhase} data={imHomeData} logs={imHomeLogs} onDismiss={dismissImHome} />
+
+      {/* Thoughts toggle button */}
+      <button
+        onClick={() => setShowThoughts(t => !t)}
+        className="fixed top-20 right-6 z-50 flex items-center gap-1.5 rounded-full border border-white/20 bg-black/60 px-3 py-1.5 font-mono text-[10px] tracking-widest text-white/60 backdrop-blur-sm transition-colors hover:border-white/40 hover:text-white/90"
+        style={{ top: '5.5rem' }}
+      >
+        <Brain className="h-3 w-3" />
+        THOUGHTS
+      </button>
+
+      {/* Thought stream overlay */}
+      <ThoughtStream visible={showThoughts} thoughts={thoughts} />
     </PageTransition>
   )
 }

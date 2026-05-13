@@ -532,6 +532,12 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
     text = _sanitize_tts_text(text)
     if not text:
         return None
+    # Apply cinematic text shaping (pauses, filler removal, mode-aware pacing)
+    try:
+        from voice.voice_personality import shape_text as _shape
+        text = _shape(text) or text
+    except Exception:
+        pass
     # 0.92 feels natural; pure 1.0 sounds slightly rushed on short commands
     if speed >= 0.99:
         speed = 0.92
@@ -549,6 +555,13 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
     # 50ms trailing silence — prevents abrupt cut-off between streamed sentence chunks
     silence = np.zeros(int(sample_rate * 0.05), dtype=np.float32)
     samples = np.concatenate([samples, silence])
+    # Apply voice identity FX (bypass on any import/runtime error so speech is never blocked)
+    try:
+        from voice.audio_fx import apply_fx
+        from voice.voice_personality import get_active_preset
+        samples = apply_fx(samples, sample_rate, get_active_preset(), stereo=False)
+    except Exception:
+        pass
     # Convert float32 samples → 16-bit PCM WAV bytes
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
     buf = io.BytesIO()

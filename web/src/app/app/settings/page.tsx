@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { Mic, Volume2, VolumeX, CheckCircle, XCircle, Play, ChevronDown, ChevronRight } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Mic, Volume2, VolumeX, CheckCircle, XCircle, Play, ChevronDown, ChevronRight, Zap, Radio } from 'lucide-react'
 import { useApi } from '@/hooks/useApi'
 import { api } from '@/lib/api'
 import {
@@ -71,12 +71,92 @@ export default function SettingsPage() {
   const [voiceGroups, setVoiceGroups]   = useState<KokoroGroup[]>([])
   const [expandedGrp, setExpandedGrp]   = useState<Set<string>>(new Set(['American Female']))
 
+  // Voice Identity state
+  interface VoiceModeInfo { name: string; description: string; speed: number; active: boolean }
+  interface VoiceProfileInfo { id: string; display_name: string; description: string; speed: number; fx_preset: string; active: boolean }
+  const [voiceModes, setVoiceModes]           = useState<VoiceModeInfo[]>([])
+  const [voiceProfiles, setVoiceProfiles]     = useState<VoiceProfileInfo[]>([])
+  const [activeMode, setActiveMode]           = useState<string>('DEFAULT')
+  const [activeProfile, setActiveProfile]     = useState<string>('echo')
+  const [fxEnabled, setFxEnabled]             = useState(true)
+  const [identityPreviewing, setIdentityPreviewing] = useState(false)
+  const identityAudioRef = useRef<HTMLAudioElement | null>(null)
+
   useEffect(() => {
     fetch(`${API_BASE}/api/v1/voice/voices`)
       .then(r => r.json())
       .then(d => { if (d?.data?.groups) setVoiceGroups(d.data.groups) })
       .catch(() => {})
   }, [])
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/v1/voice/identity/mode`)
+      .then(r => r.json())
+      .then(d => { setVoiceModes(d.modes ?? []); setActiveMode(d.mode ?? 'DEFAULT') })
+      .catch(() => {})
+    fetch(`${API_BASE}/api/v1/voice/identity/profiles`)
+      .then(r => r.json())
+      .then(d => { setVoiceProfiles(d.profiles ?? []); setActiveProfile(d.active_profile ?? 'echo'); setFxEnabled(d.fx_enabled ?? true) })
+      .catch(() => {})
+  }, [])
+
+  async function handleSetMode(mode: string) {
+    setActiveMode(mode)
+    setVoiceModes(prev => prev.map(m => ({ ...m, active: m.name === mode })))
+    try {
+      await fetch(`${API_BASE}/api/v1/voice/identity/mode`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      })
+    } catch {}
+  }
+
+  async function handleSetProfile(profile: string) {
+    setActiveProfile(profile)
+    setVoiceProfiles(prev => prev.map(p => ({ ...p, active: p.id === profile })))
+    try {
+      await fetch(`${API_BASE}/api/v1/voice/identity/profile`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile }),
+      })
+    } catch {}
+  }
+
+  async function handleToggleFx() {
+    const next = !fxEnabled
+    setFxEnabled(next)
+    try {
+      await fetch(`${API_BASE}/api/v1/voice/identity/fx`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+    } catch {}
+  }
+
+  async function handleIdentityPreview() {
+    if (identityPreviewing) {
+      identityAudioRef.current?.pause()
+      setIdentityPreviewing(false)
+      return
+    }
+    setIdentityPreviewing(true)
+    try {
+      const resp = await fetch(`${API_BASE}/api/v1/voice/identity/preview`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: activeMode, profile: activeProfile }),
+      })
+      if (!resp.ok) throw new Error(await resp.text())
+      const blob = await resp.blob()
+      const url  = URL.createObjectURL(blob)
+      const audio = new Audio(url)
+      identityAudioRef.current = audio
+      audio.onended  = () => { URL.revokeObjectURL(url); setIdentityPreviewing(false) }
+      audio.onerror  = () => { setIdentityPreviewing(false) }
+      await audio.play()
+    } catch {
+      setIdentityPreviewing(false)
+    }
+  }
 
   async function previewVoice(voice: string) {
     if (previewing) return
@@ -175,6 +255,87 @@ export default function SettingsPage() {
               </button>
             ))}
           </div>
+        </div>
+      </CyberPanel>
+
+      {/* Voice Identity */}
+      <CyberPanel>
+        <ST label="VOICE IDENTITY" />
+
+        {/* Voice Mode */}
+        <div className="pb-3">
+          <p className="mb-2 font-mono text-[10px] text-text-muted">VOICE MODE</p>
+          {voiceModes.length === 0 ? (
+            <p className="font-mono text-[10px] text-text-muted italic">Backend offline</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
+              {voiceModes.map(m => (
+                <button key={m.name} onClick={() => handleSetMode(m.name)}
+                  className={cn(
+                    'rounded border p-2 text-left transition-all',
+                    activeMode === m.name
+                      ? 'border-[#ff2020] bg-[rgba(255,32,32,0.10)] shadow-[0_0_8px_rgba(255,32,32,0.2)]'
+                      : 'border-[rgba(255,32,32,0.15)] hover:border-[rgba(255,32,32,0.35)]',
+                  )}>
+                  <p className="font-mono text-[10px] font-bold"
+                    style={{ color: activeMode === m.name ? '#ff2020' : '#94a3b8' }}>
+                    {m.name}
+                  </p>
+                  <p className="mt-0.5 font-mono text-[9px] text-text-muted leading-tight">{m.description}</p>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Voice Profile */}
+        <div className="border-t border-[rgba(255,32,32,0.08)] pt-3 pb-3">
+          <p className="mb-2 font-mono text-[10px] text-text-muted">VOICE PROFILE</p>
+          {voiceProfiles.length === 0 ? (
+            <p className="font-mono text-[10px] text-text-muted italic">Backend offline</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+              {voiceProfiles.map(p => (
+                <button key={p.id} onClick={() => handleSetProfile(p.id)}
+                  className={cn(
+                    'rounded border p-2 text-left transition-all',
+                    activeProfile === p.id
+                      ? 'border-[#ff2020] bg-[rgba(255,32,32,0.10)] shadow-[0_0_8px_rgba(255,32,32,0.2)]'
+                      : 'border-[rgba(255,32,32,0.15)] hover:border-[rgba(255,32,32,0.35)]',
+                  )}>
+                  <p className="font-mono text-[10px] font-bold"
+                    style={{ color: activeProfile === p.id ? '#ff2020' : '#94a3b8' }}>
+                    {p.display_name}
+                  </p>
+                  <p className="mt-0.5 font-mono text-[9px] text-text-muted leading-tight">{p.description}</p>
+                  <p className="mt-0.5 font-mono text-[9px]" style={{ color: 'rgba(255,32,32,0.5)' }}>{p.fx_preset}</p>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* FX toggle */}
+        <Row label="CINEMATIC FX" sub="Reverb · EQ · stereo width">
+          <Toggle checked={fxEnabled} onChange={handleToggleFx} />
+        </Row>
+
+        {/* Preview */}
+        <div className="pt-3 flex items-center gap-3">
+          <button onClick={handleIdentityPreview}
+            className={cn(
+              'flex items-center gap-2 rounded border px-3 py-1.5 font-mono text-[10px] uppercase transition-all',
+              identityPreviewing
+                ? 'border-[#ff2020] bg-[rgba(255,32,32,0.12)] text-[#ff2020]'
+                : 'border-[rgba(255,32,32,0.25)] text-text-muted hover:border-[rgba(255,32,32,0.5)] hover:text-[#ff2020]',
+            )}>
+            {identityPreviewing
+              ? <><Radio className="h-3.5 w-3.5 animate-pulse" /> Stop</>
+              : <><Zap   className="h-3.5 w-3.5" /> Preview Voice</>}
+          </button>
+          <span className="font-mono text-[9px] text-text-muted">
+            {activeProfile} · {activeMode} · fx {fxEnabled ? 'on' : 'off'}
+          </span>
         </div>
       </CyberPanel>
 

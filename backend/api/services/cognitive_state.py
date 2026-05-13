@@ -5,9 +5,19 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 
+VALID_EMOTIONS = frozenset({
+    "neutral", "happy", "laughing", "joyful", "excited",
+    "stressed", "tired", "sad", "curious", "focused",
+    "surprised", "bored",
+})
+
 @dataclass
 class CognitiveState:
-    last_user_emotion: Optional[str] = None
+    attention: str = "IDLE"
+    last_user_emotion: str = "neutral"
+    emotion_intensity: float = 0.5
+    active_goal: Optional[str] = None
+    current_task: Optional[str] = None
     active_ui_mode: str = "default"
 
     def update(self, **kwargs: Any) -> None:

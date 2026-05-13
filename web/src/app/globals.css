@@ -2,6 +2,8 @@
 @tailwind components;
 @tailwind utilities;
 
+@import '../styles/ui-modes.css';
+
 :root {
   --cyber-red: #ff2020;
   --cyber-red-dark: #cc0000;
