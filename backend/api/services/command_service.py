@@ -465,6 +465,21 @@ class CommandService:
             except Exception:
                 pass
 
+            # ── Goal detection ────────────────────────────────────────────────
+            _GOAL_PHRASES = (
+                "i want to", "my goal is", "remind me to", "i need to",
+            )
+            _tl = text.lower()
+            if any(_tl.startswith(p) or f" {p} " in _tl for p in _GOAL_PHRASES):
+                try:
+                    from cognition.goals import goal_tracker as _gt
+                    from cognition.cognitive_state import cognitive_state as _cs
+                    _goal = _gt.set_goal(text)
+                    _cs.update(active_goal=_goal.description)
+                    logger.info("[GOALS] auto-set goal: %r", _goal.description[:60])
+                except Exception as _ge:
+                    logger.debug("[GOALS] goal detection error: %s", _ge)
+
             # ── 1. AI tool calling via central registry ───────────────────────
             tool_name: str | None  = None
             tool_params: dict      = {}

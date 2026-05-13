@@ -44,8 +44,15 @@ def generate_response(
             "Summarise in 1-2 natural spoken sentences."
         ) if tool_output else text
 
+        _tone = ""
+        try:
+            from cognition.personality import personality as _p
+            _tone = _p.get_tone_prompt() + " "
+        except Exception:
+            pass
         messages = [
             {"role": "system", "content": (
+                _tone +
                 "You are Xyron, a voice AI built by Tayyab Aziz. "
                 "Reply in English only. Keep replies under 2 sentences. No markdown."
             )},
@@ -126,8 +133,14 @@ def _openai_spoken_response(command: str, result: str, agent: str, session_id: O
 
         from openai import OpenAI
 
-        # Inject long-term user facts into system prompt
-        system_prompt = _SYSTEM_PROMPT
+        # Inject personality tone + long-term user facts into system prompt
+        _tone_prefix = ""
+        try:
+            from cognition.personality import personality as _p
+            _tone_prefix = _p.get_tone_prompt() + "\n\n"
+        except Exception:
+            pass
+        system_prompt = _tone_prefix + _SYSTEM_PROMPT
         try:
             from api.services.memory_service import memory_service
             ctx = memory_service.get_context_string()

@@ -155,3 +155,80 @@ async def memory_recall(
         return [RecallResult(**r) for r in results]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Goal endpoints ────────────────────────────────────────────────────────────
+
+class GoalRequest(BaseModel):
+    description: str
+    priority: int = 3
+    deadline: Optional[float] = None
+
+
+class GoalResponse(BaseModel):
+    id: str
+    description: str
+    created_at: float
+    deadline: Optional[float]
+    priority: int
+    status: str
+    sub_goals: list[str]
+
+
+def _goal_to_response(g: Any) -> GoalResponse:
+    return GoalResponse(
+        id=g.id,
+        description=g.description,
+        created_at=g.created_at,
+        deadline=g.deadline,
+        priority=g.priority,
+        status=g.status,
+        sub_goals=g.sub_goals,
+    )
+
+
+@router.get("/goals", response_model=list[GoalResponse])
+async def get_goals() -> list[GoalResponse]:
+    """Return all active goals ordered by priority."""
+    try:
+        from cognition.goals import goal_tracker
+        return [_goal_to_response(g) for g in goal_tracker.get_active_goals()]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/goals", response_model=GoalResponse, status_code=201)
+async def create_goal(body: GoalRequest) -> GoalResponse:
+    """Create a new goal and update cognitive_state.active_goal."""
+    try:
+        from cognition.goals import goal_tracker
+        goal = goal_tracker.set_goal(
+            description=body.description,
+            priority=body.priority,
+            deadline=body.deadline,
+        )
+        cognitive_state.update(active_goal=goal.description)
+        return _goal_to_response(goal)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.patch("/goals/{goal_id}/complete", response_model=GoalResponse)
+async def complete_goal(goal_id: str) -> GoalResponse:
+    """Mark a goal as completed."""
+    try:
+        from cognition.goals import goal_tracker
+        goal_tracker.complete_goal(goal_id)
+        goal = goal_tracker.get_goal(goal_id)
+        if not goal:
+            raise HTTPException(status_code=404, detail=f"Goal {goal_id!r} not found")
+        # Clear active_goal if it was this one
+        snap = cognitive_state.snapshot()
+        if snap.get("active_goal") == goal.description:
+            next_goal = goal_tracker.prioritize()
+            cognitive_state.update(active_goal=next_goal.description if next_goal else None)
+        return _goal_to_response(goal)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
