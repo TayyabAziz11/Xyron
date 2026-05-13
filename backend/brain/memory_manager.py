@@ -88,8 +88,7 @@ class EpisodicMemoryLayer:
 
 class SemanticMemoryLayer:
     """
-    Long-term user facts (via memory_service) + per-session tool frequency counter.
-    The frequency counter helps the orchestrator prioritise familiar tools.
+    Long-term vector memory (ChromaDB) + per-session tool frequency counter.
     """
 
     def __init__(self) -> None:
@@ -100,6 +99,15 @@ class SemanticMemoryLayer:
 
     def top_tools(self, n: int = 5) -> list[tuple[str, int]]:
         return sorted(self._freq.items(), key=lambda x: x[1], reverse=True)[:n]
+
+    async def recall(self, query: str, n: int = 5) -> list[dict]:
+        """Semantic similarity search via ChromaDB."""
+        try:
+            from cognition.memory.semantic_store import semantic_store
+            return await asyncio.to_thread(semantic_store.recall, query, n)
+        except Exception as exc:
+            logger.debug("[SemanticMemoryLayer] recall error: %s", exc)
+            return []
 
     async def get_facts(self) -> dict[str, Any]:
         try:

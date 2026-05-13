@@ -1,9 +1,9 @@
-"""Cognition router — exposes live CognitiveState for the frontend."""
+"""Cognition router — exposes live CognitiveState and memory endpoints."""
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from cognition.cognitive_state import cognitive_state
@@ -94,3 +94,56 @@ async def set_attention(body: AttentionUpdate) -> CognitiveStateResponse:
         )
     cognitive_state.update(attention=body.attention)
     return _build_response()
+
+
+# ── Memory endpoints ──────────────────────────────────────────────────────────
+
+class RememberRequest(BaseModel):
+    text: str
+    metadata: dict[str, Any] = {}
+    role: str = "user"
+    session_id: str = "api"
+
+
+class RememberResponse(BaseModel):
+    id: str
+    stored: bool
+
+
+@router.post("/memory/remember", response_model=RememberResponse)
+async def memory_remember(body: RememberRequest) -> RememberResponse:
+    """Store text in semantic (ChromaDB) and episodic (SQLite) memory."""
+    try:
+        from cognition.memory.memory_bridge import memory_bridge
+        memory_bridge.add(
+            text=body.text,
+            role=body.role,
+            session_id=body.session_id,
+            metadata=body.metadata,
+        )
+        from cognition.memory.semantic_store import semantic_store
+        count = semantic_store.count()
+        return RememberResponse(id=f"stored:{count}", stored=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class RecallResult(BaseModel):
+    id: str
+    text: str
+    metadata: dict[str, Any]
+    distance: float
+
+
+@router.get("/memory/recall", response_model=list[RecallResult])
+async def memory_recall(
+    query: str = Query(..., description="Semantic search query"),
+    n: int = Query(5, ge=1, le=20),
+) -> list[RecallResult]:
+    """Return top-n semantically similar memories."""
+    try:
+        from cognition.memory.memory_bridge import memory_bridge
+        results = memory_bridge.recall(query, n)
+        return [RecallResult(**r) for r in results]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
