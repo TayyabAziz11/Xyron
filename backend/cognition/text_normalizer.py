@@ -29,6 +29,9 @@ from typing import Optional
 
 _PHRASE_MAP: dict[str, str] = {
     # Volume
+    "volume zara barha do":     "volume up",
+    "volume thori barha do":    "volume up",
+    "volume zara tez karo":     "volume up",
     "awaz zara tez karo":       "volume up",
     "awaaz zara tez karo":      "volume up",
     "awaz thori barha do":      "volume up",
@@ -117,6 +120,44 @@ _PHRASE_MAP: dict[str, str] = {
     "screen lock karo":         "lock screen",
     "band kar do computer":     "shutdown",
     "shutdown karo":            "shutdown",
+    # WiFi
+    "wifi on karo":             "enable wifi",
+    "wifi chalu karo":          "enable wifi",
+    "wifi lagao":               "enable wifi",
+    "wifi band karo":           "disable wifi",
+    "wifi off karo":            "disable wifi",
+    "wifi check karo":          "wifi status",
+    "wifi batao":               "wifi status",
+    "network check karo":       "wifi status",
+    # Bluetooth
+    "bluetooth on karo":        "enable bluetooth",
+    "bluetooth chalu karo":     "enable bluetooth",
+    "bluetooth band karo":      "disable bluetooth",
+    "bluetooth off karo":       "disable bluetooth",
+    # Brightness
+    "brightness barha do":      "brightness up",
+    "screen roshan karo":       "brightness up",
+    "brightness kam karo":      "brightness down",
+    "screen dim karo":          "brightness down",
+    # Mute
+    "mute karo":                "mute",
+    "awaaz band karo":          "mute",
+    "awaz band karo":           "mute",
+    "unmute karo":              "unmute",
+    # System info
+    "system ka haal batao":     "system status",
+    "pc ka haal batao":         "system status",
+    # File ops
+    "folder banao":             "create folder",
+    "naya folder banao":        "create folder",
+    "file dhundo":              "search files",
+    # Clipboard
+    "copy karo":                "copy",
+    "paste karo":               "paste",
+    # Sleep
+    "so jao":                   "sleep",
+    "pc so jaye":               "sleep",
+    "hibernate karo":           "hibernate",
 }
 
 # Build longest-first sorted list at import time
@@ -150,6 +191,13 @@ _TOKEN_MAP: dict[str, str] = {
     "dhundo":   "find",
     "talash":   "search",
     "yaad":     "remember",
+    "banao":    "create",
+    "bana":     "create",
+    "banana":   "create",
+    "hatao":    "delete",
+    "mita":     "delete",
+    "copy":     "copy",
+    "paste":    "paste",
     # Nouns
     "awaaz":    "volume",
     "awaz":     "volume",
@@ -167,6 +215,13 @@ _FUZZY_VOCAB: list[str] = list(_PHRASE_MAP.keys())
 
 # Pre-compile tokenizer
 _SPLIT_RE = re.compile(r"\s+")
+
+# Urdu filler / address words that carry no semantic intent — stripped after normalization
+_FILLER_WORDS: frozenset[str] = frozenset({
+    "yar", "yaar", "bhai", "bhaijaan", "arre", "oye", "oi",
+    "sun", "suno", "dekho", "please", "zara", "jaldi",
+    "mujhe", "humein",
+})
 
 
 def normalize(text: str) -> str:
@@ -194,7 +249,18 @@ def normalize(text: str) -> str:
     # 3. Fuzzy fallback for likely Whisper mishearings
     result = _fuzzy_correct(result)
 
+    # 4. Strip filler words so the intent router gets clean semantic text
+    result = _strip_fillers(result)
+
     return result.strip()
+
+
+def _strip_fillers(text: str) -> str:
+    """Remove Urdu address/filler words that add no intent signal."""
+    tokens = _SPLIT_RE.split(text.strip())
+    cleaned = [t for t in tokens if t not in _FILLER_WORDS]
+    # Keep at least one token
+    return " ".join(cleaned) if cleaned else text
 
 
 def _has_urdu_signals(text: str) -> bool:
@@ -207,6 +273,8 @@ def _has_urdu_signals(text: str) -> bool:
         "kholo", "karo", "batao", "chalao", "chala", "band", "awaaz", "awaz",
         "waqt", "badhao", "barhao", "ghata", "kam", "yaad", "talash",
         "dhundo", "shuru", "lo", "btao", "hai", "hain", "kya", "do", "kholna",
+        "banao", "bana", "hatao", "mita", "lagao", "utha", "rakh", "barha",
+        "zara", "thori", "thora", "bhi", "mujhe",
     }
     return any(t in _fast or t in _TOKEN_MAP for t in tokens)
 

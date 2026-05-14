@@ -4030,3 +4030,76 @@ async def cached_ack(phrase: str):
         logger.warning("[ACK] Kokoro failed for '%s': %s", phrase, exc)
 
     raise HTTPException(status_code=503, detail="TTS unavailable")
+
+
+# ── Multilingual debug endpoint ───────────────────────────────────────────────
+
+@router.post("/debug-pipeline")
+async def debug_pipeline(request: Request):
+    """
+    Dry-run the multilingual pipeline on a text input without executing tools.
+
+    Body: {"text": "yar settings kholo"}
+    Returns: full trace of each pipeline stage.
+    """
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent.parent))
+
+    trace: dict = {"input": text}
+
+    # Stage 1: Old normalizer
+    try:
+        from api.services.normalizer import normalize as _old_norm
+        trace["normalized_old"] = _old_norm(text)
+    except Exception as exc:
+        trace["normalized_old"] = f"error: {exc}"
+
+    # Stage 2: Language detection
+    try:
+        from cognition.language_detector import detect as _detect
+        lang_result = _detect(text)
+        trace["language"] = lang_result
+    except Exception as exc:
+        trace["language"] = f"error: {exc}"
+
+    # Stage 3: Multilingual normalizer
+    normalized = trace.get("normalized_old", text)
+    try:
+        from cognition.text_normalizer import normalize as _ml_norm
+        ml_normalized = _ml_norm(normalized if isinstance(normalized, str) else text)
+        trace["normalized_ml"] = ml_normalized
+    except Exception as exc:
+        trace["normalized_ml"] = f"error: {exc}"
+        ml_normalized = normalized if isinstance(normalized, str) else text
+
+    # Stage 4: Intent routing
+    try:
+        from api.services.intent_router import IntentRouter
+        _ir = IntentRouter.get_instance()
+        route = _ir.route(ml_normalized if isinstance(ml_normalized, str) else text)
+        trace["intent"] = {
+            "tool": route.tool_name,
+            "confidence": round(route.confidence, 3),
+            "tier": route.tier,
+            "params": dict(route.params or {}),
+            "would_execute": bool(route.tool_name and route.confidence >= 0.65 and route.tier <= 2),
+        }
+    except Exception as exc:
+        trace["intent"] = f"error: {exc}"
+
+    # Stage 5: System prompt selection
+    lang_str = None
+    if isinstance(trace.get("language"), dict):
+        lang_str = trace["language"].get("language")
+    try:
+        from api.services.pipeline import _get_system_prompt
+        trace["system_prompt_preview"] = _get_system_prompt(lang_str)[:120] + "…"
+    except Exception as exc:
+        trace["system_prompt_preview"] = f"error: {exc}"
+
+    return trace
