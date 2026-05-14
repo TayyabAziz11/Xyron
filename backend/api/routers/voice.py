@@ -590,11 +590,26 @@ _EDGE_VOICE_MAP: dict[str, str] = {
     "shimmer": "en-US-EmmaNeural",
 }
 
+_URDU_EDGE_VOICE = "ur-PK-UzmaNeural"   # Microsoft Neural Urdu (Pakistan)
+_URDU_CHAR_MIN, _URDU_CHAR_MAX = 0x0600, 0x06FF
+
+
+def _contains_urdu_script(text: str) -> bool:
+    """True if text has Urdu/Arabic script characters (U+0600–U+06FF)."""
+    return any(_URDU_CHAR_MIN <= ord(c) <= _URDU_CHAR_MAX for c in text)
+
+
+def _select_edge_voice(text: str, voice: str) -> str:
+    """Return the correct edge-tts voice, auto-upgrading to Urdu when script is detected."""
+    if _contains_urdu_script(text):
+        return _URDU_EDGE_VOICE
+    return _EDGE_VOICE_MAP.get(voice, "en-US-AvaNeural")
+
 
 async def _edge_tts_mp3(text: str, voice: str, speed: float) -> bytes:
     """Generate MP3 via edge-tts (Microsoft Neural TTS, free, ~200-400ms)."""
     import edge_tts  # type: ignore
-    edge_voice = _EDGE_VOICE_MAP.get(voice, "en-US-AvaNeural")
+    edge_voice = _select_edge_voice(text, voice)
     pct = int(round((speed - 1.0) * 100))
     rate_str = f"+{pct}%" if pct >= 0 else f"{pct}%"
     communicate = edge_tts.Communicate(text, voice=edge_voice, rate=rate_str)
@@ -633,6 +648,21 @@ async def synthesize_text(request: Request):
         raise HTTPException(status_code=400, detail="text is empty after cleaning")
 
     import asyncio as _asyncio
+
+    # ── 0. Urdu script → skip Kokoro (English-only), go straight to edge-tts ─
+    if _contains_urdu_script(text):
+        try:
+            mp3_bytes = await _edge_tts_mp3(text, voice, speed)
+            if mp3_bytes:
+                logger.info("[TTS] edge-tts Urdu (%s): %d chars → %d bytes",
+                            _URDU_EDGE_VOICE, len(text), len(mp3_bytes))
+                return Response(
+                    content=mp3_bytes,
+                    media_type="audio/mpeg",
+                    headers={"Cache-Control": "no-cache", "X-TTS-Engine": "edge-tts-ur"},
+                )
+        except Exception as exc:
+            logger.warning("[TTS] Urdu edge-tts failed, falling through: %s", exc)
 
     # ── 1. Kokoro — local offline, ~850ms CPU / ~80ms GPU ────────────────────
     try:

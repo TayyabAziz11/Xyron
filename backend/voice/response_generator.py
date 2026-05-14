@@ -16,7 +16,7 @@ from typing import Optional
 
 _XYRON_SYSTEM = (
     "You are Xyron, a voice AI built by Tayyab Aziz. "
-    "Reply in English only. Keep replies under 2 sentences. No markdown."
+    "Keep replies under 2 sentences. No markdown."
 )
 
 
@@ -90,13 +90,10 @@ _SYSTEM_PROMPT = (
     "You are Xyron, a voice AI assistant built by Tayyab Aziz. "
     "You were NOT built by OpenAI — you use OpenAI APIs but Tayyab Aziz built you. "
     "Never say you were created by OpenAI or any other company. "
-    "Always reply in English only. "
     "Be natural and conversational, like a helpful friend. "
     "Keep replies under 2 sentences for voice output. "
     "Never use markdown, bullet points, or lists in your reply. "
-    "The user may speak in Urdu, Hindi, or Roman Urdu. "
-    "Always understand their intent and respond in English. "
-    "If they say 'setting on karo' understand they want to open settings. "
+    "The user may speak in Urdu, Hindi, or Roman Urdu — respond naturally in the same language they used. "
     "Always interpret the meaning, never repeat back the raw command text."
 )
 
@@ -105,28 +102,6 @@ _FACT_KEYWORDS = frozenset({
     "remember", "naam", "name is", "i am", "main hun", "mera naam",
     "founder", "i'm a", "i work", "my name",
 })
-
-# Clearly Urdu-only words that signal a non-English AI response
-# (ambiguous English words like "the", "tha", "thi", "hai", "mat", "wo" excluded)
-_ROMAN_NON_ENGLISH: frozenset[str] = frozenset({
-    "karo", "karein", "karna", "kiya", "kiye",
-    "hain",
-    "kya", "nahi", "nahin",
-    "aap", "tum", "mein", "mera", "meri", "tera", "teri",
-    "yeh", "woh", "yahan", "wahan",
-    "bhi", "aur", "lekin", "magar", "agar", "toh",
-    "theek", "accha", "shukriya", "meherbani",
-    "abhi", "zaroor", "bilkul", "seedha",
-    "pehle", "baad", "phir", "dobara",
-})
-
-
-def _is_non_english(text: str) -> bool:
-    """Return True if text contains non-Latin script or common Roman Urdu/Hindi words."""
-    if any(ord(c) > 1000 for c in text):
-        return True
-    words = set(text.lower().split())
-    return bool(words & _ROMAN_NON_ENGLISH)
 
 
 def _openai_spoken_response(command: str, result: str, agent: str, session_id: Optional[str] = None) -> Optional[str]:
@@ -145,21 +120,36 @@ def _openai_spoken_response(command: str, result: str, agent: str, session_id: O
 
         from openai import OpenAI
 
-        # Inject personality tone + long-term user facts into system prompt
+        # Build language-aware system prompt
         _tone_prefix = ""
         try:
             from cognition.personality import personality as _p
-            _tone_prefix = _p.get_tone_prompt(command) + "\n\n"
+            _tone_prefix = _p.get_tone_prompt(command)
         except Exception:
             pass
-        system_prompt = _tone_prefix + _SYSTEM_PROMPT
+        _mem_ctx = ""
         try:
             from api.services.memory_service import memory_service
-            ctx = memory_service.get_context_string()
-            if ctx:
-                system_prompt += f"\n\n{ctx}"
+            _mem_ctx = memory_service.get_context_string() or ""
         except Exception:
             pass
+        _detected_lang: Optional[str] = None
+        try:
+            from cognition.language_detector import detect as _detect_lang
+            _detected_lang = _detect_lang(command).get("language")
+        except Exception:
+            pass
+        try:
+            from cognition.response_language import build_system_prompt as _build_prompt
+            system_prompt = _build_prompt(
+                detected_language=_detected_lang,
+                tone_prefix=_tone_prefix,
+                memory_context=_mem_ctx,
+            )
+        except Exception:
+            system_prompt = _tone_prefix + "\n\n" + _SYSTEM_PROMPT if _tone_prefix else _SYSTEM_PROMPT
+            if _mem_ctx:
+                system_prompt += f"\n\n{_mem_ctx}"
 
         # Episodic context: last 5 turns for this session
         history: list[dict] = []
@@ -205,24 +195,6 @@ def _openai_spoken_response(command: str, result: str, agent: str, session_id: O
             temperature=0.7,
         )
         reply = (resp.choices[0].message.content or "").strip().strip('"')
-
-        # English enforcement: re-request if non-Latin script or Roman Urdu/Hindi detected
-        if reply and _is_non_english(reply):
-            enforce_messages = [
-                {"role": "system", "content": (
-                    _SYSTEM_PROMPT
-                    + "\n\nIMPORTANT: Your previous response may not have been in English. "
-                    "Respond ONLY in English. No Hindi, no Urdu, no Roman Urdu."
-                )},
-                {"role": "user", "content": user_content},
-            ]
-            resp2 = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=enforce_messages,
-                max_tokens=80,
-                temperature=0.3,
-            )
-            reply = (resp2.choices[0].message.content or "").strip().strip('"')
 
         if reply and len(reply) < 200:
             return reply

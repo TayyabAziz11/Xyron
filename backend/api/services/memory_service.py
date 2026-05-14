@@ -444,4 +444,18 @@ class MemoryService:
         )
 
 
+    # ── Language mode per session ─────────────────────────────────────────────
+
+    def set_language_mode(self, session_id: str, lang: str) -> None:
+        """Persist the detected language for a session (e.g. 'roman_urdu', 'mixed')."""
+        with self._lock:
+            r = self._routing.setdefault(session_id, {})
+            r["language_mode"] = lang
+
+    def get_language_mode(self, session_id: str) -> "str | None":
+        """Return the last detected language for a session, or None if unknown."""
+        with self._lock:
+            return self._routing.get(session_id, {}).get("language_mode")
+
+
 memory_service = MemoryService()
