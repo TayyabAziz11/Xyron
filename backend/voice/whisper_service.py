@@ -31,12 +31,33 @@ _MODEL_SIZE  = os.getenv("WHISPER_MODEL", "small")
 _LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "auto")   # "auto" → None (multilingual)
 _CONF_THRESH = float(os.getenv("WHISPER_CONFIDENCE_THRESHOLD", "-1.0"))
 
-# Bias Whisper toward system command vocabulary — no API cost, just text.
-_VOICE_INITIAL_PROMPT = (
+# Language-aware initial prompts — bias Whisper toward command vocabulary.
+_VOICE_INITIAL_PROMPT_EN = (
     "Voice assistant command for Windows. "
     "C drive, D drive, E drive, F drive, folder, settings, volume, brightness, battery, WiFi. "
     "Open, create, delete, close, screenshot, maximize, minimize, lock, shutdown."
 )
+_VOICE_INITIAL_PROMPT_UR = (
+    "Voice assistant command, Urdu aur English mixed. "
+    "کھولو، بند کرو، اسکرین شاٹ لو، والیوم بڑھاؤ، والیوم گھٹاؤ، فولڈر، سیٹنگز۔ "
+    "Open, close, screenshot, volume up, volume down, folder, settings, lock, shutdown."
+)
+
+
+def _get_initial_prompt(lang: Optional[str]) -> str:
+    """Return the right initial prompt based on resolved language.
+
+    lang=None  → auto-detect mode — bilingual prompt helps Whisper handle
+                 code-switching (Roman Urdu mixed with English).
+    lang='ur'  → Urdu-primary prompt.
+    lang='en'  → English-only prompt.
+    """
+    if lang == "ur":
+        return _VOICE_INITIAL_PROMPT_UR
+    if lang is None:
+        # Bilingual: lets Whisper recognise both Urdu script and English commands
+        return _VOICE_INITIAL_PROMPT_EN + " " + _VOICE_INITIAL_PROMPT_UR
+    return _VOICE_INITIAL_PROMPT_EN
 
 # Post-processing: fix common phonetic mistakes from Whisper before routing.
 _CORRECTIONS: list[tuple[re.Pattern, str | object]] = [
@@ -182,7 +203,7 @@ def transcribe_audio(
         {text, language, confidence, duration, segments}
     """
     model = _get_model()
-    lang = _resolve_lang(language) or "en"  # force English — skip language detection
+    lang = _resolve_lang(language)  # None → auto-detect (handles Urdu, English, mixed)
 
     segments_raw, info = model.transcribe(
         audio,
@@ -192,7 +213,7 @@ def transcribe_audio(
         vad_parameters={"min_silence_duration_ms": 300},
         temperature=0.0,              # greedy — deterministic + fastest
         condition_on_previous_text=False,
-        initial_prompt=_VOICE_INITIAL_PROMPT,  # bias toward command vocabulary
+        initial_prompt=_get_initial_prompt(lang),
     )
 
     segments  = _filter_segments(segments_raw)
