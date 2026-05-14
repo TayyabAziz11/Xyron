@@ -17,7 +17,22 @@ class PersonalityProfile:
     humor_level:      float = 0.3
     confidence_level: float = 0.8
 
-    def get_tone_prompt(self) -> str:
+    @staticmethod
+    def detect_language(text: str) -> str:
+        """Return 'ur', 'en', or 'mixed' based on script character analysis."""
+        if not text:
+            return "en"
+        urdu_chars  = sum(1 for c in text if ord(c) > 1000)
+        latin_chars = sum(1 for c in text if c.isalpha() and ord(c) <= 127)
+        total_alpha = urdu_chars + latin_chars
+        if total_alpha == 0:
+            return "en"
+        urdu_ratio = urdu_chars / total_alpha
+        if urdu_ratio > 0.3:
+            return "mixed" if latin_chars > 0 and urdu_ratio < 0.9 else "ur"
+        return "en"
+
+    def get_tone_prompt(self, text: str = "") -> str:
         """Return a system prompt fragment encoding current personality + time context."""
         hour        = time.localtime().tm_hour
         turn_count  = self._get_turn_count()
@@ -40,6 +55,12 @@ class PersonalityProfile:
             if self.humor_level >= 0.3 else ""
         )
 
+        lang_note = ""
+        if text:
+            lang = self.detect_language(text)
+            if lang in ("ur", "mixed"):
+                lang_note = "User speaks Urdu or mixes Urdu/English. Respond naturally in the same mix they used."
+
         parts = [
             f"Personality: {self.name} — {self.tone}, {self.verbosity}.",
             "Never use filler phrases like 'Certainly!', 'Of course!', 'Sure thing!', 'Absolutely!'.",
@@ -53,6 +74,8 @@ class PersonalityProfile:
             parts.append(time_note)
         if brevity_note:
             parts.append(brevity_note)
+        if lang_note:
+            parts.append(lang_note)
 
         return " ".join(parts)
 

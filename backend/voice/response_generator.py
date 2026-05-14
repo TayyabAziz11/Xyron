@@ -53,7 +53,7 @@ def generate_response(
             _tone = ""
             try:
                 from cognition.personality import personality as _p
-                _tone = _p.get_tone_prompt() + " "
+                _tone = _p.get_tone_prompt(text) + " "
             except Exception:
                 pass
             messages = [
@@ -149,7 +149,7 @@ def _openai_spoken_response(command: str, result: str, agent: str, session_id: O
         _tone_prefix = ""
         try:
             from cognition.personality import personality as _p
-            _tone_prefix = _p.get_tone_prompt() + "\n\n"
+            _tone_prefix = _p.get_tone_prompt(command) + "\n\n"
         except Exception:
             pass
         system_prompt = _tone_prefix + _SYSTEM_PROMPT
