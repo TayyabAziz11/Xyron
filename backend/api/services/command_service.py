@@ -43,7 +43,7 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
       "open spotify", "open terminal", "open calculator", "launch chrome", "launch spotify",
       "launch vscode", "launch vs code", "open notepad", "open firefox",
       "کھولو", "شروع کرو", "چلاؤ"], "system", "open_app"),
-    (["close app", "close window", "exit app", "quit app", "بند کرو", "بند"], "system", "close_app"),
+    (["close app", "close window", "exit app", "quit app", "بند کرو", "بند"], "system", "kill_app"),
     (["volume up", "louder", "آواز بڑھاؤ", "اونچا کرو"], "system", "volume_up"),
     (["volume down", "quieter", "آواز کم کرو", "نیچا کرو"], "system", "volume_down"),
     (["take screenshot", "capture screen", "اسکرین شاٹ", "تصویر لو"], "system", "screenshot"),
