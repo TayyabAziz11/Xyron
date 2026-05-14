@@ -188,6 +188,9 @@ class OpenAIClient:
             logger.warning("[OpenAIClient] %s request failed: %s", model, exc)
             return None  # caller uses offline path
 
+    def is_available(self) -> bool:
+        return self.available
+
     def stats(self) -> dict:
         """Return current hour call counts — safe to expose in a debug endpoint."""
         self._ensure_init()
@@ -206,14 +209,31 @@ class OpenAIClient:
 openai_client = OpenAIClient()
 
 
-# ── Offline fallback stub (plug Ollama here later) ────────────────────────────
+# ── Offline Ollama fallback ────────────────────────────────────────────────────
 
-def offline_generate(prompt: str, *, complex: bool = False) -> Optional[str]:
-    """Local Ollama fallback. Uses llama3.2:3b for quick tasks, mistral:7b for complex ones."""
-    model = "mistral:7b" if complex else "llama3.2:3b"
+def offline_generate(
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    complex: bool = False,
+) -> Optional[str]:
+    """Local Ollama fallback. llama3.2:3b for quick tasks, mistral:7b for complex ones.
+
+    Respects OLLAMA_MODEL and OLLAMA_API_URL env vars.
+    Returns None silently if Ollama is not running or the package is not installed.
+    """
+    import os as _os
+    _default_model = "mistral:7b" if complex else "llama3.2:3b"
+    model = _os.getenv("OLLAMA_MODEL", _default_model)
     try:
         import ollama as _ollama
-        resp = _ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
+        _base_url = _os.getenv("OLLAMA_API_URL", "http://localhost:11434")
+        client = _ollama.Client(host=_base_url)
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        resp = client.chat(model=model, messages=messages)
         text = resp["message"]["content"].strip()
         logger.debug("[Ollama:%s] response length=%d", model, len(text))
         return text or None

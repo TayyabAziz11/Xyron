@@ -3,7 +3,8 @@ Generates natural-language assistant responses for spoken TTS output.
 
 Priority:
 1. OpenAI generates a concise spoken response (when key is available)
-2. Template fallback per-agent (always works)
+2. Ollama local LLM fallback (when OpenAI is unavailable or returns None)
+3. Template fallback per-agent (always works)
 
 Each response is ≤ 2 sentences, no markdown, natural spoken English.
 """
@@ -13,6 +14,11 @@ import logging
 import re
 from typing import Optional
 
+_XYRON_SYSTEM = (
+    "You are Xyron, a voice AI built by Tayyab Aziz. "
+    "Reply in English only. Keep replies under 2 sentences. No markdown."
+)
+
 
 def generate_response(
     text: str,
@@ -21,51 +27,57 @@ def generate_response(
 ) -> str:
     """
     Entry point for the voice pipeline's _generate_response helper.
-    Uses model_router to pick the right model, then openai_client to call it.
-    Falls back to template strings if the API is unavailable.
+    Tier 1: OpenAI → Tier 2: Ollama → Tier 3: template string.
     """
+    reply: Optional[str] = None
     try:
         from api.services.model_router import select_model
-        from api.services.openai_client import openai_client
+        from api.services.openai_client import offline_generate, openai_client
 
         tool_matched = bool(tool_name and tool_name not in ("general_query",))
         model_choice = select_model(text, tool_matched=tool_matched)
 
-        # Local / tool result — narrate briefly without extra AI call
-        if model_choice == "local" or not openai_client.available:
-            if tool_output:
-                return tool_output[:150]
-            if tool_name:
-                return f"Done — {tool_name.replace('_', ' ')}."
-            return "Sure, done."
+        # Local tool result — no AI narration needed
+        if model_choice == "local":
+            return tool_output[:150] if tool_output else (
+                f"Done — {tool_name.replace('_', ' ')}." if tool_name else "Sure, done."
+            )
 
-        user_content = (
-            f"User said: '{text}'\nResult: {(tool_output or '')[:300]}\n\n"
-            "Summarise in 1-2 natural spoken sentences."
-        ) if tool_output else text
+        # Tier 1: OpenAI
+        if openai_client.available:
+            user_content = (
+                f"User said: '{text}'\nResult: {(tool_output or '')[:300]}\n\n"
+                "Summarise in 1-2 natural spoken sentences."
+            ) if tool_output else text
 
-        _tone = ""
-        try:
-            from cognition.personality import personality as _p
-            _tone = _p.get_tone_prompt() + " "
-        except Exception:
-            pass
-        messages = [
-            {"role": "system", "content": (
-                _tone +
-                "You are Xyron, a voice AI built by Tayyab Aziz. "
-                "Reply in English only. Keep replies under 2 sentences. No markdown."
-            )},
-            {"role": "user", "content": user_content},
-        ]
-        model = model_choice if model_choice in ("gpt-4o", "gpt-4o-mini") else "gpt-4o-mini"
-        reply = openai_client.generate(messages, model=model, max_tokens=100)  # type: ignore[arg-type]
-        if reply:
-            return reply
+            _tone = ""
+            try:
+                from cognition.personality import personality as _p
+                _tone = _p.get_tone_prompt() + " "
+            except Exception:
+                pass
+            messages = [
+                {"role": "system", "content": _tone + _XYRON_SYSTEM},
+                {"role": "user", "content": user_content},
+            ]
+            model = model_choice if model_choice in ("gpt-4o", "gpt-4o-mini") else "gpt-4o-mini"
+            reply = openai_client.generate(messages, model=model, max_tokens=100)  # type: ignore[arg-type]
+
+        # Tier 2: Ollama (when OpenAI is down or returned None)
+        if reply is None:
+            reply = offline_generate(
+                prompt=text,
+                system=_XYRON_SYSTEM,
+                complex=len(text.split()) > 15,
+            )
+
     except Exception as exc:
         logging.getLogger(__name__).debug("generate_response AI path failed: %s", exc)
 
-    # Template fallback
+    if reply:
+        return reply
+
+    # Tier 3: Template fallback
     if tool_output:
         return tool_output[:150]
     if tool_name:
@@ -291,12 +303,25 @@ def _resolve_spoken_response(
         clean = _clean_for_speech(result)
         return clean[:120] if clean else "Done."
 
-    # Try OpenAI for a natural spoken reply
+    # Tier 1: OpenAI for a natural spoken reply
     ai_reply = _openai_spoken_response(command_text, result, agent, session_id)
     if ai_reply:
         return ai_reply
 
-    # Fallback: template-based response
+    # Tier 2: Ollama local LLM fallback
+    try:
+        from api.services.openai_client import offline_generate as _offline
+        _ollama_reply = _offline(
+            prompt=command_text,
+            system=_XYRON_SYSTEM,
+            complex=len(command_text.split()) > 15,
+        )
+        if _ollama_reply:
+            return _ollama_reply
+    except Exception:
+        pass
+
+    # Tier 3: template-based response
     clean = _clean_for_speech(result)
 
     # Route to per-agent response template
