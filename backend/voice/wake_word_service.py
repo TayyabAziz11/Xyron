@@ -64,7 +64,7 @@ except json.JSONDecodeError:
 # Rationale: 0.90+ required to block false positives from phonetically similar words.
 # Single-word keywords ("xyron") share phonemes with common words → highest threshold.
 _MODEL_THRESHOLDS.setdefault("hey_xyron",    0.72)  # raised: noise floor sits at 0.40–0.49
-_MODEL_THRESHOLDS.setdefault("wakeup_xyron", 0.97)  # model fires at 0.9+ on random words — near-disable
+_MODEL_THRESHOLDS.setdefault("wakeup_xyron", 0.94)  # lowered: Whisper is the false-positive gate now
 _MODEL_THRESHOLDS.setdefault("xyron",        0.78)  # single word — highest FP risk
 _MODEL_THRESHOLDS.setdefault("hey_xeron",    0.72)  # phonetic variant
 _MODEL_THRESHOLDS.setdefault("hi_xyron",     0.72)

@@ -116,7 +116,8 @@ async def ws_wake(websocket: WebSocket) -> None:
 
     # Rolling audio buffer: last 2.56s of PCM (32 × 1280 samples @ 16kHz).
     # Used for Whisper second-stage verification when OWW fires.
-    _BUFFER_FRAMES = 32
+    _BUFFER_FRAMES  = 32   # full buffer kept for session audio
+    _WHISPER_FRAMES = 15   # last 15 × 80ms = 1.2s sent to Whisper (isolates wake phrase)
     audio_buf: collections.deque[np.ndarray] = collections.deque(maxlen=_BUFFER_FRAMES)
 
     loop = asyncio.get_event_loop()
@@ -150,7 +151,7 @@ async def ws_wake(websocket: WebSocket) -> None:
                     # OWW models produce false positives from background noise.
                     # Whisper confirms a wake keyword was actually spoken before
                     # we send the wake event to the frontend.
-                    clip = np.concatenate(list(audio_buf))
+                    clip = np.concatenate(list(audio_buf)[-_WHISPER_FRAMES:])
                     try:
                         from voice.whisper_service import verify_wake_phrase, _model_ready
                         # If Whisper is still loading (startup warmup), skip verification
