@@ -256,6 +256,17 @@ Added Urdu/Roman Urdu intent patterns, Whisper language auto-detection, wake wor
 
 ---
 
+## 2026-05-16 — Voice Quality Overhaul: Pronunciation, Chunking, STT Normalization, Intros
+
+### What Was Fixed
+
+- **Pronunciation engine** (`voice/pronunciation_engine.py` + `pronunciation_lexicon.py`): global pre-TTS word substitution. "Xyron" → "Zyron" (was "X Y Ron"). Acronyms, brand names, technical terms all handled. Word-boundary-safe, logs `[PRONUNCIATION]`.
+- **STT normalization** (`api/services/normalizer.py`): "Here's Aaron", "Zairon", "xylone", "siron" all map to "xyron" before wake-word stripping. Logs `[NAME_NORMALIZE]`.
+- **Prosody planner** (`voice/prosody_planner.py`): `_guard_chunk_size()` enforces 150-char hard max. `_split_intro()` for AUDIENCE/DETAILED (120-char max). Pauses reduced 200-250ms → 80-150ms. EXTREME speed 1.20x → 1.10x.
+- **Self-intro engine** (`cognition/self_intro_engine.py`): new DETAILED style (25-45s), AUDIENCE rewritten with cinematic system-level script, all styles upgraded for more intelligent delivery.
+
+---
+
 ## 2026-05-16 — RVC Emotional Voice Conversion Layer
 
 ### What Was Built

@@ -113,13 +113,19 @@ def _is_silent_audio(audio_bytes: bytes, content_type: str = "audio/webm") -> bo
 # ── Text cleaning for speech ──────────────────────────────────────────────────
 
 def _clean_for_speech(text: str, max_chars: int = 300) -> str:
-    """Strip markdown, code, URLs and truncate so TTS sounds natural."""
+    """Strip markdown, code, URLs and apply pronunciation normalization before TTS."""
     if not text:
         return ""
     t = text.strip()
     # Backslashes cause espeak-ng to split output lines → phonemizer line-count mismatch → Kokoro retry.
     # Replace all backslashes with spaces so paths become pronounceable words.
     t = t.replace("\\", " ")
+    # Apply pronunciation lexicon before any other cleaning (operates on original casing)
+    try:
+        from voice.pronunciation_engine import pronunciation_engine as _pe
+        t = _pe.apply(t)
+    except Exception:
+        pass
     # Code blocks
     t = re.sub(r"```[\s\S]*?```", "See the screen for code.", t)
     t = re.sub(r"`[^`]+`", "", t)
@@ -2925,9 +2931,18 @@ async def respond_stream(body: _RespondStreamBody):
                             import re as _re_intro
                             _intro_style, _intro_script = _intro_gen(_raw_text)
                             logger.info("[SELF_INTRO] style=%s script_len=%d", _intro_style, len(_intro_script))
-                            # Split script into sentence chunks for progressive streaming
-                            _intro_sentences = [s.strip() for s in _re_intro.split(r'(?<=[.!?])\s+', _intro_script) if s.strip()]
-                            for _i_idx, _i_sent in enumerate(_intro_sentences):
+                            # Split at sentence boundaries then enforce max 120 chars per chunk
+                            _raw_intro_sents = [s.strip() for s in _re_intro.split(r'(?<=[.!?])\s+', _intro_script) if s.strip()]
+                            _intro_chunks: list[str] = []
+                            for _rs in _raw_intro_sents:
+                                if len(_rs) <= 120:
+                                    _intro_chunks.append(_rs)
+                                else:
+                                    # Sub-split at comma or whitespace (word-safe)
+                                    _sub = _re_intro.split(r'(?<=,)\s+', _rs, maxsplit=2)
+                                    _intro_chunks.extend(s.strip() for s in _sub if s.strip())
+                            for _i_idx, _i_sent in enumerate(_intro_chunks):
+                                logger.info("[PROSODY_CHUNK] index=%d chars=%d text=%r", _i_idx, len(_i_sent), _i_sent[:60])
                                 yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': _i_idx, 'text': _i_sent})}\n\n"
                             _intro_full = _intro_script
                         except Exception as _ie:

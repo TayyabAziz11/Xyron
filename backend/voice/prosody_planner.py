@@ -2,13 +2,22 @@
 Prosody planner — splits text into synthesizable chunks with pause/style metadata.
 
 Emotion profiles and their pacing:
-  HYPED_NATURAL     — upgrade reactions: sentence splits, 130ms pauses, 1.08-1.10x speed
+  HYPED_NATURAL     — upgrade reactions: sentence splits, 100ms pauses, 1.08-1.10x speed
   RELIEVED_EXCITED  — bug/wake fixes: first chunk calm 0.98x, rest 1.05x
-  HYPED / EXTREME   — em-dash splits, 200ms dramatic pauses, 1.20x
-  DOMINANT          — sentence splits, 250ms pauses, 0.95x
+  HYPED / EXTREME   — em-dash splits, 150ms dramatic pauses, 1.10x
+  DOMINANT          — sentence splits, 200ms pauses, 0.95x
   PROTECTIVE_FOCUSED — no splitting, 0.96x, calm
   PROUD_CALM        — no splitting, 0.98-1.02x, warm
   CALM / LATE_NIGHT — no splitting, single chunk
+
+Chunk size rules:
+  - Intro / audience mode: 60-120 chars per chunk
+  - Emotional burst:        ≤20 chars (micro-reaction)
+  - Default:                40-100 chars
+  - Hard max:               150 chars (never exceeded)
+
+Word-safety: all splits happen at whitespace/punctuation boundaries.
+Never split inside a word, name, or phonetic replacement.
 
 Each ProsodicChunk maps to one Kokoro synthesis call; silence is inserted between chunks.
 """
@@ -37,11 +46,45 @@ class ProsodyPlan:
 
 _EM_DASH_RE   = re.compile(r'\s*—\s*')
 _SENTENCE_RE  = re.compile(r'(?<=[.!?])\s+')
-_COMMA_CLAUSE = re.compile(r',\s+')
+_COMMA_CLAUSE = re.compile(r',\s+(?=\S)')
+
+_HARD_MAX_CHARS = 150  # never exceed — prevents Kokoro slow synthesis on long inputs
+
+
+def _guard_chunk_size(
+    parts: list[tuple[str, int, str]],
+    max_chars: int = _HARD_MAX_CHARS,
+) -> list[tuple[str, int, str]]:
+    """
+    Split any chunk that exceeds max_chars at a comma or whitespace boundary.
+    Never cuts inside a word. Returns a new flat list.
+    """
+    result: list[tuple[str, int, str]] = []
+    for text, pause, style in parts:
+        if len(text) <= max_chars:
+            result.append((text, pause, style))
+            continue
+        # Try splitting at commas first
+        sub = _COMMA_CLAUSE.split(text, maxsplit=1)
+        if len(sub) == 2 and len(sub[0].strip()) >= 10:
+            result.append((sub[0].strip(), 60, style))
+            result.append((sub[1].strip(), pause, style))
+        else:
+            # Fall back to whitespace split at max_chars boundary (word-safe)
+            chunk = text
+            while len(chunk) > max_chars:
+                cut = chunk[:max_chars].rfind(" ")
+                if cut < 20:
+                    cut = max_chars  # no space found — hard cut (rare)
+                result.append((chunk[:cut].strip(), 60, style))
+                chunk = chunk[cut:].strip()
+            if chunk:
+                result.append((chunk, pause, style))
+    return result
 
 
 def _split_hyped(text: str) -> list[tuple[str, int, str]]:
-    """Split on em-dash first, then sentence boundaries. Returns (text, pause_ms, style)."""
+    """Split at sentence boundaries. Em-dash → natural pause. Calm pauses — no drama."""
     parts: list[tuple[str, int, str]] = []
     em_parts = _EM_DASH_RE.split(text)
     for i, part in enumerate(em_parts):
@@ -54,13 +97,13 @@ def _split_hyped(text: str) -> list[tuple[str, int, str]]:
             if not sent:
                 continue
             is_last = (i == len(em_parts) - 1) and (j == len(sentences) - 1)
-            pause = 0 if is_last else (100 if j < len(sentences) - 1 else 120)
+            pause = 0 if is_last else (80 if j < len(sentences) - 1 else 100)
             parts.append((sent, pause, "fast"))
-    return parts or [(text, 0, "fast")]
+    return _guard_chunk_size(parts) or [(text, 0, "fast")]
 
 
 def _split_extreme(text: str) -> list[tuple[str, int, str]]:
-    """EXTREME: em-dash splits with longer dramatic pauses for emotional wave effect."""
+    """EXTREME: sentence splits with moderate emotional pauses."""
     parts: list[tuple[str, int, str]] = []
     em_parts = _EM_DASH_RE.split(text)
     for i, part in enumerate(em_parts):
@@ -73,14 +116,13 @@ def _split_extreme(text: str) -> list[tuple[str, int, str]]:
             if not sent:
                 continue
             is_last = (i == len(em_parts) - 1) and (j == len(sentences) - 1)
-            # Longer pauses: 200ms between em-dash breaks for dramatic wave effect
-            pause = 0 if is_last else (150 if j < len(sentences) - 1 else 200)
+            pause = 0 if is_last else (100 if j < len(sentences) - 1 else 150)
             parts.append((sent, pause, "fast"))
-    return parts or [(text, 0, "fast")]
+    return _guard_chunk_size(parts) or [(text, 0, "fast")]
 
 
 def _split_dominant(text: str) -> list[tuple[str, int, str]]:
-    """Split on sentence boundaries only. Returns (text, pause_ms, style)."""
+    """Sentence boundaries, steady authoritative pauses."""
     parts: list[tuple[str, int, str]] = []
     sentences = _SENTENCE_RE.split(text.strip())
     for i, sent in enumerate(sentences):
@@ -88,13 +130,13 @@ def _split_dominant(text: str) -> list[tuple[str, int, str]]:
         if not sent:
             continue
         is_last = i == len(sentences) - 1
-        pause = 0 if is_last else 250
+        pause = 0 if is_last else 200
         parts.append((sent, pause, "slow"))
-    return parts or [(text, 0, "slow")]
+    return _guard_chunk_size(parts) or [(text, 0, "slow")]
 
 
 def _split_natural(text: str) -> list[tuple[str, int, str]]:
-    """Natural sentence splits with moderate pauses — for HYPED_NATURAL and RELIEVED_EXCITED."""
+    """Natural sentence splits — conversational rhythm, short pauses."""
     parts: list[tuple[str, int, str]] = []
     sentences = _SENTENCE_RE.split(text.strip())
     for i, sent in enumerate(sentences):
@@ -102,10 +144,24 @@ def _split_natural(text: str) -> list[tuple[str, int, str]]:
         if not sent:
             continue
         is_last = i == len(sentences) - 1
-        # Shorter pause — natural conversational rhythm, not dramatic
-        pause = 0 if is_last else 130
+        pause = 0 if is_last else 100
         parts.append((sent, pause, "normal"))
-    return parts or [(text, 0, "normal")]
+    return _guard_chunk_size(parts) or [(text, 0, "normal")]
+
+
+def _split_intro(text: str) -> list[tuple[str, int, str]]:
+    """Intro/audience mode: longer chunks (60-120 chars), calm pacing."""
+    parts: list[tuple[str, int, str]] = []
+    sentences = _SENTENCE_RE.split(text.strip())
+    for i, sent in enumerate(sentences):
+        sent = sent.strip()
+        if not sent:
+            continue
+        is_last = i == len(sentences) - 1
+        pause = 0 if is_last else 120
+        parts.append((sent, pause, "normal"))
+    # For intro, allow up to 120 chars before sub-splitting
+    return _guard_chunk_size(parts, max_chars=120) or [(text, 0, "normal")]
 
 
 class ProsodyPlanner:
@@ -166,27 +222,27 @@ class ProsodyPlanner:
             raw_chunks = _split_extreme(text)
             return ProsodyPlan(
                 chunks=[ProsodicChunk(t, p, s) for t, p, s in raw_chunks],
-                speed=1.20,
+                speed=1.10,
                 pitch_shift=0.0,
-                energy=0.90,
+                energy=0.85,
             )
 
         if mood_up == "HYPED" or intens == "EXTREME":
             raw_chunks = _split_hyped(text)
             return ProsodyPlan(
                 chunks=[ProsodicChunk(t, p, s) for t, p, s in raw_chunks],
-                speed=1.10,
+                speed=1.08,
                 pitch_shift=0.0,
-                energy=0.82,
+                energy=0.80,
             )
 
         if mood_up == "DOMINANT":
             raw_chunks = _split_dominant(text)
             return ProsodyPlan(
                 chunks=[ProsodicChunk(t, p, s) for t, p, s in raw_chunks],
-                speed=0.95,
+                speed=0.96,
                 pitch_shift=0.0,
-                energy=0.85,
+                energy=0.82,
             )
 
         return self._single(text, mood_up, profile_up)

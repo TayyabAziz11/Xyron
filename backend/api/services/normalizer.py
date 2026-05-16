@@ -14,6 +14,35 @@ from __future__ import annotations
 
 import re
 
+# ── 0. Xyron STT phonetic variant normalization ───────────────────────────────
+# Whisper mishears "Xyron" as several phonetically similar words.
+# Normalize them back to "xyron" BEFORE wake-word stripping so the wake-word
+# pattern fires correctly on all variants.
+
+_XYRON_VARIANTS_RE = re.compile(
+    r"\b(?:"
+    r"here['’]?s?\s+aaron|here\s+is\s+aaron|"  # "here's Aaron", "here is Aaron"
+    r"zairon|zyron|zaron|zeiron|zaharon|"
+    r"xylone|xiron|siron|syron|"
+    r"zairan|searon|"
+    r"herons?"                                         # rare but heard
+    r")\b",
+    re.IGNORECASE,
+)
+
+import logging as _logging
+_norm_log = _logging.getLogger(__name__)
+
+
+def _normalize_xyron_variants(text: str) -> str:
+    """Replace STT phonetic mishearings of 'Xyron' with the canonical spelling."""
+    def _replace(m: re.Match) -> str:
+        raw = m.group(0)
+        _norm_log.info("[NAME_NORMALIZE] raw=%r normalized='xyron'", raw)
+        return "xyron"
+    return _XYRON_VARIANTS_RE.sub(_replace, text)
+
+
 # ── 1. Wake-word stripping ────────────────────────────────────────────────────
 
 _WAKE_WORD_RE = re.compile(
@@ -120,6 +149,9 @@ def normalize(text: str) -> str:
     """
     if not text or not text.strip():
         return text
+
+    # 0. Fix STT phonetic mishearings of "Xyron" before wake-word strip
+    text = _normalize_xyron_variants(text)
 
     # 1. Strip wake word
     text = _WAKE_WORD_RE.sub("", text).strip()
