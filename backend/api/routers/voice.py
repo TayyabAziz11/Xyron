@@ -2569,6 +2569,7 @@ async def respond_stream(body: _RespondStreamBody):
                 logger.info("[EMOTION_STATE] mood=%s emotion=%s energy=%.2f",
                             _mm.state.value, _emo_r.emotion, _emo_r.energy)
 
+                _emo_route_t0 = __import__("time").monotonic()
                 _guard_r = _eig.classify(_raw_text, _raw_text)
                 logger.info("[VOICE_TRACE] stage=emotional_guard intent=%s conf=%.2f reason=%s text=%r",
                             _guard_r.intent_class.value, _guard_r.confidence,
@@ -2809,27 +2810,28 @@ async def respond_stream(body: _RespondStreamBody):
                         # EXTREME events always get a burst; HIGH uses standard cooldown path
                         try:
                             if _is_extreme:
+                                # EXTREME: excited reactions only — no calm "Wait…" / "Okay…"
                                 _burst_options = [
-                                    "Wait…",
                                     "Oh wow.",
-                                    "Okay, that's big.",
-                                    "Honestly?",
                                     "No way.",
+                                    "That's huge.",
+                                    "Okay, that's big.",
+                                    "Oh, this is good.",
                                     "That's actually huge.",
-                                    "Oh, nice.",
-                                    "Okay…",
-                                    "Oh, that's good.",
-                                    "Finally.",
-                                    "Oh, interesting.",
-                                    "Huh. Okay.",
+                                    "Oh wow, seriously?",
+                                    "No way, that's big.",
                                 ]
                                 _micro_burst = _rnd.choice(_burst_options)
+                                _first_audio_ms = (__import__("time").monotonic() - _emo_route_t0) * 1000
                                 logger.info("[MICRO_REACTION_AUDIO] emitted=true intensity=EXTREME text=%r", _micro_burst)
+                                logger.info("[VOICE_LATENCY] emotional_route_to_first_audio_ms=%.0f", _first_audio_ms)
                                 yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': -1, 'text': _micro_burst})}\n\n"
                             else:
                                 _micro = _expr.get_micro_reaction("HYPED", _ev_energy, 0)
                                 if _micro:
+                                    _first_audio_ms = (__import__("time").monotonic() - _emo_route_t0) * 1000
                                     logger.info("[MICRO_REACTION_AUDIO] text=%r state=HYPED emitted=true", _micro)
+                                    logger.info("[VOICE_LATENCY] emotional_route_to_first_audio_ms=%.0f", _first_audio_ms)
                                     yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': -1, 'text': _micro})}\n\n"
                         except Exception as _me:
                             logger.warning("[EMOTION] micro_reaction error: %s", _me)
@@ -2970,7 +2972,27 @@ async def respond_stream(body: _RespondStreamBody):
                     except Exception:
                         _emo_full = _base_resp
 
-                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _emo_full})}\n\n"
+                    # Split into short sentences — never send >90 chars in one SSE chunk.
+                    # Each sentence triggers an independent Kokoro call on the frontend
+                    # so audio starts immediately after the first sentence, not the full response.
+                    import re as _re_split
+                    _raw_sents = _re_split.split(r'(?<=[.!?])\s+', _emo_full.strip())
+                    # Further split any sentence >90 chars at natural comma/clause boundaries
+                    _final_chunks: list[str] = []
+                    for _rs in _raw_sents:
+                        if not _rs.strip():
+                            continue
+                        if len(_rs) <= 90:
+                            _final_chunks.append(_rs.strip())
+                        else:
+                            # Split at comma/dash/clause for very long sentences
+                            _sub = _re_split.split(r'(?<=,)\s+|(?<=—)\s*', _rs, maxsplit=2)
+                            _final_chunks.extend(s.strip() for s in _sub if s.strip())
+                    if not _final_chunks:
+                        _final_chunks = [_emo_full.strip()]
+                    for _ci, _csent in enumerate(_final_chunks):
+                        logger.info("[PROSODY_CHUNK] index=%d chars=%d text=%r", _ci, len(_csent), _csent[:60])
+                        yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': _ci, 'text': _csent})}\n\n"
                     logger.info("[VOICE_TRACE] emotional_response=offline mood=%s response=%r",
                                 _cur_mood, _emo_full[:60])
 
