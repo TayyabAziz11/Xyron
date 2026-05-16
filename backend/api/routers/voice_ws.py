@@ -497,11 +497,165 @@ async def ws_session(websocket: WebSocket) -> None:
         await _send(websocket, {"type": "transcript", "text": transcript, "final": True})
         logger.info("[WS/session] transcript: %r", transcript)
         memory.add_user(transcript)
+        logger.info("[VOICE_TRACE] stage=stt transcript=%r", transcript[:80])
+
+        # ── Emotion detection + mood update (runs before ANY routing) ─────────
+        _emo          = None
+        _current_mood = "CALM"
+        try:
+            from cognition.emotion_engine import emotion_engine as _ee
+            from cognition.mood_state_machine import mood_machine as _mm, MoodContext, MoodState
+            from cognition.cognitive_state import cognitive_state as _cs
+            import datetime as _dt
+            _emo  = _ee.detect_text(transcript)
+            _hour = _dt.datetime.now().hour
+            _mm.update(MoodContext(
+                emotion       = _emo.emotion,
+                energy        = _emo.energy,
+                is_late_night = (_hour >= 23 or _hour < 5),
+            ))
+            _cs.mood_state     = _mm.state.value
+            _cs.emotion_label  = _emo.emotion
+            _cs.emotion_energy = _emo.energy
+            _current_mood      = _mm.state.value
+            logger.info("[VOICE_TRACE] stage=emotion_detect emotion=%s energy=%.2f mood=%s",
+                        _emo.emotion, _emo.energy, _current_mood)
+        except Exception as _exc:
+            logger.warning("[VOICE_TRACE] emotion_detect failed: %s", _exc)
+
+        # ── Emotional intent guard — intercepts BEFORE orchestrator ───────────
+        _guard = None
+        try:
+            from cognition.emotional_intent_guard import emotional_intent_guard as _eig, IntentClass
+            _guard = _eig.classify(transcript, transcript)
+            logger.info("[VOICE_TRACE] stage=emotional_guard intent=%s conf=%.2f reason=%s",
+                        _guard.intent_class.value, _guard.confidence, _guard.reason)
+        except Exception as _exc:
+            logger.warning("[VOICE_TRACE] emotional_guard failed: %s", _exc)
+
+        # ── Emotional branch — full bypass of orchestrator + tool routing ─────
+        if _guard and _guard.intent_class.value in ("EMOTIONAL_EVENT", "CONVERSATION"):
+            _emotional_response_text = ""
+            try:
+                from cognition.self_upgrade_detector import self_upgrade_detector as _sud
+                from cognition.expression_engine import expression_engine as _expr
+                from voice.emotion_tts_mapper import emotion_tts_mapper as _etm
+                from api.services.response_pipeline import quick_response as _qr
+                from cognition.mood_state_machine import MoodState as _MS
+
+                _su = _sud.detect(transcript)
+
+                if _su.is_self_upgrade:
+                    _mm.force(_MS.HYPED)
+                    try:
+                        _cs.mood_state = "HYPED"
+                    except Exception:
+                        pass
+                    _current_mood = "HYPED"
+                    _sys = (
+                        "You are Xyron, a voice-first AI built by Tayyab Aziz. "
+                        + _mm.get_personality_addendum() + " "
+                        + f"The user just told you about a {_su.upgrade_type} upgrade to your system. "
+                        "React with genuine excitement. Reference the specific upgrade type. "
+                        "1-2 punchy sentences. No markdown, no lists."
+                    )
+                    logger.info("[VOICE_TRACE] stage=self_upgrade type=%s mood=HYPED", _su.upgrade_type)
+                elif _guard.reason == "frustration_pattern":
+                    _mm.force(_MS.PROTECTIVE)
+                    try:
+                        _cs.mood_state = "PROTECTIVE"
+                    except Exception:
+                        pass
+                    _current_mood = "PROTECTIVE"
+                    _sys = (
+                        "You are Xyron, a voice-first AI built by Tayyab Aziz. "
+                        + _mm.get_personality_addendum() + " "
+                        "The user is expressing frustration with a bug or issue. "
+                        "Acknowledge it directly. Offer specific help. "
+                        "1-2 sentences. No filler. No generic chatbot warmth."
+                    )
+                    logger.info("[VOICE_TRACE] stage=frustration mood=PROTECTIVE")
+                else:
+                    _sys = (
+                        "You are Xyron, a voice-first AI built by Tayyab Aziz. "
+                        + _mm.get_personality_addendum() + " "
+                        "Respond naturally. 1-2 sentences max. No markdown."
+                    )
+
+                # Generate emotional response with specialized system prompt
+                _raw = await _qr(transcript, memory.history_for_llm(), system_override=_sys)
+                logger.info("[VOICE_TRACE] stage=response_generation raw=%r", _raw[:80])
+
+                # Shape with expression engine
+                _shaped = _expr.shape(
+                    _raw, _current_mood,
+                    _emo.emotion if _emo else "calmness",
+                    _emo.energy  if _emo else 0.5,
+                    turn_count = 1,
+                    importance = _emo.importance if _emo else 0.5,
+                )
+                _emotional_response_text = _shaped
+
+                # Apply emotion TTS transform
+                _tts_r = _etm.transform(_shaped, _current_mood)
+                logger.info("[TTS_EMOTION] state=%s speed=%.2f transform_applied=true",
+                            _current_mood, _tts_r.speed_hint)
+                logger.info("[VOICE_TRACE] stage=emotion_tts text=%r speed=%.2f",
+                            _tts_r.text[:60], _tts_r.speed_hint)
+
+                await _send(websocket, {"type": "response", "text": _shaped, "chunk": 1})
+
+                # Synthesize with emotion speed (bypasses closure `speed`)
+                _emo_chunks = _split_for_tts(_tts_r.text)
+                for _i, _ec in enumerate(_emo_chunks, 1):
+                    _wav = await _synthesize_chunk(_ec, voice, _tts_r.speed_hint)
+                    if _wav:
+                        await _send(websocket, {
+                            "type":  "audio",
+                            "data":  base64.b64encode(_wav).decode(),
+                            "chunk": _i,
+                            "total": len(_emo_chunks),
+                            "final": (_i == len(_emo_chunks)),
+                            "text":  _ec,
+                        })
+
+            except Exception as _exc:
+                logger.warning("[VOICE_TRACE] emotional_response error: %s", _exc)
+                _OFFLINE = {
+                    "self_upgrade_pattern": "That upgrade just landed. System noted — keep building.",
+                    "frustration_pattern":  "I hear you. Send me the error and we'll tear it apart.",
+                    "achievement_pattern":  "That's it. Done. Onto the next.",
+                }
+                _emotional_response_text = _OFFLINE.get(_guard.reason, "Got it.")
+                await _send(websocket, {"type": "response", "text": _emotional_response_text, "chunk": 1})
+                await _tts_sequential(_emotional_response_text)
+
+            # Emit live emotion state update to frontend
+            await _send(websocket, {
+                "type":    "emotion_state",
+                "mood":    _current_mood,
+                "emotion": getattr(_emo, "emotion", "calmness") if _emo else "calmness",
+                "energy":  getattr(_emo, "energy",  0.5)        if _emo else 0.5,
+            })
+            logger.info("[UI_EMOTION_EVENT] state=%s", _current_mood)
+
+            if _emotional_response_text:
+                last_response_text = _emotional_response_text
+            memory.add_assistant(_emotional_response_text, tool_name=None)
+            is_speaking     = False
+            last_activity_t = time.time()
+            await _send(websocket, {"type": "done"})
+            await _send(websocket, {"type": "listening"})
+            return
+
+        logger.info("[VOICE_TRACE] stage=intent_router — passing to orchestrator")
 
         # ── Orchestrator decision ─────────────────────────────────────────────
         from brain.orchestrator import orchestrator as _orch, ActionType
         decision = await _orch.decide(transcript, memory.history_for_llm())
         logger.info("[ORCHESTRATOR] action=%s reason=%s", decision.action.name, decision.reason)
+        logger.info("[VOICE_TRACE] stage=tool_route action=%s tool=%s",
+                    decision.action.name, decision.tool_name)
 
         response_text: str = ""
         interrupted:   bool = False
@@ -618,6 +772,16 @@ async def ws_session(websocket: WebSocket) -> None:
         if response_text:
             last_response_text = response_text
         memory.add_assistant(response_text, tool_name=decision.tool_name)
+
+        # Emit emotion state so frontend orb stays in sync after tool/LLM turns
+        await _send(websocket, {
+            "type":    "emotion_state",
+            "mood":    _current_mood,
+            "emotion": getattr(_emo, "emotion", "calmness") if _emo else "calmness",
+            "energy":  getattr(_emo, "energy",  0.5)        if _emo else 0.5,
+        })
+        logger.info("[UI_EMOTION_EVENT] state=%s", _current_mood)
+        logger.info("[VOICE_TRACE] stage=audio_stream done response=%r", (response_text or "")[:60])
 
         logger.info("[TTS_STOPPED] interrupted=%s", interrupted)
         is_speaking     = False

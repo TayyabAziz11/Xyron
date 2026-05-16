@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     onnx_provider: str = ""          # e.g. "CUDAExecutionProvider" — empty = let kokoro_onnx decide
 
+    # RVC voice conversion
+    enable_rvc: bool = False
+    rvc_model_dir: str = ""          # default: ~/.xyron/models/rvc
+    rvc_default_preset: str = "neutral"
+    rvc_device: str = "auto"         # "cuda", "cpu", or "auto"
+    rvc_max_latency_ms: int = 250
+    rvc_lightweight: bool = False    # force lightweight tier, skip full RVC
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors(cls, v: object) -> List[str]:

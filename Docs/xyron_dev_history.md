@@ -256,6 +256,40 @@ Added Urdu/Roman Urdu intent patterns, Whisper language auto-detection, wake wor
 
 ---
 
+## 2026-05-16 — RVC Emotional Voice Conversion Layer
+
+### What Was Built
+
+Full RVC (Retrieval-based Voice Conversion) pipeline between Kokoro TTS and AudioFX:
+
+- **Three-tier engine** (`backend/voice/rvc_engine.py`): auto-selects `full_rvc` → `lightweight` → `passthrough` based on available deps and model files
+- **Lightweight tier**: librosa pitch_shift + scipy butterworth spectral EQ — no ML models needed, activates immediately
+- **Full RVC tier**: rvc_python + HuBERT feature extraction, requires model `.pth` files at `~/.xyron/models/rvc/<preset>/model.pth`
+- **Emotion → preset mapping**: 8 presets (hyped, relieved, dominant, protective, calm, late_night, audience_mode, neutral) mapped from mood state labels
+- **Latency guard**: skips conversion if previous call exceeded 250ms, resets each turn
+- **Safe fallback chain**: full_rvc → lightweight → original audio, never raises to caller
+- **`/rvc-status` endpoint**: tier, latency, and preset availability
+- **Frontend indicator**: subtle "KOKORO + RVC LITE" / "KOKORO + RVC" badge on Command Center
+- **WAV comparison test**: `backend/scripts/test_rvc_pipeline.py` — kokoro_only.wav + rvc_<preset>.wav per preset
+
+### Config
+
+```env
+ENABLE_RVC=true
+RVC_MAX_LATENCY_MS=250
+RVC_DEVICE=auto
+```
+
+### Architecture Doc
+
+Full architecture at `Docs/rvc_voice_system.md`.
+
+### Current Status
+
+Lightweight tier active. Full RVC blocked by fairseq build failures — requires source build from GitHub. Real audio differentiation working now via lightweight tier.
+
+---
+
 ## Earlier — Phase 9: Offline Ollama Fallback
 
 **Commit:** `4530bca`, `e0aaf73`

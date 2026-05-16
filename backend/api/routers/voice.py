@@ -900,6 +900,16 @@ async def synthesize_stream(request: Request):
     raise HTTPException(status_code=503, detail="All TTS engines failed")
 
 
+@router.get("/rvc-status")
+async def rvc_status():
+    """Return RVC engine status: tier, available presets, last latency."""
+    try:
+        from voice.rvc_engine import rvc_engine
+        return {"success": True, "data": rvc_engine.get_status()}
+    except Exception as exc:
+        return {"success": False, "data": {"tier": "passthrough", "enabled": False, "error": str(exc)}}
+
+
 @router.get("/tts-info")
 async def tts_info():
     """Return TTS engine availability and active engine."""
