@@ -353,6 +353,7 @@ export default function CommandCenterPage() {
 
   // RVC status — fetch once on mount, refresh every 30s
   useEffect(() => {
+    const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:8000'
     const load = () =>
       fetch(`${API_BASE}/api/v1/voice/rvc-status`)
         .then(r => r.json())
@@ -647,11 +648,9 @@ export default function CommandCenterPage() {
                           style={{ animation: isListening ? 'svgWave 0.8s ease-in-out infinite' : 'svgWave 2s ease-in-out infinite' }}
                         />
                       </svg>
-                      {rvcTier !== 'passthrough' && (
-                        <p className="font-mono text-[9px] tracking-widest opacity-40 mt-1">
-                          {rvcTier === 'full_rvc' ? 'KOKORO + RVC' : 'KOKORO + RVC LITE'}
-                        </p>
-                      )}
+                      <p className="font-mono text-[9px] tracking-widest opacity-40 mt-1">
+                        {rvcTier === 'full_rvc' ? 'KOKORO + RVC' : rvcTier === 'lightweight' ? 'KOKORO + RVC LITE' : 'KOKORO + FX'}
+                      </p>
                     </div>
 
                     {/* Mic control buttons */}

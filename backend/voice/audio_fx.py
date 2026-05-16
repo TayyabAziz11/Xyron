@@ -132,16 +132,15 @@ def _apply_cinematic(samples: np.ndarray, sr: int) -> np.ndarray:
 
 
 def _apply_hyped(samples: np.ndarray, sr: int) -> np.ndarray:
-    """HYPED — gentle brightness and warmth; energetic but clean and natural."""
-    samples = _compress(samples, threshold=0.55, ratio=3.5, makeup=1.06)
-    # Light air boost: subtle presence, not harsh brightness
+    """HYPED — clean, warm, slightly bright. No reverb — reverb causes echo across streamed chunks."""
+    samples = _compress(samples, threshold=0.58, ratio=3.0, makeup=1.04)
+    # Subtle air boost: presence without harshness
     nyq = sr / 2.0
-    b, a = _sig.butter(1, min(4000, nyq * 0.98) / nyq, btype="high")
+    b, a = _sig.butter(1, min(3500, nyq * 0.98) / nyq, btype="high")
     air = _sig.lfilter(b, a, samples)
-    samples = np.clip(samples + air * 0.10, -1.0, 1.0).astype(np.float32)
-    samples = _multitap_reverb(samples, sr, room_ms=16, wet=0.05)
-    samples = _soft_saturation(samples, drive=0.02)
-    samples = _normalize(samples, target=0.92)
+    samples = np.clip(samples + air * 0.07, -1.0, 1.0).astype(np.float32)
+    samples = _soft_saturation(samples, drive=0.015)
+    samples = _normalize(samples, target=0.90)
     return samples
 
 

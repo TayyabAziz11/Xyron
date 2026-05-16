@@ -420,6 +420,7 @@ _kokoro_instance = None        # module-level singleton, lazy-loaded once
 _kokoro_lock = __import__("threading").Lock()
 _tts_cache: dict[tuple[str, str, float], bytes] = {}  # (text, voice, speed) → WAV bytes
 _current_emotion_profile: str = ""  # set per-turn by respond-stream; read by _kokoro_to_wav
+_rvc_enabled_for_response: bool = False  # set once per response — never toggled mid-stream
 _TTS_CACHE_MAXSIZE = 64
 
 
@@ -591,18 +592,8 @@ def _kokoro_to_wav(text: str, voice: str, speed: float, _apply_prosody: bool = T
                         all_pcm.append(np.zeros(_sil_len, dtype=np.float32))
                 if all_pcm:
                     combined = np.concatenate(all_pcm)
-                    # Apply voice conversion on the combined audio
-                    try:
-                        from voice.voice_conversion import voice_conversion as _vc
-                        _pcm_bytes = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-                        _wav_tmp = io.BytesIO()
-                        with wave.open(_wav_tmp, "wb") as _wf2:
-                            _wf2.setnchannels(1); _wf2.setsampwidth(2)
-                            _wf2.setframerate(_sample_rate); _wf2.writeframes(_pcm_bytes)
-                        _converted = _vc.convert(_wav_tmp.getvalue(), _cur_mood)
-                        return _converted
-                    except Exception:
-                        pass
+                    # RVC intentionally not applied here — applied at respond-stream level only,
+                    # after response-level enable/disable decision is made once for the whole turn.
                     pcm_out = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
                     buf_out = io.BytesIO()
                     with wave.open(buf_out, "wb") as wf_out:
@@ -644,12 +635,7 @@ def _kokoro_to_wav(text: str, voice: str, speed: float, _apply_prosody: bool = T
         wf.setframerate(sample_rate)
         wf.writeframes(pcm.tobytes())
     wav_bytes = buf.getvalue()
-    # Apply optional voice conversion before caching
-    try:
-        from voice.voice_conversion import voice_conversion as _vc
-        wav_bytes = _vc.convert(wav_bytes, _cur_mood)
-    except Exception:
-        pass
+    # RVC not applied here — response-level decision happens at respond-stream, not per-chunk.
     if len(_tts_cache) >= _TTS_CACHE_MAXSIZE:
         _tts_cache.pop(next(iter(_tts_cache)))
     _tts_cache[cache_key] = wav_bytes
@@ -2448,6 +2434,19 @@ async def respond_stream(body: _RespondStreamBody):
         pass
 
     async def _generate():  # noqa: C901
+        # ── Response-level RVC decision — made ONCE, never toggled mid-stream ──────
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        try:
+            from voice.rvc_engine import rvc_engine as _rvc_eng
+            _rvc_for_resp = _rvc_eng.get_tier() != "passthrough"
+            _rvc_reason   = "enabled" if _rvc_for_resp else "streaming_disabled"
+        except Exception:
+            _rvc_for_resp = False
+            _rvc_reason   = "import_error"
+        _mod.__dict__["_rvc_enabled_for_response"] = _rvc_for_resp
+        logger.info("[RVC_RESPONSE] enabled=%s reason=%s", _rvc_for_resp, _rvc_reason)
+        # ────────────────────────────────────────────────────────────────────────────
         try:
             from ..config import settings
             if not (settings.openai_api_key and settings.openai_api_key.startswith("sk-")):
