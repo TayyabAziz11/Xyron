@@ -6,6 +6,7 @@ Presets:
   subtle    — DEFAULT mode: light reverb, gentle warmth, minimal stereo
   crisp     — WORK mode:    compression, air, minimal reverb
   cinematic — TAKEOVER:    reverb, stereo spread, bass boost, subtle saturation
+  hyped     — EXTREME mode: tight compression, bright air, hot normalize, short reverb
   warm      — CHILL mode:  warm EQ, reverb, stereo
   ambient   — HOME mode:   soft reverb, gentle warmth, stereo spread
   bypass    — no processing
@@ -122,11 +123,25 @@ def _apply_crisp(samples: np.ndarray, sr: int) -> np.ndarray:
 
 
 def _apply_cinematic(samples: np.ndarray, sr: int) -> np.ndarray:
-    samples = _compress(samples, threshold=0.50, ratio=4.0, makeup=1.05)
-    samples = _bass_boost(samples, sr, freq=160, boost_db=3.0)
-    samples = _multitap_reverb(samples, sr, room_ms=40, wet=0.16)
-    samples = _soft_saturation(samples, drive=0.03)
-    samples = _normalize(samples)
+    samples = _compress(samples, threshold=0.45, ratio=5.0, makeup=1.10)
+    samples = _bass_boost(samples, sr, freq=160, boost_db=4.5)
+    samples = _multitap_reverb(samples, sr, room_ms=28, wet=0.14)
+    samples = _soft_saturation(samples, drive=0.05)
+    samples = _normalize(samples, target=0.96)
+    return samples
+
+
+def _apply_hyped(samples: np.ndarray, sr: int) -> np.ndarray:
+    """HYPED — gentle brightness and warmth; energetic but clean and natural."""
+    samples = _compress(samples, threshold=0.55, ratio=3.5, makeup=1.06)
+    # Light air boost: subtle presence, not harsh brightness
+    nyq = sr / 2.0
+    b, a = _sig.butter(1, min(4000, nyq * 0.98) / nyq, btype="high")
+    air = _sig.lfilter(b, a, samples)
+    samples = np.clip(samples + air * 0.10, -1.0, 1.0).astype(np.float32)
+    samples = _multitap_reverb(samples, sr, room_ms=16, wet=0.05)
+    samples = _soft_saturation(samples, drive=0.02)
+    samples = _normalize(samples, target=0.92)
     return samples
 
 
@@ -148,6 +163,7 @@ _PRESET_FNS = {
     "subtle":    _apply_subtle,
     "crisp":     _apply_crisp,
     "cinematic": _apply_cinematic,
+    "hyped":     _apply_hyped,
     "warm":      _apply_warm,
     "ambient":   _apply_ambient,
 }
@@ -189,7 +205,7 @@ def apply_fx(
         processed = fn(samples.astype(np.float32), sr)
         if stereo:
             # Cinematic preset gets wider stereo
-            width = 0.35 if preset == "cinematic" else 0.20 if preset in ("ambient", "warm") else 0.15
+            width = 0.35 if preset == "cinematic" else 0.18 if preset == "hyped" else 0.20 if preset in ("ambient", "warm") else 0.15
             processed = _stereo_haas(processed, sr, width=width)
         return processed
     except Exception as exc:

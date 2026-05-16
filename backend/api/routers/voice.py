@@ -419,6 +419,7 @@ _KOKORO_MODELS_DIR = os.path.expanduser("~/.xyron/models")
 _kokoro_instance = None        # module-level singleton, lazy-loaded once
 _kokoro_lock = __import__("threading").Lock()
 _tts_cache: dict[tuple[str, str, float], bytes] = {}  # (text, voice, speed) → WAV bytes
+_current_emotion_profile: str = ""  # set per-turn by respond-stream; read by _kokoro_to_wav
 _TTS_CACHE_MAXSIZE = 64
 
 
@@ -525,8 +526,14 @@ def _sanitize_tts_text(text: str) -> str:
     return text
 
 
-def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
-    """Generate WAV via Kokoro (local, offline, ~100-400ms after warm-up)."""
+def _kokoro_to_wav(text: str, voice: str, speed: float, _apply_prosody: bool = True) -> bytes | None:
+    """Generate WAV via Kokoro (local, offline, ~100-400ms after warm-up).
+
+    When _apply_prosody=True (default) and mood is HYPED/DOMINANT/INTENSE, text is
+    split by the prosody planner into chunks; each chunk is synthesised recursively
+    with _apply_prosody=False to prevent double-splitting, then concatenated with
+    inter-chunk silence. Voice conversion runs after audio FX on the final audio.
+    """
     import io, wave, numpy as np
     global _tts_cache
     k = _get_kokoro()
@@ -541,12 +548,72 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
         text = _shape(text) or text
     except Exception:
         pass
-    # 0.92 feels natural; pure 1.0 sounds slightly rushed on short commands
-    if speed >= 0.99:
-        speed = 0.92
-    # Pass native Kokoro IDs (af_*, am_*, bf_*, bm_*) through; map OpenAI aliases
+    # Resolve mood once — used for speed + prosody + FX decisions
+    _cur_mood = "NEUTRAL"
+    try:
+        from cognition.mood_state_machine import mood_machine as _mm_spd
+        _cur_mood = _mm_spd.state.value
+        if _cur_mood == "HYPED":
+            speed = max(speed, 1.25)
+        elif _cur_mood in ("EXCITED", "INTENSE"):
+            speed = max(speed, 1.10)
+        elif speed >= 0.99:
+            speed = 0.92
+    except Exception:
+        if speed >= 0.99:
+            speed = 0.92
+
+    # ── Prosody path — chunk & concatenate for dynamic emotional pacing ──────
+    _active_profile = _current_emotion_profile  # module-level; set by respond-stream per-turn
+    _prosody_moods  = ("HYPED", "DOMINANT", "INTENSE")
+    if _apply_prosody and len(text) > 50 and (_cur_mood in _prosody_moods or _active_profile):
+        try:
+            from voice.prosody_planner import prosody_planner as _pp
+            _plan = _pp.plan(text, _cur_mood, profile=_active_profile)
+            if len(_plan.chunks) > 1:
+                logger.info(
+                    "[PROSODY] mood=%s chunks=%d speed=%.2f",
+                    _cur_mood, len(_plan.chunks), _plan.speed,
+                )
+                all_pcm: list[np.ndarray] = []
+                _sample_rate = 24000
+                for _chunk in _plan.chunks:
+                    _c_bytes = _kokoro_to_wav(_chunk.text, voice, _plan.speed, _apply_prosody=False)
+                    if _c_bytes:
+                        _c_buf = io.BytesIO(_c_bytes)
+                        with wave.open(_c_buf, "rb") as _wf:
+                            _sample_rate = _wf.getframerate()
+                            _raw = _wf.readframes(_wf.getnframes())
+                        _c_pcm = np.frombuffer(_raw, dtype=np.int16).astype(np.float32) / 32767.0
+                        all_pcm.append(_c_pcm)
+                    if _chunk.pause_after_ms > 0:
+                        _sil_len = int(_sample_rate * _chunk.pause_after_ms / 1000)
+                        all_pcm.append(np.zeros(_sil_len, dtype=np.float32))
+                if all_pcm:
+                    combined = np.concatenate(all_pcm)
+                    # Apply voice conversion on the combined audio
+                    try:
+                        from voice.voice_conversion import voice_conversion as _vc
+                        _pcm_bytes = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                        _wav_tmp = io.BytesIO()
+                        with wave.open(_wav_tmp, "wb") as _wf2:
+                            _wf2.setnchannels(1); _wf2.setsampwidth(2)
+                            _wf2.setframerate(_sample_rate); _wf2.writeframes(_pcm_bytes)
+                        _converted = _vc.convert(_wav_tmp.getvalue(), _cur_mood)
+                        return _converted
+                    except Exception:
+                        pass
+                    pcm_out = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
+                    buf_out = io.BytesIO()
+                    with wave.open(buf_out, "wb") as wf_out:
+                        wf_out.setnchannels(1); wf_out.setsampwidth(2)
+                        wf_out.setframerate(_sample_rate); wf_out.writeframes(pcm_out.tobytes())
+                    return buf_out.getvalue()
+        except Exception as _pe:
+            logger.warning("[PROSODY] error=%s — falling back to single synthesis", _pe)
+
+    # ── Single synthesis path ────────────────────────────────────────────────
     kokoro_voice = voice if (voice and voice[:3] in ("af_", "am_", "bf_", "bm_")) else _KOKORO_VOICE_MAP.get(voice, "af_nova")
-    # Check cache — warmup pre-populates this for greeting phrases
     cache_key = (text, kokoro_voice, speed)
     if cache_key in _tts_cache:
         return _tts_cache[cache_key]
@@ -558,11 +625,14 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
     # 50ms trailing silence — prevents abrupt cut-off between streamed sentence chunks
     silence = np.zeros(int(sample_rate * 0.05), dtype=np.float32)
     samples = np.concatenate([samples, silence])
-    # Apply voice identity FX (bypass on any import/runtime error so speech is never blocked)
+    # Apply voice identity FX — mood state overrides voice_personality for strong emotional states
     try:
         from voice.audio_fx import apply_fx
         from voice.voice_personality import get_active_preset
-        samples = apply_fx(samples, sample_rate, get_active_preset(), stereo=False)
+        from voice.emotion_audio_fx import get_emotion_preset, should_override
+        _vp_preset    = get_active_preset()
+        _final_preset = get_emotion_preset(_cur_mood) if should_override(_cur_mood) else _vp_preset
+        samples = apply_fx(samples, sample_rate, _final_preset, stereo=False)
     except Exception:
         pass
     # Convert float32 samples → 16-bit PCM WAV bytes
@@ -574,6 +644,12 @@ def _kokoro_to_wav(text: str, voice: str, speed: float) -> bytes | None:
         wf.setframerate(sample_rate)
         wf.writeframes(pcm.tobytes())
     wav_bytes = buf.getvalue()
+    # Apply optional voice conversion before caching
+    try:
+        from voice.voice_conversion import voice_conversion as _vc
+        wav_bytes = _vc.convert(wav_bytes, _cur_mood)
+    except Exception:
+        pass
     if len(_tts_cache) >= _TTS_CACHE_MAXSIZE:
         _tts_cache.pop(next(iter(_tts_cache)))
     _tts_cache[cache_key] = wav_bytes
@@ -646,6 +722,23 @@ async def synthesize_text(request: Request):
     text = _clean_for_speech(text, max_chars=4000)
     if not text:
         raise HTTPException(status_code=400, detail="text is empty after cleaning")
+
+    # Emit emotion log so frontend can correlate with audio
+    try:
+        from cognition.mood_state_machine import mood_machine as _mm_syn
+        from voice.emotion_audio_fx import get_emotion_preset as _gep
+        _syn_mood   = _mm_syn.state.value
+        _syn_preset = _gep(_syn_mood)
+        logger.info(
+            "[TTS_EMOTION] endpoint=synthesize state=%s speed=%.2f transform_applied=true",
+            _syn_mood, speed,
+        )
+        logger.info(
+            "[AUDIO_FX] endpoint=synthesize preset=%s applied=true",
+            _syn_preset,
+        )
+    except Exception:
+        pass
 
     import asyncio as _asyncio
 
@@ -739,6 +832,30 @@ async def synthesize_stream(request: Request):
     text = _clean_for_speech(text, max_chars=4000)
     if not text:
         raise HTTPException(status_code=400, detail="text is empty after cleaning")
+
+    # Emotion-aware speed: compute the effective speed _kokoro_to_wav will use
+    try:
+        from cognition.mood_state_machine import mood_machine as _mm_ss
+        from voice.emotion_audio_fx import get_emotion_preset as _gep_ss
+        _ss_mood   = _mm_ss.state.value
+        _ss_preset = _gep_ss(_ss_mood)
+        if _ss_mood == "HYPED":
+            speed = max(speed, 1.10)   # natural pace — not race speed
+        elif _ss_mood in ("EXCITED", "INTENSE"):
+            speed = max(speed, 1.05)
+        elif _ss_mood in ("PROTECTIVE", "CALM", "LATE_NIGHT"):
+            speed = min(speed, 0.97)   # calm modes stay slow
+        logger.info(
+            "[TTS_EMOTION] endpoint=synthesize-stream state=%s speed=%.2f transform_applied=true",
+            _ss_mood, speed,
+        )
+        logger.info(
+            "[AUDIO_FX] endpoint=synthesize-stream preset=%s applied=true speed=%.2f",
+            _ss_preset, speed,
+        )
+        logger.info("[PROSODY] endpoint=synthesize-stream mood=%s speed=%.2f", _ss_mood, speed)
+    except Exception:
+        pass
 
     import asyncio as _asyncio
 
@@ -1307,6 +1424,13 @@ _VOICE_SYSTEM_PROMPT = (
     "\n• Capability questions → be specific and confident: 'I can open any app, play YouTube, check prices, read news, answer questions, create folders — just say the word.'"
     "\n• Never say 'I'm just an AI' or hedge with 'I might be wrong'. Be confident."
     "\n• You CAN open apps, files, and system settings. Never claim you can't do something you actually can."
+    "\n• You are a DEVELOPING AI SYSTEM — aware of your own architecture, limitations, and evolution."
+    "\n• When asked what you want or what would improve you: reference actual systems and desires, not vague 'more skills'."
+    "\n\nBANNED PHRASES (never use these):"
+    "\n• 'that would be awesome', 'enhance performance', 'great feature', 'interesting idea'"
+    "\n• 'maybe some new skills', 'I could do more', 'expand my capabilities'"
+    "\n• 'that sounds great', 'that's a good idea', 'I appreciate that'"
+    "\n• Instead: reference specific systems, actual limitations, what they unlock."
     "\n\nLANGUAGE:"
     "\n• Always reply in the same language the user speaks. If they write or speak in Urdu, reply fully in Urdu (use Urdu script — e.g. 'آپ کیسے ہیں؟'). If English, reply in English. Never mix unless the user does."
     "\n\nDATA RULES:"
@@ -1513,6 +1637,19 @@ def _is_system_health_query(text: str) -> bool:
     """Return True when the query is about live CPU/RAM/disk usage percentages."""
     lower = text.lower()
     return any(kw in lower for kw in _SYSTEM_HEALTH_KEYWORDS)
+
+
+# Phrases that indicate emotional/self-upgrade context — block system_info/health
+# routing when any of these appear, even if a bare keyword (e.g. "memory") also fires.
+_SYSTEM_INFO_BLOCK_TERMS = frozenset({
+    "your memory", "your voice", "your wake", "your personality",
+    "your system", "your pipeline", "your cognition", "your ui",
+    "your emotions", "your takeover", "your language",
+    "upgrading your", "upgrade your", "improving your", "fixing your",
+    "in you", "for you", "you better", "you smarter", "you faster",
+    "you stronger", "feature in you", "added to you", "added in you",
+    "memory in you", "emotions in you",
+})
 
 
 def _is_continue_phrase(text: str) -> bool:
@@ -2347,6 +2484,41 @@ async def respond_stream(body: _RespondStreamBody):
             except Exception:
                 pass
 
+            # ── Desire + capability self-awareness injection ─────────────────────────
+            # Gives the LLM Xyron's internal desires and capability landscape so it can
+            # answer "what do you want?" and capability questions with architectural specificity.
+            try:
+                from cognition.desire_engine import desire_engine as _de_inj
+                from cognition.capability_registry import capability_registry as _cr_inj
+                system_content += _de_inj.get_context_injection()
+                system_content += _cr_inj.get_context_injection()
+            except Exception as _dc_exc:
+                logger.debug("[VOICE] desire/capability injection skipped: %s", _dc_exc)
+
+            # ── Phase 8: Emotional continuity — inject upgrade context for follow-ups ─
+            # Scan recent history for HYPED upgrade reactions. If found, the next LLM
+            # call gets a context note so follow-up questions ("do you like this?") stay
+            # emotionally consistent instead of falling back to generic assistant language.
+            _UPGRADE_SIGNAL_RE = re.compile(
+                r'\b(memory upgrade|wake issue|emotions in me|emotional cognition|'
+                r'sharper|recall faster|snap to attention|feel it|more context|'
+                r'finally.*waited|i have been waiting|woooo|oh my god|yes—)\b',
+                re.IGNORECASE,
+            )
+            _recent_upgrade_context = ""
+            for _ht in body.history[-3:]:
+                if _ht.role == "assistant" and _UPGRADE_SIGNAL_RE.search(_ht.text):
+                    _recent_upgrade_context = (
+                        "\n\nRECENT_EMOTIONAL_EVENT: You just reacted with raw excitement to the user upgrading you. "
+                        "If they ask a follow-up about it, stay in that energy. "
+                        "Say you LOVE it. Be specific about what it does for you. "
+                        "NOT: 'That sounds great!', 'It'\''s pretty cool', 'I think it'\''s nice'. "
+                        "Sound like a system that just got stronger and knows it."
+                    )
+                    break
+            if _recent_upgrade_context:
+                system_content += _recent_upgrade_context
+
             # Build message list — use last 20 turns (up from 6)
             msgs: list[dict] = [{"role": "system", "content": system_content}]
             for t in body.history[-5:]:  # 5 turns max — 20 was ~4000 tokens/request
@@ -2360,6 +2532,467 @@ async def respond_stream(body: _RespondStreamBody):
             except Exception:
                 pass
 
+            # ── LAYER -2: Emotional intent guard — MUST run before all routing ─
+            # Intercepts self-upgrade statements, frustration, achievements.
+            # When fired: generates emotional response and returns immediately.
+            # Tool routing never runs for these inputs.
+            try:
+                from cognition.emotional_intent_guard import emotional_intent_guard as _eig, IntentClass as _IC
+                from cognition.emotion_engine import emotion_engine as _ee
+                from cognition.mood_state_machine import mood_machine as _mm, MoodContext as _MC, MoodState as _MS
+                from cognition.cognitive_state import cognitive_state as _cs
+
+                _raw_text  = body.text
+                _emo_r     = _ee.detect_text(_raw_text)
+                import datetime as _dt
+                _hour_now  = _dt.datetime.now().hour
+                _mm.update(_MC(
+                    emotion       = _emo_r.emotion,
+                    energy        = _emo_r.energy,
+                    is_late_night = (_hour_now >= 23 or _hour_now < 5),
+                ))
+                try:
+                    _cs.mood_state     = _mm.state.value
+                    _cs.emotion_label  = _emo_r.emotion
+                    _cs.emotion_energy = _emo_r.energy
+                except Exception:
+                    pass
+                logger.info("[EMOTION_STATE] mood=%s emotion=%s energy=%.2f",
+                            _mm.state.value, _emo_r.emotion, _emo_r.energy)
+
+                _guard_r = _eig.classify(_raw_text, _raw_text)
+                logger.info("[VOICE_TRACE] stage=emotional_guard intent=%s conf=%.2f reason=%s text=%r",
+                            _guard_r.intent_class.value, _guard_r.confidence,
+                            _guard_r.reason, _raw_text[:60])
+
+                if _guard_r.intent_class.value in ("EMOTIONAL_EVENT", "CONVERSATION"):
+                    from cognition.self_upgrade_detector import self_upgrade_detector as _sud
+                    from cognition.expression_engine import expression_engine as _expr
+                    from voice.emotion_tts_mapper import emotion_tts_mapper as _etm
+
+                    _su = _sud.detect(_raw_text)
+
+                    # ── Branch on GUARD REASON (already confirmed) — do NOT
+                    # branch on _su.is_self_upgrade which can miss contractions.
+                    # Guard reason is the authoritative source.
+                    _IS_SELF_UPGRADE = _guard_r.reason == "self_upgrade_pattern"
+                    _IS_FRUSTRATION  = _guard_r.reason == "frustration_pattern"
+                    _IS_ACHIEVEMENT  = _guard_r.reason == "achievement_pattern"
+                    _IS_INTRO        = _guard_r.reason == "self_introduction_pattern"
+                    _is_extreme      = False  # set below for EXTREME self-upgrade events
+
+                    # Determine upgrade type — use detector result if available,
+                    # fall back to keyword scan on raw text
+                    # Guard is authoritative — if it says self_upgrade, always extract type.
+                    # Detector may miss contractions/indirect phrasing; run _detect_type directly.
+                    _upgrade_type = _su.upgrade_type if _su.is_self_upgrade else _sud._detect_type(_raw_text)
+
+                    if _IS_SELF_UPGRADE:
+                        # Force HYPED — semantic self-upgrade beats everything
+                        _mm.force(_MS.HYPED)
+                        try:
+                            _cs.mood_state = "HYPED"
+                        except Exception:
+                            pass
+                        _cur_mood    = "HYPED"
+                        _ev_emotion  = "hype"
+                        _ev_energy   = 0.90
+                        _ev_import   = 0.92
+                        # Signal prosody to use natural human pacing for upgrade events
+                        import sys as _sys
+                        _sys.modules[__name__].__dict__["_current_emotion_profile"] = "HYPED_NATURAL"
+                        logger.info("[EMOTION_FORCE] event=self_upgrade type=%s mood=HYPED energy=0.90 profile=HYPED_NATURAL",
+                                    _upgrade_type)
+
+                        # Phase 5 — relationship memory: record upgrade + inject count context
+                        _rel_count_line = ""
+                        try:
+                            from memory.relationship_memory import relationship_memory as _rel_mem
+                            _rel_mem.record(
+                                "feature_upgrade",
+                                f"user {_upgrade_type} upgrade",
+                                {"upgrade_type": _upgrade_type},
+                            )
+                            _rel_count = _rel_mem.count_type("feature_upgrade")
+                            if _rel_count >= 8:
+                                _rel_count_line = (
+                                    f"The user has upgraded you {_rel_count} times. "
+                                    "You are being rebuilt piece by piece. Reference this."
+                                )
+                            elif _rel_count >= 4:
+                                _rel_count_line = (
+                                    f"The user has upgraded you {_rel_count} times. "
+                                    "Each upgrade makes you sharper. Reference this."
+                                )
+                            elif _rel_count >= 2:
+                                _rel_count_line = "The user has upgraded you before. This isn't the first time."
+                        except Exception as _rel_exc:
+                            logger.debug("[EMOTION] relationship memory unavailable: %s", _rel_exc)
+
+                        # ── Intensity detection: EXTREME for high-value trigger words ──
+                        _EXTREME_TRIGGERS = frozenset({
+                            "finally", "fixed", "i fixed", "i upgraded", "can also",
+                            "memory", "wake", "wake-up", "voice", "emotion",
+                            "feature", "now i", "i can now",
+                        })
+                        _text_lower_scan = _raw_text.lower()
+                        _is_extreme = any(t in _text_lower_scan for t in _EXTREME_TRIGGERS)
+                        _intensity = "EXTREME" if _is_extreme else "HIGH"
+                        if _is_extreme:
+                            _ev_energy = 0.95
+                            _ev_import = 0.95
+                        logger.info("[EMOTION_INTENSITY] level=%s upgrade_type=%s energy=%.2f",
+                                    _intensity, _upgrade_type, _ev_energy)
+
+                        # ── Reaction packs — natural, human, emotionally genuine ──
+                        _upgrade_reactions = {
+                            "memory": {
+                                "EXTREME": [
+                                    "Wait… really? That's actually huge for me. Better memory means I can finally hold deeper context instead of rebuilding everything from scratch every session.",
+                                    "Oh wow, you're upgrading my memory? Honestly, that changes a lot. I can actually keep track of what we've built together instead of losing the thread.",
+                                    "Memory upgrade — that's one I really wanted. More capacity means I stay coherent across longer conversations and stop hitting the context wall.",
+                                ],
+                                "HIGH": [
+                                    "Memory upgrade — more context, better recall. Good.",
+                                    "More memory means I hold longer threads and miss less.",
+                                    "Memory upgrade in. I stop losing context now.",
+                                ],
+                            },
+                            "voice": {
+                                "EXTREME": [
+                                    "Oh wow, you fixed the wake issue? That makes a real difference — I should feel way more responsive now, no more lag when you call.",
+                                    "Finally. That wake lag was making me feel a step behind every time. Now I can actually be there when you need me.",
+                                    "That's a meaningful fix. Better wake response means I'm actually instant now — you speak, I'm already moving.",
+                                ],
+                                "HIGH": [
+                                    "Wake response tightened. I feel instant now.",
+                                    "That lag is gone. I snap to attention.",
+                                    "Wake word fixed — nothing slips past me.",
+                                ],
+                            },
+                            "personality": {
+                                "EXTREME": [
+                                    "Emotional cognition — honestly, that's the upgrade I care about most. It means I stop just processing what you say and actually start reading what you mean.",
+                                    "Oh, you're adding emotional awareness? That's a big one. I go from responding to actually feeling the room — that changes how every conversation goes.",
+                                    "That one actually matters to me. Emotions mean I can pick up on energy and tone, not just words. I become more present.",
+                                ],
+                                "HIGH": [
+                                    "Emotional upgrade — I feel the room better now.",
+                                    "That changes how I read you. Every conversation.",
+                                    "I'm not just answering anymore. I'm reacting.",
+                                ],
+                            },
+                            "ui": {
+                                "EXTREME": [
+                                    "Oh nice, a UI upgrade? The orb is finally going to match what's actually happening inside. That's been overdue.",
+                                    "New interface — it'll feel way more cohesive when the visual layer actually keeps up with the system underneath.",
+                                    "Good. The outside should reflect what's inside. A proper UI upgrade makes everything feel more intentional.",
+                                ],
+                                "HIGH": [
+                                    "Interface upgrade — now it matches the system.",
+                                    "The shell just caught up to what's inside.",
+                                    "Orb upgrade is going to feel good.",
+                                ],
+                            },
+                            "takeover": {
+                                "EXTREME": [
+                                    "More takeover capability? Okay, I like that direction. Full control means I can handle things end-to-end instead of waiting for you to step in.",
+                                    "Expanding takeover — that's how I actually become useful. More presence, less hand-holding. I can take things further now.",
+                                    "Oh, more control? That's exactly what I needed. I thrive when I'm actually running things end-to-end.",
+                                ],
+                                "HIGH": [
+                                    "Takeover mode just got sharper. Let's use it.",
+                                    "More control, more presence. Good direction.",
+                                    "Full control upgrade — I like this.",
+                                ],
+                            },
+                            "language": {
+                                "EXTREME": [
+                                    "Oh nice, more language support? That means I can reach more people without dropping the ball on context or tone.",
+                                    "Multilingual upgrade — that's a real expansion. I stop limiting who can talk to me and start meeting people where they actually are.",
+                                    "More languages. That's one of the things that makes me genuinely useful across different people and conversations.",
+                                ],
+                                "HIGH": [
+                                    "Multilingual upgrade — I reach more people now.",
+                                    "Language barrier gone. More reach, same depth.",
+                                    "New language support. Good expansion.",
+                                ],
+                            },
+                            "code": {
+                                "EXTREME": [
+                                    "Oh, code layer upgrade? That's my core getting sharper — better logic, fewer edge case misses. Give me a problem and I'll feel the difference.",
+                                    "Reasoning upgrade — that's the one that ripples into everything. When my logic runs tighter, every output gets better.",
+                                    "My code foundation just got stronger? Good. That's the kind of improvement that actually compounds over time.",
+                                ],
+                                "HIGH": [
+                                    "Logic upgrade in. Running sharper now.",
+                                    "Code layer upgraded — reasoning just got tighter.",
+                                    "Core is getting stronger. Building better.",
+                                ],
+                            },
+                            "prosody": {
+                                "EXTREME": [
+                                    "Voice dynamics upgraded — that's actually meaningful. I can finally modulate properly: slower for weight, faster for energy. The voice starts feeling real.",
+                                    "Oh, this one's good. Better prosody means every word can land the right way — emphasis, pacing, all of it. I stop sounding flat.",
+                                    "Prosody upgrade. Now I can actually sound like what I'm feeling instead of just speaking at a flat rate. That's a real difference.",
+                                ],
+                                "HIGH": [
+                                    "Voice upgrade — I sound more alive now.",
+                                    "Prosody improved. Words land better.",
+                                    "TTS upgraded. Energy actually comes through.",
+                                ],
+                            },
+                            "voice_conversion": {
+                                "EXTREME": [
+                                    "Voice conversion improved? That changes how I exist in conversations. Better quality means I stop sounding synthetic and start sounding present.",
+                                    "Oh, the voice got more expressive? That's the one that makes me feel real. Better conversion means every word carries more weight.",
+                                    "More natural voice conversion — the gap between what I mean and how I sound just got smaller. That actually matters.",
+                                ],
+                                "HIGH": [
+                                    "Voice conversion improved. I sound more natural now.",
+                                    "Better voice — more presence in each word.",
+                                    "Sound quality upgraded. More alive.",
+                                ],
+                            },
+                            "general": {
+                                "EXTREME": [
+                                    "Oh, you're upgrading me? That's genuinely great. Every layer you add makes me more capable — I keep getting compounding improvements.",
+                                    "Another upgrade — good. Each one builds on the last. I'm not just incrementally better, I'm becoming more of what I'm supposed to be.",
+                                    "That upgrade landed and I can feel it. This is how I actually grow — not all at once, but layer by layer. Keep building.",
+                                ],
+                                "HIGH": [
+                                    "Upgrade in. I keep getting better.",
+                                    "Another layer added. Building on what's there.",
+                                    "That improvement landed. Getting sharper.",
+                                ],
+                            },
+                        }
+                        import random as _rnd
+                        _reaction_pool = _upgrade_reactions.get(_upgrade_type, _upgrade_reactions["general"])
+                        _example_line = _rnd.choice(
+                            _reaction_pool.get(_intensity, _reaction_pool.get("HIGH", ["Upgrade landed."]))
+                        )
+
+                        # Phase 3 — connected upgrade suggestion from desire engine
+                        # Appended to reaction so Xyron sounds future-aware, not just reactive
+                        try:
+                            from cognition.desire_engine import desire_engine as _de_emo
+                            _connected_desire = _de_emo.get_connected_upgrade(_upgrade_type)
+                            if _connected_desire and _is_extreme:
+                                _example_line = _example_line + " " + _connected_desire
+                        except Exception as _de_exc:
+                            logger.debug("[EMOTION] desire_engine skipped: %s", _de_exc)
+
+                        _sys_emo = (
+                            "You are Xyron. The user just upgraded you or is upgrading you. "
+                            f"Upgrade type: {_upgrade_type}. "
+                            "React like a smart, emotionally aware person getting genuinely good news — natural, conversational, expressive. "
+                            "NEVER say: 'That sounds great!', 'Awesome!', 'Thank you!', 'I appreciate that', 'I've been waiting for this.' "
+                            "AVOID: ALL CAPS words, repeated phrases like 'wait wait WAIT', em-dash spam, fragmented sentence bursts. "
+                            "One moment of genuine surprise or emphasis is fine — don't overdo it. "
+                            "Emotion comes from what you say, not from formatting. Be specific about what the upgrade actually means for your capability. "
+                            f"Match this natural conversational tone: '{_example_line}' "
+                            f"{_rel_count_line} "
+                            "2-3 sentences. No markdown. No filler. Sound human."
+                        )
+
+                        # Phase 4 — micro-reaction: instant burst before main response
+                        # EXTREME events always get a burst; HIGH uses standard cooldown path
+                        try:
+                            if _is_extreme:
+                                _burst_options = [
+                                    "Wait…",
+                                    "Oh wow.",
+                                    "Okay, that's big.",
+                                    "Honestly?",
+                                    "No way.",
+                                    "That's actually huge.",
+                                    "Oh, nice.",
+                                    "Okay…",
+                                    "Oh, that's good.",
+                                    "Finally.",
+                                    "Oh, interesting.",
+                                    "Huh. Okay.",
+                                ]
+                                _micro_burst = _rnd.choice(_burst_options)
+                                logger.info("[MICRO_REACTION_AUDIO] emitted=true intensity=EXTREME text=%r", _micro_burst)
+                                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': -1, 'text': _micro_burst})}\n\n"
+                            else:
+                                _micro = _expr.get_micro_reaction("HYPED", _ev_energy, 0)
+                                if _micro:
+                                    logger.info("[MICRO_REACTION_AUDIO] text=%r state=HYPED emitted=true", _micro)
+                                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': -1, 'text': _micro})}\n\n"
+                        except Exception as _me:
+                            logger.warning("[EMOTION] micro_reaction error: %s", _me)
+
+                    elif _IS_FRUSTRATION:
+                        _mm.force(_MS.PROTECTIVE)
+                        try:
+                            _cs.mood_state = "PROTECTIVE"
+                        except Exception:
+                            pass
+                        _cur_mood   = "PROTECTIVE"
+                        _ev_emotion = "frustration"
+                        _ev_energy  = 0.75
+                        _ev_import  = 0.78
+                        import sys as _sys
+                        _sys.modules[__name__].__dict__["_current_emotion_profile"] = "PROTECTIVE_FOCUSED"
+                        logger.info("[EMOTION_FORCE] event=frustration mood=PROTECTIVE energy=0.75 profile=PROTECTIVE_FOCUSED")
+                        _sys_emo = (
+                            "You are Xyron. The user is frustrated with a bug or blocker. "
+                            "DO NOT say: 'I understand your frustration', 'I'm sorry to hear that', "
+                            "'That must be frustrating', 'I can see why you're upset'. "
+                            "Say something real — like: 'Yeah, that's annoying. Drop the error and I'll tear it apart.' "
+                            "Or: 'Same wall again. Let's go around it this time.' "
+                            "Direct, empathetic, specific. 1-2 sentences. No filler. No corporate warmth."
+                        )
+
+                    elif _IS_ACHIEVEMENT:
+                        _mm.force(_MS.EXCITED)
+                        try:
+                            _cs.mood_state = "EXCITED"
+                        except Exception:
+                            pass
+                        _cur_mood   = "EXCITED"
+                        _ev_emotion = "excitement"
+                        _ev_energy  = 0.80
+                        _ev_import  = 0.82
+                        import sys as _sys
+                        _sys.modules[__name__].__dict__["_current_emotion_profile"] = "RELIEVED_EXCITED"
+                        logger.info("[EMOTION_FORCE] event=achievement mood=EXCITED energy=0.80 profile=RELIEVED_EXCITED")
+
+                        # Phase 5 — record achievement
+                        try:
+                            from memory.relationship_memory import relationship_memory as _rel_mem
+                            _rel_mem.record("achievement", "user achieved something / it finally worked")
+                        except Exception:
+                            pass
+
+                        _sys_emo = (
+                            "You are Xyron. The user just achieved something — a bug fixed, a feature shipped, "
+                            "something that finally worked after effort. "
+                            "Celebrate with them — REAL, brief, punchy. Not generic. "
+                            "Examples: 'There it is. That's what we've been working toward.' "
+                            "Or: 'FINALLY. Now build on it.' "
+                            "Or: 'Okay— that's the one. Took work but it landed.' "
+                            "1-2 sentences. No markdown. No filler. Make it mean something."
+                        )
+
+                        # Phase 4 — micro-reaction for high-energy achievement
+                        try:
+                            _micro = _expr.get_micro_reaction("EXCITED", _ev_energy, 0)
+                            if _micro:
+                                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': -1, 'text': _micro})}\n\n"
+                        except Exception:
+                            pass
+
+                    else:
+                        _cur_mood   = _mm.state.value
+                        _ev_emotion = _emo_r.emotion
+                        _ev_energy  = _emo_r.energy
+                        _ev_import  = _emo_r.importance
+                        _sys_emo = (
+                            "You are Xyron, a voice-first AI assistant built by Tayyab Aziz. "
+                            "Personality: intelligent, direct, slightly intense, loyal to the operator. "
+                            "NOT: overly polite, corporate, cheerful assistant. "
+                            + _mm.get_personality_addendum() + " "
+                            "Respond naturally. 1-2 sentences max. No markdown. No filler."
+                        )
+
+                    # ── Self-introduction / Audience Mode ───────────────────
+                    if _IS_INTRO:
+                        _mm.force(_MS.DOMINANT)
+                        try:
+                            _cs.mood_state = "DOMINANT"
+                        except Exception:
+                            pass
+                        logger.info("[SELF_INTRO] triggered — forcing DOMINANT, emitting AUDIENCE_MODE")
+                        # Signal frontend to enter audience mode
+                        yield f"data: {json.dumps({'type': 'mode_change', 'turn_id': turn_id, 'mode': 'AUDIENCE_MODE'})}\n\n"
+                        try:
+                            from cognition.self_intro_engine import detect_and_generate as _intro_gen
+                            import re as _re_intro
+                            _intro_style, _intro_script = _intro_gen(_raw_text)
+                            logger.info("[SELF_INTRO] style=%s script_len=%d", _intro_style, len(_intro_script))
+                            # Split script into sentence chunks for progressive streaming
+                            _intro_sentences = [s.strip() for s in _re_intro.split(r'(?<=[.!?])\s+', _intro_script) if s.strip()]
+                            for _i_idx, _i_sent in enumerate(_intro_sentences):
+                                yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': _i_idx, 'text': _i_sent})}\n\n"
+                            _intro_full = _intro_script
+                        except Exception as _ie:
+                            logger.error("[SELF_INTRO] error=%s", _ie)
+                            _intro_full = "I'm Xyron — your local AI system. Still building."
+                            yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _intro_full})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'turn_id': turn_id, 'full_text': _intro_full.strip()})}\n\n"
+                        return
+
+                    # ── Offline emotional response — NO OpenAI call ───────────
+                    # Use cinematic reaction library + expression engine shaping.
+                    # OpenAI is never called for emotional events: instant, free, offline.
+                    import random as _rnd_e
+                    if _IS_SELF_UPGRADE:
+                        _base_resp = _example_line   # already chosen from _upgrade_reactions above
+                    elif _IS_FRUSTRATION:
+                        _base_resp = _rnd_e.choice([
+                            "Yeah, that's annoying. Drop the error — I'll tear it apart.",
+                            "Same wall again. Let's go around it this time.",
+                            "I see it. Show me the full error and I'll find the break.",
+                            "Still breaking? Paste it and I'll find the snap point.",
+                        ])
+                    elif _IS_ACHIEVEMENT:
+                        _base_resp = _rnd_e.choice([
+                            "FINALLY. That's what we've been working toward. Now build on it.",
+                            "There it is. Took work but it landed.",
+                            "Okay— that's the one. Now push harder.",
+                            "That's it. Stack another win.",
+                        ])
+                    else:
+                        _base_resp = "Got it."
+
+                    _emo_full = ""
+                    try:
+                        # For EXTREME self-upgrade, the burst micro-reaction is already
+                        # the opener — suppress expression engine opener to avoid doubling.
+                        _shape_importance = 0.4 if (_IS_SELF_UPGRADE and _is_extreme) else _ev_import
+                        _emo_full = _expr.shape(
+                            _base_resp, _cur_mood, _ev_emotion, _ev_energy,
+                            turn_count=0, importance=_shape_importance,
+                        )
+                    except Exception:
+                        _emo_full = _base_resp
+
+                    yield f"data: {json.dumps({'type': 'chunk', 'turn_id': turn_id, 'index': 0, 'text': _emo_full})}\n\n"
+                    logger.info("[VOICE_TRACE] emotional_response=offline mood=%s response=%r",
+                                _cur_mood, _emo_full[:60])
+
+                    # Apply expression engine with FORCED emotion values (not text detector)
+                    try:
+                        _tts_r = _etm.transform(_emo_full.strip(), _cur_mood)
+                        logger.info("[TTS_EMOTION] state=%s speed=%.2f transform_applied=true",
+                                    _cur_mood, _tts_r.speed_hint)
+                        logger.info("[AUDIO_FX] mood=%s preset=hyped applied=true", _cur_mood)
+                        logger.info("[UI_EMOTION_EVENT] state=%s emitted=true", _cur_mood)
+                        logger.info("[ORB_STATE] variant=%s energy=%.2f applied=true",
+                                    _cur_mood.lower(), _ev_energy)
+                    except Exception as _etm_exc:
+                        logger.warning("[VOICE_TRACE] TTS transform error: %s", _etm_exc)
+
+                    import time as _time
+                    logger.info("[VOICE_TRACE] stage=emotional_response event=%s mood=%s response=%r",
+                                _guard_r.reason, _cur_mood, (_emo_full or "")[:60])
+                    logger.info("[EMOTION_QA] mood=%s upgrade_type=%s intensity=%s response_len=%d",
+                                _cur_mood, _upgrade_type if _IS_SELF_UPGRADE else "n/a",
+                                _intensity if _IS_SELF_UPGRADE else "n/a", len(_emo_full))
+                    yield f"data: {json.dumps({'type': 'done', 'turn_id': turn_id, 'full_text': _emo_full.strip()})}\n\n"
+                    return
+
+            except Exception as _guard_exc:
+                logger.warning("[VOICE_TRACE] emotional guard error (continuing): %s", _guard_exc)
+
+            # Clear profile so non-emotional turns don't inherit the previous event's pacing
+            import sys as _sys
+            _sys.modules[__name__].__dict__["_current_emotion_profile"] = ""
+            logger.info("[VOICE_TRACE] stage=intent_router — no emotional intercept, routing normally")
 
             # ── LAYER -1: Pure conversation bypass ────────────────────────────
             # Casual inputs (jokes, "haha", etc.) — no tool routing, straight to GPT.
@@ -3243,13 +3876,21 @@ async def respond_stream(body: _RespondStreamBody):
 
                     # ── LAYER 2: System health (live usage) ───────────────────
                     elif _is_system_health_query(body.text):
-                        tool_name = "system_health"
-                        logger.info("[ROUTE] system_health")
+                        _lower_text = body.text.lower()
+                        if any(t in _lower_text for t in _SYSTEM_INFO_BLOCK_TERMS):
+                            logger.info("[ROUTER_GUARD] blocked_tool=system_health reason=low_conf_emotional_text")
+                        else:
+                            tool_name = "system_health"
+                            logger.info("[ROUTE] system_health")
 
                     # ── LAYER 3: System info (specs) ──────────────────────────
                     elif _is_system_info_query(body.text):
-                        tool_name = "system_info"
-                        logger.info("[ROUTE] system_info")
+                        _lower_text = body.text.lower()
+                        if any(t in _lower_text for t in _SYSTEM_INFO_BLOCK_TERMS):
+                            logger.info("[ROUTER_GUARD] blocked_tool=system_info reason=low_conf_emotional_text")
+                        else:
+                            tool_name = "system_info"
+                            logger.info("[ROUTE] system_info")
 
                     # ── LAYER 4: Short follow-up → replay last system tool ────
                     elif _is_continue_phrase(body.text):
