@@ -2,12 +2,29 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## STRICT RULE: Never Push Directly to Main
+
+**Always work on a feature branch. Never `git push origin main`.**
+
+```bash
+# Correct workflow every time:
+git checkout main && git pull origin main
+git checkout -b fix/your-description   # or feat/your-description
+# ... do work ...
+git add <specific files>
+git commit -m "fix: description"
+git push origin fix/your-description
+gh pr create --base main --head fix/your-description
+```
+
+Pushing directly to main bypasses review and makes retroactive PRs impossible (GitHub blocks PRs with no diff).
+
 ## Before Starting Any Work
 
 Always sync with main first:
 ```bash
 git checkout main && git pull origin main
-git checkout - && git merge main
+git checkout -b your-branch-name
 ```
 
 ## Running the Project
