@@ -94,3 +94,17 @@ output.txt
 tsconfig.tsbuildinfo
 tsconfig*.tsbuildinfo
 graphify-out/
+
+# Generated test audio (WAV samples from test scripts — too large for git)
+backend/data/rvc_tests/
+backend/data/voice_tests/
+
+# Runtime logs and auto-generated snapshots
+backend/system_log.md
+backend/src/ai_operator/skills/gold/Logs/
+backend/src/ai_operator/skills/gold/system_log.md
+
+# Personal / business docs (not part of the codebase)
+backend/Business/
+backend/Needs_Action/
+backend/src/ai_operator/skills/gold/Needs_Action/
