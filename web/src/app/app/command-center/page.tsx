@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  Mic, MicOff, Terminal, Clock, ArrowRight, Sparkles,
+  Mic, Terminal, Clock, ArrowRight, Sparkles,
   CheckCircle2, XCircle, Loader2, Volume2, VolumeX, Zap, Brain,
   FileText, Radio, WifiOff, Moon, Coffee, Settings, LayoutGrid,
   Star, Cpu, Code2, Activity, Wifi, ChevronRight,
@@ -81,13 +81,6 @@ function VoiceOrb({ isListening, isSpeaking, isProcessing, onClick }: {
   const orbColor  = isListening ? '#00ff88' : isProcessing ? '#00ffff' : variant.primaryColor
   const gi        = variant.glowIntensity            // 0.35–1.0
   const breathDur = `${variant.duration}s`           // 0.9s for HYPED → 4.5s for CALM
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      console.log(`[EMOTION_UI] received state=${emotion.mood_state}`)
-      console.log(`[ORB_STATE] applied variant=${emotion.mood_state}`)
-    }
-  }, [emotion.mood_state])
 
   useEffect(() => {
     const animate = () => {
@@ -309,7 +302,7 @@ export default function CommandCenterPage() {
     }
   }, [session])
 
-  const { supported: wakeSupported, listening: wakeListening } = useWakeWord(wakeActivate)
+  const { listening: wakeListening } = useWakeWord(wakeActivate)
   const { data: commands, submit, submitting, lastResult, refetch } = useCommands()
   const { settings, saveSettings, speak, stop, isSpeaking } = useVoice()
   const { getDraft, confirmDraft, rejectDraft, editDraft, executing } = useDrafts()
