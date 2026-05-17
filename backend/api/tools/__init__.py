@@ -12,5 +12,6 @@ from . import gmail_tools        # noqa: F401
 from . import calendar_tools     # noqa: F401
 from . import browser_tools      # noqa: F401  — browser_navigate/click/fill/read/screenshot
 from . import automation_tools   # noqa: F401  — desktop_type/hotkey/click/scroll + run_workflow
+from . import core_tools         # noqa: F401  — drives, file_search, media_control, app_finder
 
 __all__ = ["registry", "ToolResult"]

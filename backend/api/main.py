@@ -163,6 +163,16 @@ async def startup() -> None:
     except Exception as _exc3:
         logger.warning("[REFLECTION] startup skipped: %s", _exc3)
 
+    # Core tools — pre-warm app index and drive cache in background
+    try:
+        from .tools.core.app_finder import build_app_index
+        from .tools.core.drives import get_drives as _get_drives
+        asyncio.create_task(build_app_index())
+        asyncio.create_task(_get_drives())
+        logger.info("[CORE_TOOLS] app_finder index and drive cache warming started")
+    except Exception as _exc4:
+        logger.warning("[CORE_TOOLS] warmup skipped: %s", _exc4)
+
 
 # CORS — allow the Next.js dashboard
 app.add_middleware(
