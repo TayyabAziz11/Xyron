@@ -27,8 +27,6 @@ class CognitiveStateResponse(BaseModel):
     code_mode: bool = False
     active_project: Optional[str] = None
     active_file: Optional[str] = None
-    # Phase 12 — Emotional orb
-    mood_state: str = "CALM"
 
 
 def _build_response() -> CognitiveStateResponse:
@@ -47,7 +45,6 @@ def _build_response() -> CognitiveStateResponse:
         code_mode=snap.get("code_mode", False),
         active_project=snap.get("active_project"),
         active_file=snap.get("active_file"),
-        mood_state=snap.get("mood_state", "CALM"),
     )
 
 

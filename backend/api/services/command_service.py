@@ -29,8 +29,7 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
     (["cancel it", "reject it", "don't send", "no cancel", "discard it", "never mind"], "cancel", "reject_draft"),
     # ── System / web actions ──────────────────────────────────────────────────
     (["what time is it", "what's the time", "whats the time", "current time",
-      "what is the time", "tell me the time", "tell me what time", "time right now",
-      "what time right now", "what's the date", "whats the date",
+      "what is the time", "tell me the time", "what's the date", "whats the date",
       "what date is it", "today's date", "what day is it", "current date",
       "وقت بتاؤ", "ٹائم"], "system", "date_time"),
     (["battery", "battery level", "battery status", "battery percentage", "how much battery",
@@ -49,10 +48,6 @@ INTENT_PATTERNS: list[tuple[list[str], str, str]] = [
     (["volume down", "quieter", "آواز کم کرو", "نیچا کرو"], "system", "volume_down"),
     (["take screenshot", "capture screen", "اسکرین شاٹ", "تصویر لو"], "system", "screenshot"),
     (["remember this", "make a note", "یاد رکھو", "نوٹ کرو"], "memory", "remember"),
-    # Conversational memory mentions — must NOT route to system_info
-    (["upgrading memory", "memory upgrade", "upgrade my memory", "more memory",
-      "add more ram", "buy more ram", "need more ram", "increase ram",
-      "thinking about memory", "memory capacity"], "general", "general_query"),
     (["تلاش کرو", "ڈھونڈو"], "system", "web_search"),
     (["open youtube", "go to youtube", "open github", "go to github", "open gmail", "go to gmail",
       "open netflix", "go to netflix", "open twitter", "open linkedin"], "system", "open_url"),
@@ -523,17 +518,10 @@ class CommandService:
                 if _cfg.openai_api_key and _cfg.openai_api_key.startswith("sk-"):
                     # ── Fast path: IntentRouter (0–80 ms, no API cost) ────────
                     # Tries cache → regex → semantic before paying for OpenAI.
-                    # Skip IntentRouter when keyword classifier explicitly blocked as general_query
-                    # (prevents semantic router from re-routing conversational phrases to tools)
-                    _keyword_general = (intent.skill == "general_query"
-                                        and intent.confidence == "keyword_match")
                     try:
-                        if not _keyword_general:
-                            from api.services.intent_router import intent_router as _ir
-                            _route = _ir.route(text)
-                        else:
-                            _route = None
-                        if _route and _route.tool_name and _route.confidence >= 0.55 and _route.tool_name in registry:
+                        from api.services.intent_router import intent_router as _ir
+                        _route = _ir.route(text)
+                        if _route.tool_name and _route.confidence >= 0.55 and _route.tool_name in registry:
                             tool_name   = _route.tool_name
                             tool_params = dict(_route.params)
                             logger.info("[ROUTE] IntentRouter tier=%d → %s (%.2f)",

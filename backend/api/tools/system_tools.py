@@ -2005,9 +2005,8 @@ registry.register(
             "description": (
                 "ALWAYS use this tool for ANY question about the user's computer hardware or OS. "
                 "Triggers: 'what CPU', 'how much RAM', 'what are my specs', 'what OS', 'disk space', "
-                "'my computer', 'my laptop', 'my PC', 'system info', 'processor', 'how much RAM', 'RAM size', 'storage'. "
+                "'my computer', 'my laptop', 'my PC', 'system info', 'processor', 'memory', 'storage'. "
                 "Returns real Windows CPU name, RAM size, OS version, and drive space. "
-                "Do NOT use for conversational uses of the word 'memory' — only use for hardware RAM questions. "
                 "Do NOT use search_web for these questions — use this tool instead."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -3126,75 +3125,22 @@ def _exec_clear_clipboard(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolRe
     return ToolResult(success=False, text=out, spoken="Couldn't clear clipboard.", error=out)
 
 
-_WIN_TZ_ABBR: Dict[str, str] = {
-    "Pakistan Standard Time":     "PKT",
-    "India Standard Time":        "IST",
-    "UTC":                        "UTC",
-    "Eastern Standard Time":      "EST",
-    "Central Standard Time":      "CST",
-    "Mountain Standard Time":     "MST",
-    "Pacific Standard Time":      "PST",
-    "Arabian Standard Time":      "GST",
-    "Saudi Arabia Standard Time": "AST",
-    "Bangladesh Standard Time":   "BST",
-    "SE Asia Standard Time":      "ICT",
-    "China Standard Time":        "CST",
-    "Tokyo Standard Time":        "JST",
-    "W. Europe Standard Time":    "CET",
-    "GMT Standard Time":          "GMT",
-    "AUS Eastern Standard Time":  "AEST",
-    "Afghanistan Standard Time":  "AFT",
-}
-
-
-_WIN_TO_IANA: Dict[str, str] = {
-    "Pakistan Standard Time":     "Asia/Karachi",
-    "India Standard Time":        "Asia/Kolkata",
-    "UTC":                        "UTC",
-    "Eastern Standard Time":      "America/New_York",
-    "Central Standard Time":      "America/Chicago",
-    "Mountain Standard Time":     "America/Denver",
-    "Pacific Standard Time":      "America/Los_Angeles",
-    "Arabian Standard Time":      "Asia/Dubai",
-    "Saudi Arabia Standard Time": "Asia/Riyadh",
-    "Bangladesh Standard Time":   "Asia/Dhaka",
-    "SE Asia Standard Time":      "Asia/Bangkok",
-    "China Standard Time":        "Asia/Shanghai",
-    "Tokyo Standard Time":        "Asia/Tokyo",
-    "W. Europe Standard Time":    "Europe/Berlin",
-    "GMT Standard Time":          "Europe/London",
-    "AUS Eastern Standard Time":  "Australia/Sydney",
-    "Afghanistan Standard Time":  "Asia/Kabul",
-}
-
-
 def _exec_get_date_time(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    """Return current local date and time with timezone abbreviation.
-
-    Uses WSL2 system clock (NTP-synced) for accuracy.
-    Detects Windows timezone label via PowerShell for display only.
-    """
-    from datetime import datetime as _dt
-    from zoneinfo import ZoneInfo
-
-    # Step 1: detect Windows timezone label (fast, label-only)
-    iana_tz   = "Asia/Karachi"  # default
-    tz_label  = "PKT"
+    """Return current local date and time from Windows (correct timezone)."""
     try:
-        ok, out = _ps("(Get-TimeZone).Id", timeout=3)
+        ok, out = _ps("Get-Date -Format 'dddd, MMMM d, yyyy h:mm tt'", timeout=5)
         if ok and out.strip():
-            win_tz  = out.strip()
-            iana_tz = _WIN_TO_IANA.get(win_tz, iana_tz)
-            tz_label = _WIN_TZ_ABBR.get(win_tz, tz_label)
+            spoken = f"It's {out.strip()}."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              data={"datetime": out.strip()})
     except Exception:
         pass
-
-    # Step 2: time from WSL2 NTP-synced clock, converted to detected timezone
-    now      = _dt.now(ZoneInfo(iana_tz))
-    date_str = now.strftime("%A, %B %-d, %Y at %I:%M %p")
-    spoken   = f"It's {date_str} {tz_label}."
+    # Pure-Python fallback (may be UTC in WSL2 but better than nothing)
+    from datetime import datetime as _dt
+    now    = _dt.now()
+    spoken = f"It's {now.strftime('%A, %B %-d, %Y at %I:%M %p')}."
     return ToolResult(success=True, text=spoken, spoken=spoken,
-                      data={"datetime": now.isoformat(), "timezone": tz_label})
+                      data={"datetime": now.isoformat()})
 
 
 def _exec_get_uptime(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
