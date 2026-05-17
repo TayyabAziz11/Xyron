@@ -27,6 +27,10 @@ class CognitiveStateResponse(BaseModel):
     code_mode: bool = False
     active_project: Optional[str] = None
     active_file: Optional[str] = None
+    # Emotional cognition
+    mood_state: str = "CALM"
+    emotion_label: str = "calmness"
+    emotion_energy: float = 0.5
 
 
 def _build_response() -> CognitiveStateResponse:
@@ -45,6 +49,9 @@ def _build_response() -> CognitiveStateResponse:
         code_mode=snap.get("code_mode", False),
         active_project=snap.get("active_project"),
         active_file=snap.get("active_file"),
+        mood_state=snap.get("mood_state", "CALM"),
+        emotion_label=snap.get("emotion_label", "calmness"),
+        emotion_energy=snap.get("emotion_energy", 0.5),
     )
 
 
@@ -230,6 +237,74 @@ async def complete_goal(goal_id: str) -> GoalResponse:
         return _goal_to_response(goal)
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Mood state endpoints ──────────────────────────────────────────────────────
+
+class MoodStateResponse(BaseModel):
+    state:    str
+    theme:    dict
+    held_sec: float
+
+
+@router.get("/mood", response_model=MoodStateResponse)
+async def get_mood_state() -> MoodStateResponse:
+    """Return live mood state machine snapshot including UI theme."""
+    try:
+        from cognition.mood_state_machine import mood_machine
+        snap = mood_machine.snapshot()
+        return MoodStateResponse(**snap)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class MoodForceRequest(BaseModel):
+    state: str
+
+
+@router.post("/mood/force")
+async def force_mood_state(body: MoodForceRequest) -> MoodStateResponse:
+    """Force the mood state machine to a specific state (dev/test)."""
+    try:
+        from cognition.mood_state_machine import mood_machine, MoodState
+        state = MoodState(body.state.upper())
+        mood_machine.force(state)
+        return MoodStateResponse(**mood_machine.snapshot())
+    except ValueError:
+        from cognition.mood_state_machine import MoodState
+        valid = [s.value for s in MoodState]
+        raise HTTPException(status_code=422, detail=f"Invalid state. Valid: {valid}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Relationship memory endpoints ─────────────────────────────────────────────
+
+@router.get("/relationship/events")
+async def get_relationship_events(n: int = Query(20, ge=1, le=100)) -> list[dict]:
+    """Return recent emotionally significant events."""
+    try:
+        from memory.relationship_memory import relationship_memory
+        return relationship_memory.export_recent(n)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class RelationshipEventRequest(BaseModel):
+    event_type: str
+    description: str
+    metadata: dict = {}
+
+
+@router.post("/relationship/events", status_code=201)
+async def record_relationship_event(body: RelationshipEventRequest) -> dict:
+    """Manually record a relationship event."""
+    try:
+        from memory.relationship_memory import relationship_memory
+        relationship_memory.record(body.event_type, body.description, body.metadata)
+        return {"status": "recorded"}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

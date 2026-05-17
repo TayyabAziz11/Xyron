@@ -181,16 +181,19 @@ async def quick_response(
     transcript: str,
     history: list[dict] | None = None,
     model: str = "gpt-4o-mini",
+    system_override: str | None = None,
 ) -> str:
     """
     Non-streaming LLM call. Returns the full response text.
     Used for tool narration, clarification prompts, and low-latency paths.
+    Pass system_override to replace the default VOICE_SYSTEM_PROMPT.
     """
     from api.config import settings as _cfg
     if not _cfg.openai_api_key:
         return "I'm not sure how to help with that."
 
-    messages: list[dict] = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
+    _system = system_override if system_override else VOICE_SYSTEM_PROMPT
+    messages: list[dict] = [{"role": "system", "content": _system}]
     for h in (history or [])[-6:]:
         role = h.get("role", "user")
         text = h.get("text", h.get("content", ""))

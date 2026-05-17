@@ -16,6 +16,10 @@ export interface CognitiveState {
   code_mode: boolean
   active_project: string | null
   active_file: string | null
+  // Emotional cognition
+  mood_state: string
+  emotion_label: string
+  emotion_energy: number
 }
 
 export function useCognitiveState(): CognitiveState | null {

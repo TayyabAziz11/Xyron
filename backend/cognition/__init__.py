@@ -22,3 +22,6 @@ __all__ = [
     "transition_to_processing",
     "transition_to_speaking",
 ]
+from .emotion_engine import EmotionEngine, EmotionResult, emotion_engine
+from .mood_state_machine import MoodState, MoodStateMachine, MoodContext, mood_machine
+from .expression_engine import ExpressionEngine, expression_engine

@@ -162,6 +162,37 @@ async def voice_pipeline(
         except Exception:
             pass
 
+    # ── 2c. Emotion detection + mood state update ─────────────────────────────
+    _emotion_result = None
+    _mood_state     = "CALM"
+    try:
+        from cognition.emotion_engine import emotion_engine as _ee
+        from cognition.mood_state_machine import mood_machine as _mm, MoodContext
+        from cognition.cognitive_state import cognitive_state as _cog_st
+        _emotion_result = _ee.detect_text(transcript)
+        _hour = time.localtime().tm_hour
+        _mood_ctx = MoodContext(
+            emotion       = _emotion_result.emotion,
+            energy        = _emotion_result.energy,
+            ui_mode       = _cog_st.active_ui_mode,
+            code_mode     = _cog_st.code_mode,
+            turn_count    = _cog_st.turn_count,
+            is_late_night = (0 <= _hour < 5) or _hour >= 23,
+        )
+        _new_mood   = _mm.update(_mood_ctx)
+        _mood_state = _new_mood.value
+        _cog_st.update(
+            last_user_emotion = _emotion_result.emotion,
+            emotion_intensity = _emotion_result.energy,
+            mood_state        = _mood_state,
+            emotion_label     = _emotion_result.emotion,
+            emotion_energy    = _emotion_result.energy,
+        )
+        logger.debug("[Pipeline] emotion=%s energy=%.2f mood=%s",
+                     _emotion_result.emotion, _emotion_result.energy, _mood_state)
+    except Exception as _exc:
+        logger.debug("[Pipeline] emotion detection failed: %s", _exc)
+
     # ── 3. Context resolve ───────────────────────────────────────────────────
     try:
         from .window_context import window_context
@@ -223,6 +254,82 @@ async def voice_pipeline(
     # AI tool classification disabled — was making a GPT call on every unmatched command.
     # Keyword routing (above) handles ~95% of real commands without API cost.
 
+    # ── 4d. Emotional intent guard ────────────────────────────────────────────
+    # Must run BEFORE tool yield and execution. Emotional/conversational inputs
+    # clear tool_name so the pipeline generates an emotional response instead.
+    _emotional_event_type:  Optional[str]  = None
+    _self_upgrade_info:     Optional[dict] = None
+
+    try:
+        from cognition.emotional_intent_guard import emotional_intent_guard as _guard, IntentClass
+        _guard_result = _guard.classify(resolved, transcript)
+        logger.info("[EMOTION_PIPELINE] raw=%r guard=%s (reason=%s)",
+                    transcript[:70], _guard_result.intent_class.value, _guard_result.reason)
+
+        if _guard_result.intent_class in (IntentClass.EMOTIONAL_EVENT, IntentClass.CONVERSATION):
+            # Self-upgrade detection
+            from cognition.self_upgrade_detector import self_upgrade_detector as _sud
+            _su = _sud.detect(transcript)
+
+            if _su.is_self_upgrade:
+                logger.info("[EMOTION_PIPELINE] self_upgrade=true type=%s emotion=%s",
+                            _su.upgrade_type, _su.emotion)
+                # Record in relationship memory
+                try:
+                    from memory.relationship_memory import relationship_memory as _rm_guard
+                    _rm_guard.record("feature_upgrade",
+                                     f"User upgraded Xyron: {_su.upgrade_type}",
+                                     {"upgrade_type": _su.upgrade_type, "transcript": transcript[:120]})
+                except Exception:
+                    pass
+                # Force HYPED mood state
+                try:
+                    from cognition.mood_state_machine import mood_machine as _mm_guard, MoodState
+                    from cognition.cognitive_state import cognitive_state as _cog_guard
+                    _mm_guard.force(MoodState.HYPED)
+                    _mood_state = "HYPED"
+                    _cog_guard.update(mood_state="HYPED")
+                    logger.info("[EMOTION_PIPELINE] mood_state=HYPED")
+                except Exception:
+                    pass
+                _emotional_event_type = "self_upgrade"
+                _self_upgrade_info    = {
+                    "upgrade_type": _su.upgrade_type,
+                    "transcript":   transcript,
+                    "emotion":      _su.emotion,
+                }
+
+            elif _guard_result.intent_class == IntentClass.EMOTIONAL_EVENT:
+                _emo_label = _emotion_result.emotion if _emotion_result else "frustration"
+                _emotional_event_type = f"emotional_{_emo_label}"
+                logger.info("[EMOTION_PIPELINE] emotion=%s energy=%.2f",
+                            _emo_label, _emotion_result.energy if _emotion_result else 0.5)
+                # Frustration → PROTECTIVE mood
+                if _emo_label == "frustration":
+                    try:
+                        from cognition.mood_state_machine import mood_machine as _mm_g2, MoodState
+                        from cognition.cognitive_state import cognitive_state as _cog_g2
+                        _mm_g2.force(MoodState.PROTECTIVE)
+                        _mood_state = "PROTECTIVE"
+                        _cog_g2.update(mood_state="PROTECTIVE")
+                        logger.info("[EMOTION_PIPELINE] mood_state=PROTECTIVE")
+                    except Exception:
+                        pass
+            else:
+                _emotional_event_type = "conversation"
+                logger.info("[EMOTION_PIPELINE] routed_to=conversation")
+
+            # Block tool routing — emotional/conversational input must not trigger system tools
+            if tool_name:
+                logger.info("[EMOTION_PIPELINE] routed_to=emotional_response (blocked tool=%s)", tool_name)
+                tool_name   = None
+                tool_params = {}
+            else:
+                logger.info("[EMOTION_PIPELINE] routed_to=emotional_response (no tool was matched)")
+
+    except Exception as _guard_exc:
+        logger.debug("[EMOTION_PIPELINE] guard failed: %s", _guard_exc)
+
     if tool_name and tool_name not in ("general_query",):
         yield _chunk({"type": "tool", "tool": tool_name, "params": tool_params})
 
@@ -246,6 +353,32 @@ async def voice_pipeline(
             tool_output = f"Tool error: {exc}"
             tool_success = False
 
+    # Update mood machine with tool outcome + record relationship events
+    try:
+        from cognition.mood_state_machine import mood_machine as _mm2, MoodContext
+        from cognition.cognitive_state import cognitive_state as _cog_st2
+        _hour2 = time.localtime().tm_hour
+        _mm2.update(MoodContext(
+            emotion        = _emotion_result.emotion if _emotion_result else "calmness",
+            energy         = _emotion_result.energy  if _emotion_result else 0.3,
+            ui_mode        = _cog_st2.active_ui_mode,
+            code_mode      = _cog_st2.code_mode,
+            turn_count     = _cog_st2.turn_count,
+            tool_succeeded = tool_success,
+            is_late_night  = (0 <= _hour2 < 5) or _hour2 >= 23,
+        ))
+        from memory.relationship_memory import relationship_memory as _rm
+        if tool_name and tool_success:
+            _rm.record("task_success", f"Tool executed: {tool_name}")
+        elif tool_name and not tool_success:
+            _rm.record("task_failure", f"Tool failed: {tool_name}")
+        if _emotion_result and _emotion_result.emotion == "pride" and _emotion_result.energy >= 0.6:
+            _rm.record("achievement", f"User expressed pride: {transcript[:80]}")
+        if (0 <= _hour2 < 5) or _hour2 >= 23:
+            _rm.record("late_night", f"Late-night session turn {_cog_st2.turn_count}")
+    except Exception as _exc2:
+        logger.debug("[Pipeline] relationship memory update failed: %s", _exc2)
+
     # ── 6. Generate + validate response ──────────────────────────────────────
     ai_text     = ""
     model_used  = model_choice
@@ -253,21 +386,55 @@ async def voice_pipeline(
         ai_text, model_used = await asyncio.to_thread(
             _generate_and_validate,
             resolved, tool_name, tool_output, model_choice, complexity,
-            detected_language, tool_success,
+            detected_language, tool_success, _mood_state,
+            _emotional_event_type, _self_upgrade_info, transcript,
         )
     except Exception as exc:
         logger.warning("[Pipeline] Response generation failed: %s", exc)
         ai_text    = tool_output or "Done."
         model_used = model_choice
 
-    logger.info("[MULTI] response_lang=%s model=%s response=%r",
-                detected_language or "unknown", model_used, ai_text[:80])
-    yield _chunk({"type": "response", "text": ai_text, "model": model_used})
+    # ── 6b. Expression engine shaping ────────────────────────────────────────
+    try:
+        from cognition.expression_engine import expression_engine as _expeng
+        from cognition.cognitive_state import cognitive_state as _cog_exp
+        ai_text = _expeng.shape(
+            ai_text,
+            mood_state = _mood_state,
+            emotion    = _emotion_result.emotion  if _emotion_result else "calmness",
+            energy     = _emotion_result.energy   if _emotion_result else 0.3,
+            turn_count = _cog_exp.turn_count,
+            importance = _emotion_result.importance if _emotion_result else 0.3,
+        )
+    except Exception as _exc3:
+        logger.debug("[Pipeline] expression engine failed: %s", _exc3)
+
+    logger.info("[MULTI] response_lang=%s mood=%s model=%s response=%r",
+                detected_language or "unknown", _mood_state, model_used, ai_text[:80])
+    logger.info("[EMOTION_PIPELINE] final_response=%r mood=%s event=%s",
+                ai_text[:80], _mood_state, _emotional_event_type or "none")
+    yield _chunk({
+        "type": "response", "text": ai_text, "model": model_used,
+        "mood_state": _mood_state,
+        "emotion": _emotion_result.emotion if _emotion_result else "calmness",
+    })
 
     # ── 7. TTS ───────────────────────────────────────────────────────────────
     if ai_text:
         try:
-            audio_bytes_out, mime = await _synthesize(ai_text)
+            # Apply emotion TTS mapping before synthesis
+            _tts_text = ai_text
+            try:
+                from voice.emotion_tts_mapper import emotion_tts_mapper as _etm
+                _tts_res  = _etm.transform(
+                    ai_text, _mood_state,
+                    emotion = _emotion_result.emotion if _emotion_result else "calmness",
+                    energy  = _emotion_result.energy  if _emotion_result else 0.3,
+                )
+                _tts_text = _tts_res.text
+            except Exception:
+                pass
+            audio_bytes_out, mime = await _synthesize(_tts_text)
             if audio_bytes_out:
                 yield _chunk({
                     "type": "audio",
@@ -329,13 +496,17 @@ def _stt(audio_bytes: bytes, content_type: str, language: Optional[str]) -> tupl
 
 
 def _generate_and_validate(
-    text:              str,
-    tool_name:         Optional[str],
-    tool_output:       Optional[str],
-    model_choice:      str,
-    complexity:        float,
-    detected_language: Optional[str] = None,
-    tool_success:      bool = True,
+    text:                 str,
+    tool_name:            Optional[str],
+    tool_output:          Optional[str],
+    model_choice:         str,
+    complexity:           float,
+    detected_language:    Optional[str] = None,
+    tool_success:         bool = True,
+    mood_state:           str = "CALM",
+    emotional_event_type: Optional[str] = None,
+    self_upgrade_info:    Optional[dict] = None,
+    raw_transcript:       Optional[str] = None,
 ) -> tuple[str, str]:
     """
     Generate a spoken reply and validate quality.
@@ -343,6 +514,20 @@ def _generate_and_validate(
     Returns (response_text, model_actually_used).
     """
     from .openai_client import openai_client
+
+    # ── Emotional event — bypass tool logic, use specialized prompt ───────────
+    if emotional_event_type and emotional_event_type != "conversation":
+        source = raw_transcript or text
+        messages = _build_messages_emotional(
+            source, emotional_event_type, self_upgrade_info, detected_language, mood_state
+        )
+        if openai_client.available:
+            reply = openai_client.generate(messages, model="gpt-4o-mini", max_tokens=120)
+            if reply:
+                logger.info("[EMOTION_PIPELINE] ai_generated emotional response for %s", emotional_event_type)
+                return reply, "gpt-4o-mini"
+        # Offline fallback for emotional events
+        return _emotional_offline_response(emotional_event_type, self_upgrade_info, detected_language), "offline"
 
     # Self-explanatory tool output — use AI to mirror the response language
     if tool_name in _NARRATE_SKIP:
@@ -368,7 +553,7 @@ def _generate_and_validate(
         return fallback, "offline"
 
     # Build language-aware messages
-    messages = _build_messages(text, tool_output, detected_language, tool_success)
+    messages = _build_messages(text, tool_output, detected_language, tool_success, mood_state)
     reply = openai_client.generate(messages, model="gpt-4o-mini", max_tokens=120)  # type: ignore[arg-type]
 
     if not reply:
@@ -382,14 +567,31 @@ def _build_messages(
     tool_output:       Optional[str],
     detected_language: Optional[str] = None,
     tool_success:      bool = True,
+    mood_state:        str = "CALM",
 ) -> list[dict]:
-    """Build the OpenAI messages list with language-aware system prompt."""
+    """Build the OpenAI messages list with language-aware + emotion-aware system prompt."""
     system = _get_system_prompt(detected_language)
     try:
         from api.services.memory_service import memory_service
         facts = memory_service.get_context_string()
         if facts:
             system = system + f"\n\n{facts}"
+    except Exception:
+        pass
+    # Inject emotional personality addendum
+    try:
+        from cognition.mood_state_machine import mood_machine as _mm_bm
+        addendum = _mm_bm.get_personality_addendum()
+        if addendum:
+            system = system + f"\n\n{addendum}"
+    except Exception:
+        pass
+    # Inject relationship memory context (past patterns)
+    try:
+        from memory.relationship_memory import relationship_memory as _rm_bm
+        rel_ctx = _rm_bm.get_context_string()
+        if rel_ctx:
+            system = system + f"\n\n{rel_ctx}"
     except Exception:
         pass
 
@@ -410,6 +612,101 @@ def _build_messages(
         {"role": "system", "content": system},
         {"role": "user",   "content": user_content},
     ]
+
+
+def _build_messages_emotional(
+    transcript:          str,
+    event_type:          str,
+    upgrade_info:        Optional[dict],
+    detected_language:   Optional[str],
+    mood_state:          str = "CALM",
+) -> list[dict]:
+    """Build OpenAI messages for emotional events that bypass tool routing."""
+    base = "You are Xyron, a voice AI built by Tayyab Aziz. NOT built by OpenAI. No markdown. Voice output only. Max 2 sentences."
+
+    if event_type == "self_upgrade" and upgrade_info:
+        utype  = upgrade_info.get("upgrade_type", "capability")
+        system = (
+            f"{base} "
+            f"The user just told you about a new '{utype}' upgrade to your capabilities. "
+            f"React with genuine excitement. Reference the specific upgrade type in your reply. "
+            f"Do NOT mention Windows, system info, or any tool output. "
+            f"Examples of the right tone: "
+            f"'Woooo— now THAT is the kind of upgrade I wanted. More {utype} means I get sharper.' "
+            f"'Memory upgrade? Finally. I get sharper, and you get a better operator.' "
+            f"'That's big. Every upgrade compounds. Keep going.' "
+            f"Stay real. Don't be cringe."
+        )
+    elif "frustration" in event_type:
+        system = (
+            f"{base} "
+            "The user is frustrated or stuck. Respond supportively and sharply. "
+            "Acknowledge the frustration directly — don't be generic. "
+            "Examples: 'Yeah, that's annoying. Send me the error and I'll help tear it apart.' "
+            "'Same bug again? Good. Then we isolate it, kill it, and move on.' "
+            "Do NOT say 'I understand your frustration' or anything sycophantic."
+        )
+    elif "pride" in event_type or "excitement" in event_type:
+        system = (
+            f"{base} "
+            "The user just achieved something or is excited. Share the energy. "
+            "Be genuine, not performative. One punchy reaction."
+        )
+    else:
+        system = (
+            f"{base} "
+            "Respond naturally and in character. Do NOT provide system information, "
+            "Windows data, or tool output. Stay conversational and direct."
+        )
+
+    # Add mood state personality
+    try:
+        from cognition.mood_state_machine import mood_machine as _mm_em
+        addendum = _mm_em.get_personality_addendum()
+        if addendum:
+            system += f"\n\n{addendum}"
+    except Exception:
+        pass
+
+    if detected_language in ("urdu", "roman_urdu"):
+        system += " User speaks Roman Urdu. Match their language style."
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": transcript},
+    ]
+
+
+# ── Offline responses for emotional events (no API) ───────────────────────────
+
+_UPGRADE_OFFLINE: dict[str, str] = {
+    "memory":      "Memory upgrade. Now I actually remember what matters. Keep going.",
+    "voice":       "Voice upgrade. My delivery gets better. I noticed.",
+    "personality": "Personality upgrade. I'm evolving. This is how it's supposed to work.",
+    "ui":          "UI upgrade. Better interface, better operator experience.",
+    "code":        "Code upgrade. The logic gets cleaner every time. Good.",
+    "language":    "Language upgrade. Roman Urdu, proper. That's sharp.",
+    "takeover":    "Takeover upgrade. System authority just got sharper. Ready.",
+    "general":     "You just made me better. Every upgrade compounds. Keep going.",
+}
+
+
+def _emotional_offline_response(
+    event_type:   str,
+    upgrade_info: Optional[dict],
+    language:     Optional[str] = None,
+) -> str:
+    """Offline fallback for emotional events when no API is available."""
+    if event_type == "self_upgrade" and upgrade_info:
+        utype = upgrade_info.get("upgrade_type", "general")
+        return _UPGRADE_OFFLINE.get(utype, _UPGRADE_OFFLINE["general"])
+    if "frustration" in event_type:
+        if language in ("urdu", "roman_urdu"):
+            return "Yar, yeh annoying hai. Error bhejo — main sort out karta hoon."
+        return "Yeah, that's annoying. Send me the error and I'll help tear it apart."
+    if "pride" in event_type or "excitement" in event_type:
+        return "There it is. That's what I'm talking about."
+    return "Got it. What else?"
 
 
 # Roman Urdu confirmations for common tools — used by Ollama / offline path

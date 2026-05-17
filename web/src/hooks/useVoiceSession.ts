@@ -938,8 +938,13 @@ export function useVoiceSession() {
 
           onModeChange: (mode) => {
             currentModeRef.current = mode
-            if (mode === 'jarvis' && typeof window !== 'undefined') {
-              window.dispatchEvent(new CustomEvent('xyron:im-home'))
+            if (typeof window !== 'undefined') {
+              if (mode === 'jarvis') {
+                window.dispatchEvent(new CustomEvent('xyron:im-home'))
+              }
+              if (mode === 'AUDIENCE_MODE') {
+                window.dispatchEvent(new CustomEvent('xyron:audience-mode'))
+              }
             }
             const modeMessages: Record<string, string> = {
               morning:       'Morning routine started — weather, calendar, and music opened.',

@@ -1,8 +1,10 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { motion } from 'framer-motion'
+import { motion, AnimatePresence } from 'framer-motion'
 import type { ImHomePhase } from '@/hooks/useImHomeProtocol'
+import { useEmotionState } from '@/hooks/useEmotionState'
+import { ORB_VARIANTS } from '@/state/emotionState'
 
 interface Props {
   phase: ImHomePhase
@@ -10,11 +12,23 @@ interface Props {
 
 // ── Inner canvas: neural energy swirl ─────────────────────────────────────────
 
-function EnergyCanvas({ phase }: { phase: ImHomePhase }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const rafRef    = useRef<number>(0)
-  const phaseRef  = useRef(phase)
+function EnergyCanvas({
+  phase,
+  primaryColor = '#ff2020',
+  accentColor  = '#00ffff',
+}: {
+  phase:        ImHomePhase
+  primaryColor?: string
+  accentColor?:  string
+}) {
+  const canvasRef    = useRef<HTMLCanvasElement>(null)
+  const rafRef       = useRef<number>(0)
+  const phaseRef     = useRef(phase)
+  const primaryRef   = useRef(primaryColor)
+  const accentRef    = useRef(accentColor)
   useEffect(() => { phaseRef.current = phase }, [phase])
+  useEffect(() => { primaryRef.current = primaryColor }, [primaryColor])
+  useEffect(() => { accentRef.current  = accentColor  }, [accentColor])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -58,7 +72,9 @@ function EnergyCanvas({ phase }: { phase: ImHomePhase }) {
 
         ctx.beginPath()
         ctx.arc(x, y, sp.cyan ? 1.8 : 1.2, 0, Math.PI * 2)
-        ctx.fillStyle = sp.cyan ? `rgba(0,255,255,${a})` : `rgba(255,32,32,${a})`
+        ctx.fillStyle = sp.cyan
+          ? `rgba(${hexToRgb(accentRef.current)},${a})`
+          : `rgba(${hexToRgb(primaryRef.current)},${a})`
         ctx.fill()
       })
 
@@ -68,7 +84,7 @@ function EnergyCanvas({ phase }: { phase: ImHomePhase }) {
         const r      = 18 + i * 10 + Math.sin(phase2) * 4
         const a      = (0.3 - i * 0.07) * intensity
         const grd    = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-        grd.addColorStop(0, `rgba(255,32,32,${a})`)
+        grd.addColorStop(0, `rgba(${hexToRgb(primaryRef.current)},${a})`)
         grd.addColorStop(1, 'transparent')
         ctx.beginPath()
         ctx.arc(cx, cy, r, 0, Math.PI * 2)
@@ -83,6 +99,17 @@ function EnergyCanvas({ phase }: { phase: ImHomePhase }) {
   }, [])
 
   return <canvas ref={canvasRef} width={280} height={280} className="absolute inset-0 rounded-full" style={{ mixBlendMode: 'screen' }} />
+}
+
+// ── Hex color utility ──────────────────────────────────────────────────────────
+
+function hexToRgb(hex: string): string {
+  const clean = hex.replace('#', '')
+  if (clean.length !== 6) return '255,32,32'
+  const r = parseInt(clean.slice(0, 2), 16)
+  const g = parseInt(clean.slice(2, 4), 16)
+  const b = parseInt(clean.slice(4, 6), 16)
+  return `${r},${g},${b}`
 }
 
 // ── Waveform bars ──────────────────────────────────────────────────────────────
@@ -239,13 +266,63 @@ function ScanSweep({ radius }: { radius: number }) {
   )
 }
 
+// ── Audience HUD ──────────────────────────────────────────────────────────────
+// Shown when mood_state === 'AUDIENCE_MODE'. Lingers 5s after mode ends.
+
+function AudienceHUD({ moduleCount }: { moduleCount: number }) {
+  return (
+    <motion.div
+      className="absolute inset-0 flex flex-col items-center justify-end pb-4 pointer-events-none z-20"
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 8 }}
+      transition={{ duration: 0.5 }}
+    >
+      <div
+        className="font-mono text-center"
+        style={{ color: '#7c4dff', textShadow: '0 0 12px rgba(124,77,255,0.8)' }}
+      >
+        <p className="text-[8px] tracking-[0.4em] font-bold uppercase mb-0.5">
+          XYRON SELF-INTRODUCTION
+        </p>
+        <p className="text-[7px] tracking-[0.25em] opacity-70">
+          {moduleCount} MODULES ACTIVE · LOCAL-FIRST SYSTEM
+        </p>
+      </div>
+    </motion.div>
+  )
+}
+
 // ── Cinematic Orb ─────────────────────────────────────────────────────────────
 
 export function CinematicOrb({ phase }: Props) {
   const isActive = phase !== 'idle'
   const isPhase5 = phase === 'phase5'
+  const emotion  = useEmotionState()
+  const variant  = ORB_VARIANTS[emotion.mood_state] ?? ORB_VARIANTS.CALM
+
+  // Track audience mode with 5s linger after it ends
+  const [showHUD, setShowHUD] = useState(false)
+  const hudTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (emotion.mood_state === 'AUDIENCE_MODE') {
+      if (hudTimerRef.current) clearTimeout(hudTimerRef.current)
+      setShowHUD(true)
+    } else if (showHUD) {
+      hudTimerRef.current = setTimeout(() => setShowHUD(false), 5000)
+    }
+    return () => { if (hudTimerRef.current) clearTimeout(hudTimerRef.current) }
+  }, [emotion.mood_state, showHUD])
 
   const outerScale = isPhase5 ? 1.15 : isActive ? 1.0 : 0.0
+
+  // Derive glow values from current emotion theme
+  const rgb          = hexToRgb(variant.primaryColor)
+  const glowMed      = `rgba(${rgb},${0.4 * variant.glowIntensity})`
+  const glowStrong   = `rgba(${rgb},${0.6 * variant.glowIntensity})`
+  const glowFaint    = `rgba(${rgb},${0.15 * variant.glowIntensity})`
+  const borderColor  = `rgba(${rgb},0.45)`
+  const breathDur    = `${variant.duration}s`
 
   return (
     <motion.div
@@ -254,52 +331,66 @@ export function CinematicOrb({ phase }: Props) {
       animate={{ scale: outerScale, opacity: isActive ? 1 : 0 }}
       transition={{ duration: 0.8, ease: 'easeOut' }}
     >
-      {/* Ambient outer glow */}
-      <div
+      {/* Ambient outer glow — emotion color */}
+      <motion.div
         className="absolute rounded-full"
-        style={{
-          width: 380, height: 380,
-          background: isPhase5
-            ? 'radial-gradient(circle, rgba(255,32,32,0.18) 0%, transparent 70%)'
-            : 'radial-gradient(circle, rgba(255,32,32,0.08) 0%, transparent 70%)',
-          animation: 'orbBreath 3s ease-in-out infinite',
+        style={{ width: 380, height: 380 }}
+        animate={{
+          background: [
+            `radial-gradient(circle, ${glowFaint} 0%, transparent 70%)`,
+            `radial-gradient(circle, ${glowMed} 0%, transparent 70%)`,
+            `radial-gradient(circle, ${glowFaint} 0%, transparent 70%)`,
+          ],
         }}
+        transition={{ duration: variant.duration, repeat: Infinity, ease: 'easeInOut' }}
       />
 
-      {/* Volumetric outer ring */}
-      <div
+      {/* Volumetric outer ring — emotion color */}
+      <motion.div
         className="absolute rounded-full"
-        style={{
-          width: 320, height: 320,
-          border: '1px solid rgba(255,32,32,0.15)',
-          boxShadow: isPhase5 ? '0 0 60px rgba(255,32,32,0.4), 0 0 120px rgba(255,32,32,0.15)' : '0 0 40px rgba(255,32,32,0.2)',
-          animation: 'orbBreath 4s ease-in-out infinite',
+        style={{ width: 320, height: 320, border: `1px solid rgba(${rgb},0.15)` }}
+        animate={{
+          boxShadow: [
+            `0 0 40px ${glowMed}, 0 0 80px ${glowFaint}`,
+            `0 0 60px ${glowStrong}, 0 0 120px ${glowMed}`,
+            `0 0 40px ${glowMed}, 0 0 80px ${glowFaint}`,
+          ],
         }}
+        transition={{ duration: variant.duration, repeat: Infinity, ease: 'easeInOut' }}
       />
 
-      {/* Segmented rotating rings */}
-      <SegmentRing radius={148} segments={12} speed={0.003}  color="rgba(255,32,32,0.35)" width={1.5} gap={8}  />
-      <SegmentRing radius={128} segments={8}  speed={-0.005} color="rgba(0,255,255,0.25)"  width={1}   gap={12} />
-      <SegmentRing radius={108} segments={16} speed={0.008}  color="rgba(255,32,32,0.20)" width={1}   gap={4}  />
+      {/* Segmented rotating rings — emotion primary + accent */}
+      <SegmentRing radius={148} segments={12} speed={0.003}  color={`rgba(${rgb},0.35)`} width={1.5} gap={8}  />
+      <SegmentRing radius={128} segments={8}  speed={-0.005} color="rgba(0,255,255,0.25)" width={1}   gap={12} />
+      <SegmentRing radius={108} segments={16} speed={0.008}  color={`rgba(${rgb},0.20)`} width={1}   gap={4}  />
 
       {/* Scan sweep */}
       <ScanSweep radius={120} />
 
-      {/* Main orb body */}
-      <div
+      {/* Main orb body — emotion reactive glow */}
+      <motion.div
         className="relative rounded-full flex items-center justify-center overflow-hidden"
         style={{
           width: 280, height: 280,
-          background: 'radial-gradient(circle at 35% 30%, rgba(255,32,32,0.25), rgba(255,32,32,0.06) 55%, transparent)',
-          border: '1.5px solid rgba(255,32,32,0.45)',
-          boxShadow: isPhase5
-            ? '0 0 60px rgba(255,32,32,0.6), 0 0 120px rgba(255,32,32,0.25), inset 0 0 40px rgba(255,32,32,0.12)'
-            : '0 0 40px rgba(255,32,32,0.4), 0 0 80px rgba(255,32,32,0.15), inset 0 0 20px rgba(255,32,32,0.08)',
-          animation: 'orbBreath 2.2s ease-in-out infinite',
+          border: `1.5px solid ${borderColor}`,
         }}
+        animate={{
+          background: [
+            `radial-gradient(circle at 35% 30%, rgba(${rgb},0.25), rgba(${rgb},0.06) 55%, transparent)`,
+            `radial-gradient(circle at 35% 30%, rgba(${rgb},0.35), rgba(${rgb},0.10) 55%, transparent)`,
+            `radial-gradient(circle at 35% 30%, rgba(${rgb},0.25), rgba(${rgb},0.06) 55%, transparent)`,
+          ],
+          boxShadow: [
+            `0 0 40px ${glowMed}, 0 0 80px ${glowFaint}, inset 0 0 20px rgba(${rgb},0.08)`,
+            `0 0 60px ${glowStrong}, 0 0 120px ${glowMed}, inset 0 0 40px rgba(${rgb},0.12)`,
+            `0 0 40px ${glowMed}, 0 0 80px ${glowFaint}, inset 0 0 20px rgba(${rgb},0.08)`,
+          ],
+          scale: variant.scale,
+        }}
+        transition={{ duration: variant.duration, repeat: Infinity, ease: 'easeInOut' }}
       >
-        {/* Inner canvas neural energy */}
-        <EnergyCanvas phase={phase} />
+        {/* Inner canvas neural energy — emotion colors */}
+        <EnergyCanvas phase={phase} primaryColor={variant.primaryColor} accentColor="#00ffff" />
 
         {/* Specular highlight */}
         <div
@@ -317,19 +408,24 @@ export function CinematicOrb({ phase }: Props) {
           <WaveBars active={isActive} />
           <p
             className="font-mono text-[9px] tracking-[0.3em] font-bold"
-            style={{ color: '#ff2020', textShadow: '0 0 8px rgba(255,32,32,0.8)', letterSpacing: '0.3em' }}
+            style={{
+              color:      variant.primaryColor,
+              textShadow: `0 0 8px rgba(${rgb},0.8)`,
+              letterSpacing: '0.3em',
+              transition: 'color 1s ease',
+            }}
           >
             XYRON
           </p>
         </div>
-      </div>
+      </motion.div>
 
-      {/* Outer ripple rings (phase1 only) */}
+      {/* Outer ripple rings (phase1 only) — emotion color */}
       {phase === 'phase1' && [0, 1, 2].map(i => (
         <motion.div
           key={i}
-          className="absolute rounded-full border border-[rgba(255,32,32,0.4)]"
-          style={{ width: 280, height: 280 }}
+          className="absolute rounded-full"
+          style={{ width: 280, height: 280, border: `1px solid rgba(${rgb},0.4)` }}
           animate={{ scale: [1, 2.4], opacity: [0.5, 0] }}
           transition={{ duration: 2.5, repeat: Infinity, delay: i * 0.8, ease: 'easeOut' }}
         />
@@ -348,6 +444,11 @@ export function CinematicOrb({ phase }: Props) {
           transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
         />
       )}
+
+      {/* Audience mode HUD — shows during self-introduction, lingers 5s after */}
+      <AnimatePresence>
+        {showHUD && <AudienceHUD moduleCount={6} />}
+      </AnimatePresence>
     </motion.div>
   )
 }

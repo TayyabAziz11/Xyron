@@ -44,6 +44,10 @@ class CognitiveState:
     code_mode:        bool           = False
     active_project:   Optional[str]  = None
     active_file:      Optional[str]  = None
+    # Emotional cognition — mood state machine + detected emotion context
+    mood_state:       str            = "CALM"
+    emotion_label:    str            = "calmness"
+    emotion_energy:   float          = 0.5
     _lock:            threading.RLock = field(
         default_factory=threading.RLock, repr=False, compare=False,
     )
