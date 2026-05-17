@@ -36,8 +36,10 @@ import { useImHomeProtocol }   from '@/hooks/useImHomeProtocol'
 import type { Command, Draft } from '@/lib/types'
 import { ThoughtStream } from '@/components/ambient'
 import { CodeAssistantPanel } from '@/components/code/CodeAssistantPanel'
-import { useCognitiveState } from '@/hooks/useCognitiveState'
+import { useCognitiveState }  from '@/hooks/useCognitiveState'
 import { useThoughtGenerator } from '@/hooks/useThoughtGenerator'
+import { useEmotionState }    from '@/hooks/useEmotionState'
+import { ORB_VARIANTS }       from '@/state/emotionState'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -69,8 +71,23 @@ const IM_HOME_RE = /(?:xyron[\s,]+)?i(?:'m|\s+am)\s+(?:home|back)|i\s+just\s+(?:
 function VoiceOrb({ isListening, isSpeaking, isProcessing, onClick }: {
   isListening: boolean; isSpeaking: boolean; isProcessing: boolean; onClick: () => void
 }) {
-  const barsRef = useRef<HTMLDivElement[]>([])
-  const rafRef  = useRef<number>(0)
+  const barsRef   = useRef<HTMLDivElement[]>([])
+  const rafRef    = useRef<number>(0)
+  const emotion   = useEmotionState()
+  const variant   = ORB_VARIANTS[emotion.mood_state] ?? ORB_VARIANTS.CALM
+
+  // Session state wins for listening — keep green as a clear "mic open" signal.
+  // For speaking/idle, emotion color drives the orb so HYPED → vivid red, EXCITED → orange, etc.
+  const orbColor  = isListening ? '#00ff88' : isProcessing ? '#00ffff' : variant.primaryColor
+  const gi        = variant.glowIntensity            // 0.35–1.0
+  const breathDur = `${variant.duration}s`           // 0.9s for HYPED → 4.5s for CALM
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      console.log(`[EMOTION_UI] received state=${emotion.mood_state}`)
+      console.log(`[ORB_STATE] applied variant=${emotion.mood_state}`)
+    }
+  }, [emotion.mood_state])
 
   useEffect(() => {
     const animate = () => {
@@ -86,37 +103,42 @@ function VoiceOrb({ isListening, isSpeaking, isProcessing, onClick }: {
     return () => cancelAnimationFrame(rafRef.current)
   }, [isListening, isSpeaking])
 
-  const orbColor = isListening ? '#00ff88' : isSpeaking ? '#a78bfa' : isProcessing ? '#00ffff' : '#ff2020'
-
   return (
     <div className="relative flex items-center justify-center w-64 h-64 mx-auto cursor-pointer select-none" onClick={onClick}>
-      {/* Outer ambient glow */}
+      {/* Outer ambient glow — scales with glowIntensity */}
       <div className="absolute inset-0 rounded-full"
-        style={{ background: `radial-gradient(circle, ${orbColor}08 0%, transparent 70%)`, animation: 'orbBreath 3s ease-in-out infinite' }} />
+        style={{
+          background: `radial-gradient(circle, ${orbColor}${Math.round(gi * 20).toString(16).padStart(2,'0')} 0%, transparent 70%)`,
+          animation: `orbBreath ${breathDur} ease-in-out infinite`,
+        }} />
 
       {/* Ring 1 — slowest */}
       <div className="absolute rounded-full border-2 w-60 h-60"
-        style={{ borderColor: `${orbColor}20`, boxShadow: `0 0 24px ${orbColor}10`, animation: 'spinSlow 18s linear infinite' }} />
+        style={{ borderColor: `${orbColor}20`, boxShadow: `0 0 ${Math.round(24 * gi)}px ${orbColor}10`, animation: 'spinSlow 18s linear infinite' }} />
 
       {/* Ring 2 */}
       <div className="absolute rounded-full border w-52 h-52"
-        style={{ borderColor: `${orbColor}30`, boxShadow: `0 0 16px ${orbColor}15`, animation: 'spinSlow 12s linear infinite reverse' }} />
+        style={{ borderColor: `${orbColor}30`, boxShadow: `0 0 ${Math.round(16 * gi)}px ${orbColor}15`, animation: 'spinSlow 12s linear infinite reverse' }} />
 
-      {/* Ring 3 */}
+      {/* Ring 3 — breathes at emotion speed */}
       <div className="absolute rounded-full border-2 w-44 h-44"
-        style={{ borderColor: `${orbColor}40`, boxShadow: `0 0 20px ${orbColor}20`, animation: 'orbBreath 2.4s ease-in-out infinite' }} />
+        style={{ borderColor: `${orbColor}40`, boxShadow: `0 0 ${Math.round(20 * gi)}px ${orbColor}20`, animation: `orbBreath ${breathDur} ease-in-out infinite` }} />
 
-      {/* Ring 4 */}
+      {/* Ring 4 — breathes slightly offset */}
       <div className="absolute rounded-full w-36 h-36"
-        style={{ border: `2px solid ${orbColor}55`, boxShadow: `0 0 30px ${orbColor}30, inset 0 0 20px ${orbColor}10`, animation: 'orbBreath 2s ease-in-out infinite 0.3s' }} />
+        style={{
+          border: `2px solid ${orbColor}55`,
+          boxShadow: `0 0 ${Math.round(30 * gi)}px ${orbColor}30, inset 0 0 ${Math.round(20 * gi)}px ${orbColor}10`,
+          animation: `orbBreath ${breathDur} ease-in-out infinite 0.3s`,
+        }} />
 
-      {/* Core orb */}
+      {/* Core orb — full emotion glow */}
       <div className="relative flex items-center justify-center w-28 h-28 rounded-full z-10"
         style={{
           background: `radial-gradient(circle at 35% 30%, ${orbColor}40, ${orbColor}10 60%, transparent)`,
-          boxShadow: `0 0 40px ${orbColor}50, 0 0 80px ${orbColor}20, inset 0 0 20px ${orbColor}15`,
+          boxShadow: `0 0 ${Math.round(40 * gi)}px ${orbColor}50, 0 0 ${Math.round(80 * gi)}px ${orbColor}20, inset 0 0 ${Math.round(20 * gi)}px ${orbColor}15`,
           border: `1.5px solid ${orbColor}60`,
-          animation: 'orbBreath 2.2s ease-in-out infinite',
+          animation: `orbBreath ${breathDur} ease-in-out infinite`,
         }}>
         {/* Specular */}
         <div className="absolute w-10 h-10 top-3 left-3 rounded-full"
@@ -132,7 +154,7 @@ function VoiceOrb({ isListening, isSpeaking, isProcessing, onClick }: {
         </div>
       </div>
 
-      {/* Ripple rings when listening */}
+      {/* Ripple rings when listening or speaking */}
       <AnimatePresence>
         {(isListening || isSpeaking) && [0, 1, 2].map(i => (
           <motion.div key={i}
@@ -140,7 +162,7 @@ function VoiceOrb({ isListening, isSpeaking, isProcessing, onClick }: {
             initial={{ opacity: 0.6, scale: 0.5 }}
             animate={{ opacity: 0, scale: 1.9 + i * 0.3 }}
             exit={{ opacity: 0 }}
-            transition={{ duration: 2, repeat: Infinity, delay: i * 0.6, ease: 'easeOut' }}
+            transition={{ duration: variant.duration * 2, repeat: Infinity, delay: i * 0.6, ease: 'easeOut' }}
             style={{ width: 112, height: 112, border: `1px solid ${orbColor}60` }} />
         ))}
       </AnimatePresence>
@@ -313,6 +335,7 @@ export default function CommandCenterPage() {
   const [activeProfile, setActiveProfile] = useState('assistant')
   const [clock, setClock]                 = useState('')
   const [clockDate, setClockDate]         = useState('')
+  const [rvcTier, setRvcTier]             = useState<'passthrough'|'lightweight'|'full_rvc'>('passthrough')
   const spokenIdRef = useRef<string | null>(null)
   const inputRef    = useRef<HTMLInputElement>(null)
 
@@ -325,6 +348,19 @@ export default function CommandCenterPage() {
     }
     tick()
     const t = setInterval(tick, 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  // RVC status — fetch once on mount, refresh every 30s
+  useEffect(() => {
+    const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:8000'
+    const load = () =>
+      fetch(`${API_BASE}/api/v1/voice/rvc-status`)
+        .then(r => r.json())
+        .then(d => { if (d?.data?.tier) setRvcTier(d.data.tier) })
+        .catch(() => {})
+    load()
+    const t = setInterval(load, 30_000)
     return () => clearInterval(t)
   }, [])
 
@@ -612,6 +648,9 @@ export default function CommandCenterPage() {
                           style={{ animation: isListening ? 'svgWave 0.8s ease-in-out infinite' : 'svgWave 2s ease-in-out infinite' }}
                         />
                       </svg>
+                      <p className="font-mono text-[9px] tracking-widest opacity-40 mt-1">
+                        {rvcTier === 'full_rvc' ? 'KOKORO + RVC' : rvcTier === 'lightweight' ? 'KOKORO + RVC LITE' : 'KOKORO + FX'}
+                      </p>
                     </div>
 
                     {/* Mic control buttons */}

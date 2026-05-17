@@ -37,14 +37,35 @@ logger = logging.getLogger(__name__)
 _WHISPER_CONF_THRESHOLD = -1.2   # env: WHISPER_CONFIDENCE_THRESHOLD overrides per-segment;
                                   # this guards the pipeline-level overall confidence
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_EN = (
     "You are Xyron, a voice AI assistant built by Tayyab Aziz. "
     "You were NOT built by OpenAI. "
-    "Reply in English only. Be natural and conversational. "
+    "Be natural and conversational, like a helpful friend. "
     "Keep replies under 2 sentences for voice output. "
-    "Never use markdown, bullet points, or formatting. "
-    "The user may speak Urdu, Hindi, or Roman Urdu — always understand intent and reply in English."
+    "Never use markdown, bullet points, or formatting."
 )
+
+_SYSTEM_PROMPT_UR = (
+    "Tum Xyron ho, ek voice AI assistant jo Tayyab Aziz ne banaya hai. "
+    "Tum OpenAI ke nahi ho. "
+    "User Roman Urdu ya mixed Urdu/English mein bol raha hai. "
+    "Usi andaaz mein jawab do — Roman Urdu mein, natural aur friendly. "
+    "2 sentences se zyada mat bolna. Markdown mat likhna."
+)
+
+_SYSTEM_PROMPT_MIXED = (
+    "You are Xyron, a voice AI assistant built by Tayyab Aziz. "
+    "The user mixes Urdu and English. Match their style naturally. "
+    "Short, warm, 2 sentences max. No markdown."
+)
+
+
+def _get_system_prompt(detected_language: Optional[str] = None) -> str:
+    if detected_language in ("urdu", "roman_urdu"):
+        return _SYSTEM_PROMPT_UR
+    if detected_language == "mixed":
+        return _SYSTEM_PROMPT_MIXED
+    return _SYSTEM_PROMPT_EN
 
 # Tools whose output is already self-explanatory — skip AI narration
 _NARRATE_SKIP = frozenset({
@@ -113,6 +134,34 @@ async def voice_pipeline(
     except Exception:
         normalized = transcript
 
+    # ── 2b. Multilingual normalization (Roman Urdu / mixed → English intent) ─
+    detected_language: Optional[str] = None
+    try:
+        from cognition.language_detector import detect as _detect_lang
+        _lang_result = _detect_lang(transcript)
+        detected_language = _lang_result["language"]
+        logger.info("[MULTI] raw=%r detected=%s conf=%.2f",
+                    transcript[:60], detected_language, _lang_result["confidence"])
+    except Exception as exc:
+        logger.debug("[MULTI] language detection failed: %s", exc)
+
+    try:
+        from cognition.text_normalizer import normalize as _ml_normalize
+        _ml_normalized = _ml_normalize(normalized)
+        if _ml_normalized != normalized:
+            logger.info("[MULTI] normalized=%r → %r", normalized[:60], _ml_normalized[:60])
+        normalized = _ml_normalized
+    except Exception as exc:
+        logger.debug("[MULTI] text normalization failed: %s", exc)
+
+    # Persist language mode for this session
+    if detected_language and session_id:
+        try:
+            from .memory_service import memory_service as _ms
+            _ms.set_language_mode(session_id, detected_language)
+        except Exception:
+            pass
+
     # ── 3. Context resolve ───────────────────────────────────────────────────
     try:
         from .window_context import window_context
@@ -137,7 +186,11 @@ async def voice_pipeline(
         if route.tool_name and route.confidence >= 0.65 and route.tier <= 2:
             tool_name   = route.tool_name
             tool_params = dict(route.params or {})
-            logger.debug("[Pipeline] intent-router tier=%d → %s", route.tier, tool_name)
+            logger.info("[MULTI] intent=%s (conf=%.2f tier=%d) text=%r",
+                        tool_name, route.confidence, route.tier, resolved[:60])
+        else:
+            logger.info("[MULTI] intent=unmatched (best=%.2f) text=%r",
+                        getattr(route, "confidence", 0.0), resolved[:60])
     except Exception as exc:
         logger.debug("[Pipeline] IntentRouter error: %s", exc)
 
@@ -175,17 +228,23 @@ async def voice_pipeline(
 
     # ── 5. Execute tool ──────────────────────────────────────────────────────
     tool_output: Optional[str] = None
+    tool_success: bool = False
     if tool_name and tool_name not in ("general_query", "confirm_draft", "reject_draft"):
         try:
             from api.tools.registry import registry as _registry
             if tool_name in _registry:
                 ctx    = {"openai_key": openai_key or _get_api_key(), "active_window": active_window}
                 result = await asyncio.to_thread(_registry.execute, tool_name, tool_params, ctx)
-                tool_output = result.spoken or result.text or None
-                logger.debug("[Pipeline] tool %r → %r", tool_name, (tool_output or "")[:80])
+                tool_output  = result.spoken or result.text or None
+                tool_success = result.success if hasattr(result, "success") else bool(tool_output)
+                logger.info("[MULTI] tool=%s executed=%s result=%r",
+                            tool_name, tool_success, (tool_output or "")[:80])
+            else:
+                logger.warning("[MULTI] tool=%s NOT in registry — execution skipped", tool_name)
         except Exception as exc:
             logger.warning("[Pipeline] Tool %r failed: %s", tool_name, exc)
             tool_output = f"Tool error: {exc}"
+            tool_success = False
 
     # ── 6. Generate + validate response ──────────────────────────────────────
     ai_text     = ""
@@ -194,12 +253,15 @@ async def voice_pipeline(
         ai_text, model_used = await asyncio.to_thread(
             _generate_and_validate,
             resolved, tool_name, tool_output, model_choice, complexity,
+            detected_language, tool_success,
         )
     except Exception as exc:
         logger.warning("[Pipeline] Response generation failed: %s", exc)
         ai_text    = tool_output or "Done."
         model_used = model_choice
 
+    logger.info("[MULTI] response_lang=%s model=%s response=%r",
+                detected_language or "unknown", model_used, ai_text[:80])
     yield _chunk({"type": "response", "text": ai_text, "model": model_used})
 
     # ── 7. TTS ───────────────────────────────────────────────────────────────
@@ -267,24 +329,30 @@ def _stt(audio_bytes: bytes, content_type: str, language: Optional[str]) -> tupl
 
 
 def _generate_and_validate(
-    text:         str,
-    tool_name:    Optional[str],
-    tool_output:  Optional[str],
-    model_choice: str,
-    complexity:   float,
+    text:              str,
+    tool_name:         Optional[str],
+    tool_output:       Optional[str],
+    model_choice:      str,
+    complexity:        float,
+    detected_language: Optional[str] = None,
+    tool_success:      bool = True,
 ) -> tuple[str, str]:
     """
     Generate a spoken reply and validate quality.
 
     Returns (response_text, model_actually_used).
-    If gpt-4o-mini produces a bad response, retries with gpt-4o.
     """
     from .openai_client import openai_client
-    from .response_validator import validate, validate_and_retry
 
-    # Self-explanatory tool output → skip AI narration
-    if tool_name in _NARRATE_SKIP and tool_output:
-        return tool_output[:150], "local"
+    # Self-explanatory tool output — use AI to mirror the response language
+    if tool_name in _NARRATE_SKIP:
+        if tool_output and detected_language in ("urdu", "roman_urdu", "mixed"):
+            # Let AI rephrase in user's language
+            pass  # fall through to AI generation below
+        elif tool_output:
+            return tool_output[:150], "local"
+        elif not tool_success and tool_name:
+            return f"{tool_name.replace('_', ' ')} failed.", "local"
 
     # Local / no-LLM path
     if model_choice == "local":
@@ -296,37 +364,44 @@ def _generate_and_validate(
 
     # Offline path
     if model_choice == "offline" or not openai_client.available:
-        fallback = _offline_response(text, tool_output)
+        fallback = _offline_response(text, tool_output, detected_language)
         return fallback, "offline"
 
-    # Build messages
-    messages = _build_messages(text, tool_output)
-    model: str = model_choice if model_choice in ("gpt-4o", "gpt-4o-mini") else "gpt-4o-mini"
-
+    # Build language-aware messages
+    messages = _build_messages(text, tool_output, detected_language, tool_success)
     reply = openai_client.generate(messages, model="gpt-4o-mini", max_tokens=120)  # type: ignore[arg-type]
 
     if not reply:
-        return _offline_response(text, tool_output), "offline"
+        return _offline_response(text, tool_output, detected_language), "offline"
 
-    # gpt-4o upgrade permanently disabled — costs 17× more with no measurable quality gain
-    # for the short (≤120 token) spoken responses this pipeline produces.
     return reply, "gpt-4o-mini"
 
 
-def _build_messages(text: str, tool_output: Optional[str]) -> list[dict]:
-    """Build the OpenAI messages list with optional tool result context."""
+def _build_messages(
+    text:              str,
+    tool_output:       Optional[str],
+    detected_language: Optional[str] = None,
+    tool_success:      bool = True,
+) -> list[dict]:
+    """Build the OpenAI messages list with language-aware system prompt."""
+    system = _get_system_prompt(detected_language)
     try:
         from api.services.memory_service import memory_service
         facts = memory_service.get_context_string()
-        system = _SYSTEM_PROMPT + (f"\n\n{facts}" if facts else "")
+        if facts:
+            system = system + f"\n\n{facts}"
     except Exception:
-        system = _SYSTEM_PROMPT
+        pass
 
     if tool_output:
+        summarise_instruction = (
+            "Ro mein jawab do." if detected_language in ("urdu", "roman_urdu")
+            else "Summarise in 1-2 natural spoken sentences."
+        )
         user_content = (
             f"User said: '{text}'\n"
             f"Result: {tool_output[:300]}\n\n"
-            "Summarise in 1-2 natural spoken sentences."
+            f"{summarise_instruction}"
         )
     else:
         user_content = text
@@ -337,10 +412,27 @@ def _build_messages(text: str, tool_output: Optional[str]) -> list[dict]:
     ]
 
 
-def _offline_response(text: str, tool_output: Optional[str]) -> str:
-    """Offline fallback — stub for future Ollama integration."""
+# Roman Urdu confirmations for common tools — used by Ollama / offline path
+_UR_CONFIRMS: dict[str, str] = {
+    "open_application":     "khol diya.",
+    "open_system_settings": "Settings khol diye.",
+    "volume_control":       "Volume adjust kar diya.",
+    "take_screenshot":      "Screenshot le liya.",
+    "get_battery_status":   "Battery status check kar liya.",
+    "lock_system":          "Screen lock kar diya.",
+    "close_window":         "Window band kar di.",
+}
+
+
+def _offline_response(
+    text:              str,
+    tool_output:       Optional[str],
+    detected_language: Optional[str] = None,
+) -> str:
+    """Offline fallback with language-aware canned responses."""
     from .openai_client import offline_generate
-    result = offline_generate(text)
+    system = _get_system_prompt(detected_language)
+    result = offline_generate(text, system=system)
     if result:
         return result
     if tool_output:

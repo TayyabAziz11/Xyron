@@ -448,8 +448,24 @@ class CommandService:
         except Exception:
             normalized = text
 
+        # Phase 4: multilingual normalization — Roman Urdu / mixed input → English intent
+        try:
+            from cognition.text_normalizer import normalize as _ml_normalize
+            normalized = _ml_normalize(normalized)
+        except Exception:
+            pass
+
         intent = classify_intent(normalized)
         cmd    = Command(text=text, status=CommandStatus.queued, intent=intent)
+
+        # Phase 9: persist detected language so response generator can match it
+        try:
+            from cognition.language_detector import detect as _detect_lang
+            _lang_result = _detect_lang(text)
+            from .memory_service import memory_service as _ms
+            _ms.set_language_mode(cmd.id, _lang_result["language"])
+        except Exception:
+            pass
 
         with self._lock:
             self._store[cmd.id] = cmd
