@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -32,12 +33,45 @@ DB_PATH = DB_DIR / "fs_index.db"
 # Build scan roots from env var or fall back to sensible defaults.
 # On WSL2, Windows drives appear as /mnt/d, /mnt/e etc — include only those that exist.
 # On native Linux/macOS, only ~/ is used unless FS_SCAN_ROOTS overrides.
+
+def _is_readable(p: Path) -> bool:
+    """Return True only for accessible directories — filters dead WSL mounts."""
+    try:
+        return p.is_dir() and bool(os.listdir(str(p)))
+    except OSError:
+        return False
+
+
+def _detect_win_user_home() -> "Path | None":
+    """Return Windows user home (e.g. /mnt/c/Users/muham) via %USERPROFILE%."""
+    try:
+        r = subprocess.run(
+            ["/mnt/c/Windows/System32/cmd.exe", "/c", "echo", "%USERPROFILE%"],
+            capture_output=True, text=True, timeout=3,
+        )
+        raw = r.stdout.strip()
+        if raw and "%" not in raw:
+            # raw = "C:\Users\muham" → /mnt/c/Users/muham
+            wsl = "/mnt/" + raw[0].lower() + "/" + raw[3:].replace("\\", "/")
+            p = Path(wsl)
+            if p.is_dir():
+                return p
+    except Exception:
+        pass
+    return None
+
+
 _env_roots = os.getenv("FS_SCAN_ROOTS", "")
 if _env_roots:
     SCAN_ROOTS: List[Path] = [Path(p.strip()) for p in _env_roots.split(",") if p.strip()]
 else:
     _candidates = [Path("/mnt/d"), Path("/mnt/e"), Path("/mnt/f"), Path("/mnt/g")]
-    SCAN_ROOTS = [p for p in _candidates if p.exists()] + [Path.home()]
+    _win_home = _detect_win_user_home()
+    SCAN_ROOTS = [p for p in _candidates if _is_readable(p)]
+    if _win_home:
+        SCAN_ROOTS.append(_win_home)
+    if not SCAN_ROOTS:
+        SCAN_ROOTS.append(Path.home())
 
 PRUNE_DIRS = {
     "node_modules",
@@ -54,7 +88,7 @@ PRUNE_DIRS = {
 }
 
 REBUILD_INTERVAL_SECONDS = 6 * 3600  # 6 hours
-STARTUP_DELAY_SECONDS = 30           # wait before first build on startup
+STARTUP_DELAY_SECONDS = 5            # wait before first build on startup
 
 DDL = """
 CREATE TABLE IF NOT EXISTS entries (

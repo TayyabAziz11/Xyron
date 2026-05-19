@@ -1339,6 +1339,73 @@ _OPEN_NAMED_FILE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches "open X folder in Y drive" — preserves drive context that plain _OPEN_NAMED_FOLDER_RE drops.
+# Trailing [.!?,]* handles Whisper adding a period to the end of transcriptions.
+_OPEN_FOLDER_IN_DRIVE_RE = re.compile(
+    r'\b(?:open|show(?:\s+me)?|go\s+to|navigate\s+to)\s+'
+    r'(?:(?:the|that|my|this)\s+)?'
+    r'(.+?)\s+folder'
+    r'\s+(?:in|on|from|at)\s+(?:(?:the|my)\s+)?([a-z])\s*(?:drive|disk|:)[.!?,\s]*$',
+    re.IGNORECASE,
+)
+
+# Matches "find X folder", "locate X file" — stops at the word folder/file/dir.
+# Drive context is extracted separately from body.text so "in the drive" / "deep drive" mishears
+# don't break the match; the drive letter is optional and never prepended to the search query.
+_FIND_ITEM_RE = re.compile(
+    r'\b(?:find|locate|search\s+for|where\s+(?:is|are)|where\'s|show\s+me)\s+'
+    r'(?:(?:the|my|a|an)\s+)?'
+    r'(.+?)'
+    r'\s+(?:folder|directory|file|dir)\b',
+    re.IGNORECASE,
+)
+# Used alongside _FIND_ITEM_RE to optionally extract explicit drive letter from the full command.
+_FIND_DRIVE_RE = re.compile(
+    r'\b(?:in|on)\s+(?:(?:the|my)\s+)?([a-z])\s*(?:drive|disk|:)\b',
+    re.IGNORECASE,
+)
+
+# Matches rename commands:
+#   "rename it alpha" / "rename it to alpha"     → new_name only, path from last action
+#   "rename folder alpha to beta on D drive"      → old_name=alpha, new_name=beta, drive=D
+#   "rename alpha to beta"                        → old_name=alpha, new_name=beta
+_RENAME_RE = re.compile(
+    r'\b(?:rename)\s+'
+    r'(?:(?:this|that|it|the)\s+)?'
+    r'(?:(?:folder|file|directory)\s+)?'
+    r'(?:(?P<old_name>(?!(?:to|into|as)\b)[a-zA-Z0-9_\-\.]{2,40})\s+(?:to|into)\s+)?'
+    r'(?:(?:to|as|into)\s+)?'
+    r'(?P<new_name>[a-zA-Z0-9_\-\.]+(?:\s+[a-zA-Z0-9_\-\.]+){0,2})'
+    r'(?:\s+(?:in|on)\s+(?:(?:the|my)\s+)?(?P<drive>[a-z])\s*(?:drive|disk|:))?[.!?,\s]*$',
+    re.IGNORECASE,
+)
+# "change the [folder] name [to/into] X" — "to/into" is optional (user may omit it)
+# Negative lookahead stops prepositions (in, on, at, the) from being captured as the new name.
+_CHANGE_NAME_RE = re.compile(
+    r'\bchange\s+(?:the\s+)?(?:folder\s+|file\s+|its\s+)?name\s+(?:(?:to|into)\s+)?'
+    r'(?!(?:in|on|at|for|the|a)\b)'
+    r'(?P<new_name>[a-zA-Z0-9_\-\.]+(?:\s+[a-zA-Z0-9_\-\.]+){0,2})[.!?,\s]*$',
+    re.IGNORECASE,
+)
+# "change the folder name beta to alpha" — old name + new name explicitly given
+_CHANGE_NAME_OLD_NEW_RE = re.compile(
+    r'\bchange\s+(?:the\s+)?(?:folder\s+|file\s+|its\s+)?name\s+'
+    r'(?P<old_name>[a-zA-Z0-9_\-\.]+)\s+(?:to|into)\s+'
+    r'(?P<new_name>[a-zA-Z0-9_\-\.]+)[.!?,\s]*$',
+    re.IGNORECASE,
+)
+# "call it X" / "name it X" as standalone rename command (not inside create_folder flow)
+_CALL_IT_RENAME_RE = re.compile(
+    r'^(?:call|name)\s+it\s+(?P<new_name>[a-zA-Z0-9_\-\.]+(?:\s+[a-zA-Z0-9_\-\.]+){0,3})[.!?,\s]*$',
+    re.IGNORECASE,
+)
+# "beta folder in [the/D] drive" — implicit open, no verb required
+_IMPLICIT_OPEN_FOLDER_RE = re.compile(
+    r'^(?:(?:the|my|a|an)\s+)?([a-zA-Z0-9_\-\.][a-zA-Z0-9_\-\. ]*?)\s+folder\s+'
+    r'(?:in|on|at)\s+(?:(?:the|my)\s+)?(?:([a-z])\s+drive\b|drive\b)[.!?,\s]*$',
+    re.IGNORECASE,
+)
+
 _SYS_CONFIRM_RE = re.compile(
     r'\b(?:yes|confirm|proceed|go\s+ahead|do\s+it|sure|okay|ok|yep|affirmative)\b',
     re.IGNORECASE,
@@ -1587,7 +1654,7 @@ _RETRYABLE_TOOLS: dict[str, bool] = {
 # Fallback: if tool X fails validation, try tool Y instead
 # Format: tool_name → (fallback_tool, params_transformer)
 _TOOL_FALLBACKS: dict[str, tuple] = {
-    "open_application": ("smart_open", lambda p: {"query": p.get("app_name", p.get("name", "")), "type": "file"}),
+    "open_application": ("smart_open", lambda p: {"query": p.get("app_name", p.get("name", "")), "type": "any"}),
     "open_file":        ("smart_open", lambda p: {"query": p.get("path", "").split("/")[-1].split("\\")[-1]}),
     "open_directory":   ("smart_open", lambda p: {"query": p.get("path", "").split("/")[-1].split("\\")[-1], "type": "folder"}),
 }
@@ -3560,6 +3627,41 @@ async def respond_stream(body: _RespondStreamBody):
                     tool_params: dict     = {}
                     user_lower = body.text.lower().strip()
 
+                    # ── PENDING ACTION RESUME: pick up clarification from previous turn ─
+                    # When a tool asked "where should I create it?" and the user now
+                    # answers "D drive" or "desktop", complete the pending tool call.
+                    try:
+                        _pending = cognitive_state.snapshot().get("pending_action")
+                        if _pending and _pending.get("clarification_type") == "location":
+                            _pend_loc: str | None = None
+                            # bare "D drive" / "D:" / "desktop" / "in D drive"
+                            _pdm = re.search(
+                                r'(?:^|(?:in|on)\s+)(?:(?:the|my)\s+)?([a-z])\s*(?:drive|disk|:)?\s*$',
+                                user_lower, re.I,
+                            )
+                            if _pdm and _pdm.group(1).lower() in "abcdefghij":
+                                _pend_loc = _pdm.group(1).upper() + ":\\"
+                            elif re.search(
+                                r'\b(?:the|that|this)\s+drive\b|\bin\s+(?:the\s+)?drive\b',
+                                user_lower,
+                            ):
+                                # "in the drive" / "the drive" — no letter given, default D
+                                _pend_loc = "D:\\"
+                                logger.info("[PENDING] 'the drive' → D:\\")
+                            elif user_lower.strip() in ("desktop", "the desktop", "my desktop"):
+                                _pend_loc = "desktop"
+                            elif user_lower.strip() in ("documents", "my documents"):
+                                _pend_loc = "documents"
+                            elif user_lower.strip() in ("downloads", "my downloads"):
+                                _pend_loc = "downloads"
+                            if _pend_loc:
+                                cognitive_state.update(pending_action=None)
+                                tool_name = _pending["tool"]
+                                tool_params = {**_pending["params"], "path": _pend_loc}
+                                logger.info("[PENDING] resuming %s with path=%r", tool_name, _pend_loc)
+                    except Exception:
+                        pass
+
                     # ── MULTI-COMMAND: split compound requests and execute each ─
                     try:
                         from ..services.command_splitter import split as _cmd_split
@@ -3607,6 +3709,124 @@ async def respond_stream(body: _RespondStreamBody):
                             tool_name   = "smart_open"
                             tool_params = {"query": _q2, "type": "video"}
                             logger.info("[ROUTE] smart_open (video pre-workflow) → %r", _q2)
+                    # Fix 1: "open X folder in Y drive" — extract drive letter so it is not lost
+                    elif _OPEN_FOLDER_IN_DRIVE_RE.search(body.text):
+                        _ofid = _OPEN_FOLDER_IN_DRIVE_RE.search(body.text)
+                        _fld2  = re.sub(r'^(?:my|the|a)\s+', '', (_ofid.group(1) or "").strip(), flags=re.I).lower()
+                        _drv2  = (_ofid.group(2) or "").upper()
+                        if _fld2 and _drv2:
+                            _KNOWN_SYS_MAP = {
+                                "music": "Music", "musics": "Music",
+                                "downloads": "Downloads", "download": "Downloads",
+                                "documents": "Documents", "document": "Documents",
+                                "desktop": "Desktop",
+                                "pictures": "Pictures", "picture": "Pictures",
+                                "photos": "Pictures", "photo": "Pictures",
+                                "videos": "Videos", "video": "Videos",
+                            }
+                            _sys_name = _KNOWN_SYS_MAP.get(_fld2)
+                            if _sys_name:
+                                tool_name   = "open_directory"
+                                tool_params = {"path": f"{_drv2}:\\{_sys_name}"}
+                                logger.info("[ROUTE] open_directory (sys+drive L-1) → %s:\\%s", _drv2, _sys_name)
+                            else:
+                                tool_name   = "smart_open"
+                                tool_params = {"query": _fld2, "type": "folder"}
+                                logger.info("[ROUTE] smart_open (folder+drive L-1) → %r drive=%s", _fld2, _drv2)
+
+                    # Fix 2: "find/locate/where is X folder" → smart_open
+                    # Drive is extracted separately and NEVER prepended to the query —
+                    # smart_open searches by name; prepending would make it a literal path lookup.
+                    elif _FIND_ITEM_RE.search(body.text):
+                        _fit2   = _FIND_ITEM_RE.search(body.text)
+                        _fq2    = (_fit2.group(1) or "").strip()
+                        _raw2   = _fit2.group(0).lower()
+                        _ftype2 = "folder" if re.search(r'\b(?:folder|directory|dir)\b', _raw2) else "file"
+                        # Extract drive letter separately (doesn't break match if missing/vague)
+                        _fdrv_m = _FIND_DRIVE_RE.search(body.text)
+                        _fdrv2  = (_fdrv_m.group(1).upper()) if _fdrv_m else ""
+                        if _fq2:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _fq2, "type": _ftype2}
+                            logger.info("[ROUTE] smart_open (find L-1) → %r type=%s drive=%s",
+                                        _fq2, _ftype2, _fdrv2 or "any")
+
+                    # Implicit open: "beta folder in [the/D] drive" (no verb)
+                    elif _IMPLICIT_OPEN_FOLDER_RE.search(body.text):
+                        _iof   = _IMPLICIT_OPEN_FOLDER_RE.search(body.text)
+                        _iof_q = (_iof.group(1) or "").strip()
+                        _iof_d = (_iof.group(2) or "").upper()
+                        if _iof_q:
+                            tool_name   = "smart_open"
+                            tool_params = {"query": _iof_q, "type": "folder"}
+                            logger.info("[ROUTE] smart_open (implicit folder L-1) → %r drive=%s",
+                                        _iof_q, _iof_d or "any")
+
+                    # Fix 3: rename commands → rename_file
+                    # _CHANGE_NAME_OLD_NEW_RE checked FIRST — captures old + new explicitly
+                    elif (_RENAME_RE.search(body.text)
+                            or _CHANGE_NAME_OLD_NEW_RE.search(body.text)
+                            or _CHANGE_NAME_RE.search(body.text)
+                            or _CALL_IT_RENAME_RE.match(body.text.strip())):
+                        _ren_m = (_RENAME_RE.search(body.text)
+                                  or _CHANGE_NAME_OLD_NEW_RE.search(body.text)
+                                  or _CHANGE_NAME_RE.search(body.text)
+                                  or _CALL_IT_RENAME_RE.match(body.text.strip()))
+                        _new_name2 = (_ren_m.group("new_name") or "").strip().rstrip(".!?,").strip()
+                        _old_name2 = ""
+                        _ren_drive2 = ""
+                        try:
+                            _old_name2 = (_ren_m.group("old_name") or "").strip()
+                        except IndexError:
+                            pass
+                        try:
+                            _ren_drive2 = (_ren_m.group("drive") or "").upper()
+                        except IndexError:
+                            pass
+                        if _new_name2:
+                            _rename_path = ""
+                            _PRONOUNS = {"it", "this", "that", "the"}
+                            if _old_name2 and _old_name2.lower() not in _PRONOUNS:
+                                # Explicit source: "rename alpha to beta [in D drive]"
+                                if _ren_drive2:
+                                    _rename_path = f"{_ren_drive2}:\\{_old_name2}"
+                                else:
+                                    _rename_path = _old_name2  # bare name, rename_file will try to resolve
+                            else:
+                                # Use last opened/created item — check in-memory first, then SQL
+                                _la_for_rename = memory_service.get_last_action()
+                                if _la_for_rename:
+                                    _rp = _la_for_rename.get("params", {})
+                                    _rr = _la_for_rename.get("result", "")
+                                    _rename_path = (
+                                        _rp.get("_found_path") or
+                                        (_rr if (_rr and ("\\" in _rr or "/" in _rr)
+                                                 and not _rr.startswith("Opening")) else "") or
+                                        _rp.get("path") or ""
+                                    )
+                                # Fallback: scan episodic memory for last opened path
+                                if not _rename_path:
+                                    try:
+                                        _epi_turns = _epi_mem.recent(n=20)
+                                        _path_pat  = re.compile(
+                                            r'(?:open(?:ing|ed)|found)\s+((?:[A-Z]:\\|/mnt/[a-z]/)[\w\\\-\./ ]+)',
+                                            re.IGNORECASE,
+                                        )
+                                        for _t in _epi_turns:
+                                            _pm = _path_pat.search(_t.text)
+                                            if _pm:
+                                                _rename_path = _pm.group(1).rstrip(".")
+                                                logger.info("[RENAME] episodic fallback path=%r", _rename_path)
+                                                break
+                                    except Exception:
+                                        pass
+                            if _rename_path:
+                                tool_name   = "rename_file"
+                                tool_params = {"path": _rename_path, "new_name": _new_name2}
+                                logger.info("[ROUTE] rename_file path=%r → %r", _rename_path, _new_name2)
+                            else:
+                                logger.info("[ROUTE] rename skip — no path in context")
+
                     elif _OPEN_NAMED_FOLDER_RE.search(body.text):
                         _onf2 = _OPEN_NAMED_FOLDER_RE.search(body.text)
                         _q2   = (_onf2.group(1) or "").strip()
@@ -4456,6 +4676,20 @@ async def respond_stream(body: _RespondStreamBody):
                         # Determine if an early ack was already streamed (index 0 used)
                         _had_early_ack = tool_name in _DIRECT_SPOKEN_TOOLS
                         _result_idx    = 1 if _had_early_ack else 0
+
+                        # Fix 4: save pending_action when tool needs location clarification
+                        if (not result.success
+                                and isinstance(getattr(result, "data", None), dict)
+                                and result.data.get("needs_clarification")):
+                            try:
+                                cognitive_state.update(pending_action={
+                                    "tool": tool_name,
+                                    "params": tool_params,
+                                    "clarification_type": result.data.get("clarification_type", "location"),
+                                })
+                                logger.info("[PENDING] saved pending_action tool=%s", tool_name)
+                            except Exception:
+                                pass
 
                         # If tool itself failed with a spoken message, return it directly
                         # (e.g. screen reading with no API key — avoid double GPT call)

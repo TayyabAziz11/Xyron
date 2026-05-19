@@ -225,21 +225,33 @@ def _popen(argv: list[str]) -> None:
 
 def _launch(app_name: str) -> tuple[bool, str]:
     """Try to launch an application. Returns (success, message)."""
-    # Kick off Start Menu indexing in the background on first call
     _ensure_index()
+
+    # ── Priority 0: app_finder 4-source index (Start Menu + Registry + PATH + Store) ──
+    # Has full .lnk / .exe paths so cmd.exe /c start "" <path> always resolves correctly.
+    try:
+        from api.tools.core.app_finder import _search_index, _launch_via_interop
+        _entry, _match = _search_index(app_name)
+        if _entry is not None:
+            _path = _entry.get("path", "")
+            _name = _entry.get("name", app_name)
+            if _launch_via_interop(_path, _name):
+                logger.info("Launched (app_finder/%s): %s → %s", _match, app_name, _name)
+                return True, f"Opening {_name}…"
+    except Exception:
+        pass
 
     key   = _normalise(app_name)
     entry = _APP_MAP.get(key)
 
     try:
         if entry:
-            # ── Fast path: known app in _APP_MAP ─────────────────────────────
+            # ── Fast path: known app in _APP_MAP (ms-settings:// URIs, WSL tools) ──
             cmd = entry.get(_PLATFORM) or entry.get("linux", "")
             if not cmd:
                 return False, f"'{app_name}' is not supported on this platform."
             if _WSL:
                 cmd = cmd.replace("cmd.exe", _find_cmdexe())
-                # WSL: pass full string to shell=True — avoids split/rejoin mangling quotes
                 _popen([cmd])
             else:
                 _popen(cmd.split())
@@ -252,17 +264,9 @@ def _launch(app_name: str) -> tuple[bool, str]:
                 _popen([_find_cmdexe(), "/c", "start", "", lnk])
                 logger.info("Launched (start-menu): %s → %s", app_name, lnk)
             else:
-                # ── Fallback 2: PowerShell Start-Process (uses App Paths registry)
-                ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-                if not os.path.exists(ps):
-                    ps = "powershell.exe"
-                safe = app_name.replace("'", "''")
-                _popen([
-                    ps, "-WindowStyle", "Hidden",
-                    "-NonInteractive", "-Command",
-                    f"Start-Process '{safe}'",
-                ])
-                logger.info("Launched (powershell): %s", app_name)
+                # ── Fallback 2: cmd.exe start (uses App Paths registry) ────────
+                _popen([_find_cmdexe(), "/c", "start", "", app_name])
+                logger.info("Launched (cmd-start): %s", app_name)
         else:
             return False, f"Unknown app '{app_name}'."
 

@@ -15,12 +15,49 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import os
+import subprocess
 import time
 from typing import Any
 
 from .ps_runner import ToolResult, run_ps
 
 logger = logging.getLogger(__name__)
+
+# ── WSL2 interop launcher ─────────────────────────────────────────────────────
+
+_CMDEXE = "/mnt/c/Windows/System32/cmd.exe"
+if not os.path.isfile(_CMDEXE):
+    _CMDEXE = "cmd.exe"
+
+# Hardcoded aliases for apps the dynamic index misses or mis-names
+_HARDCODED_APPS: dict[str, dict[str, str]] = {
+    "microsoft store": {"name": "Microsoft Store", "path": r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App", "source": "hardcoded"},
+    "windows store":   {"name": "Microsoft Store", "path": r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App", "source": "hardcoded"},
+    "store":           {"name": "Microsoft Store", "path": r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App", "source": "hardcoded"},
+    "microsoft edit":  {"name": "Microsoft Edit",  "path": "edit.exe",                                                    "source": "hardcoded"},
+    "edit":            {"name": "Microsoft Edit",  "path": "edit.exe",                                                    "source": "hardcoded"},
+}
+
+
+def _launch_via_interop(win_path: str, fallback_name: str = "") -> bool:
+    """
+    Launch a Windows app via WSL2 interop daemon — routes to the correct desktop session.
+    Uses cmd.exe /c start "" path, same as system.py:_popen() approach.
+    """
+    try:
+        target = win_path or fallback_name
+        if not target:
+            return False
+        subprocess.Popen(
+            [_CMDEXE, "/c", "start", "", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
 
 # ── App index ─────────────────────────────────────────────────────────────────
 
@@ -157,9 +194,13 @@ async def build_app_index() -> None:
 def _search_index(query: str) -> tuple[dict[str, str] | None, str]:
     """
     Search _APP_INDEX.  Returns (entry, match_type) or (None, '').
-    Priority: exact → starts_with → contains → fuzzy (cutoff 0.6).
+    Priority: hardcoded → exact → starts_with → contains → fuzzy (cutoff 0.6).
     """
     q = query.lower().strip()
+
+    # 0. Hardcoded aliases (Microsoft Store, Edit, etc.)
+    if q in _HARDCODED_APPS:
+        return _HARDCODED_APPS[q], "exact"
 
     # 1. Exact
     if q in _APP_INDEX:
@@ -212,77 +253,33 @@ async def find_app(name: str) -> ToolResult:
 
 # ── launch_app ────────────────────────────────────────────────────────────────
 
-def _is_store_uri(path: str) -> bool:
-    return path.startswith("shell:AppsFolder")
-
-
-async def _verify_launched(process_name: str) -> bool:
-    """Return True if a process matching name appeared within 2 s."""
-    safe = process_name.replace("'", "''")
-    script = (
-        f"$p = Get-Process -ErrorAction SilentlyContinue | "
-        f"Where-Object {{ $_.Name -like '*{safe}*' }}; "
-        "if ($p) { 'running' } else { 'not_found' }"
-    )
-    for _ in range(2):
-        await asyncio.sleep(1)
-        r = await run_ps(script, timeout=5.0)
-        if r.success and "running" in r.message:
-            return True
-    return False
-
-
 async def launch_app(name: str) -> ToolResult:
     """
-    Find and launch an application by name.
+    Find and launch an application by name via WSL2 interop.
 
-    Launch strategy:
-      - Store URI  → Start-Process "shell:AppsFolder\\..."
-      - .lnk/.exe  → Start-Process "path"
-      - Fallback   → Start-Process name directly (works for built-ins like notepad)
+    Uses cmd.exe /c start "" path — routes through the correct Windows desktop session.
+    Falls back to launching the raw name when find_app returns nothing.
     """
     found = await find_app(name)
 
     if found.success:
-        app_name  = found.data["name"]
-        app_path  = found.data["path"]
-        app_src   = found.data["source"]
-
-        if _is_store_uri(app_path):
-            safe_path = app_path.replace("'", "''")
-            script = f"Start-Process '{safe_path}'; Write-Output 'launched'"
-        elif app_path:
-            safe_path = app_path.replace("'", "''")
-            script = f"Start-Process '{safe_path}'; Write-Output 'launched'"
-        else:
-            # registry entry with no path — try name directly
-            safe_name = app_name.replace("'", "''")
-            script = f"Start-Process '{safe_name}'; Write-Output 'launched'"
+        app_name = found.data["name"]
+        app_path = found.data["path"]
+        app_src  = found.data["source"]
     else:
-        # Last resort: try Start-Process with raw name
         app_name = name
+        app_path = ""
         app_src  = "direct"
-        safe_name = name.replace("'", "''")
-        script = f"Start-Process '{safe_name}' -ErrorAction Stop; Write-Output 'launched'"
 
-    result = await run_ps(script, timeout=10.0, risk="medium")
-    if not result.success:
-        msg = f"Failed to launch '{app_name}': {result.message}"
+    ok = _launch_via_interop(app_path, app_name)
+    if not ok:
+        msg = f"Failed to launch '{app_name}'"
         return ToolResult.failure(msg, spoken=f"Could not open {app_name}", error_code="LAUNCH_FAILED")
-
-    # Best-effort verification (non-blocking — don't fail if we can't confirm)
-    proc_name = app_name.split()[0].replace(".exe", "").replace(".lnk", "")
-    confirmed = await _verify_launched(proc_name)
 
     spoken = f"Opened {app_name}"
     return ToolResult.ok(
-        f"Launched '{app_name}' (confirmed={confirmed})",
+        f"Launched '{app_name}'",
         spoken=spoken,
-        data={
-            "name":      app_name,
-            "path":      app_path if found.success else name,
-            "source":    app_src,
-            "confirmed": confirmed,
-        },
+        data={"name": app_name, "path": app_path, "source": app_src},
         risk="medium",
     )
