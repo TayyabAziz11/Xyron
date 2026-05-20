@@ -133,7 +133,11 @@ class IntentRouter:
         self._np = None
         self._classifier_ready = False
         self._build_rules()
-        threading.Thread(target=self._load_classifier, daemon=True, name="intent-classifier").start()
+        import os as _os_ir
+        if _os_ir.getenv("LOCAL_ONLY_MODE", "").lower() in ("1", "true", "yes"):
+            logger.info("[IntentRouter] LOCAL_ONLY_MODE=true — skipping SentenceTransformer load (no HuggingFace)")
+        else:
+            threading.Thread(target=self._load_classifier, daemon=True, name="intent-classifier").start()
 
     # ────────────────────────────────────────────────────────────────────────
     # Tier 2 — Regex rules
@@ -297,6 +301,80 @@ class IntentRouter:
             _parse_subfolders,
         )
 
+        # ── Create single folder ──────────────────────────────────────────────
+        def _parse_create_folder(m: re.Match) -> dict:
+            name_raw = m.group(1).strip().rstrip('.,!?')
+            loc_raw  = m.group(2).strip().rstrip('.,!?')
+            # "C drive" / "C:" / "C disk" → "C:\"
+            loc_m = re.match(r'^([a-fA-F])\s*(?:drive|disk|:)?$', loc_raw, re.IGNORECASE)
+            path = loc_m.group(1).upper() + ':\\' if loc_m else loc_raw
+            return {'name': name_raw, 'path': path}
+
+        add(
+            r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+'
+            r'(?:(?:called|named|with\s+(?:the\s+)?name\s+of)\s+)?(\S+)\s+'
+            r'(?:in|on|at|inside|under)\s+(.+)',
+            'create_folder',
+            _parse_create_folder,
+        )
+        add(
+            r'\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+'
+            r'(?:(?:called|named|with\s+(?:the\s+)?name\s+of)\s+)?(\S+)',
+            'create_folder',
+            lambda m: {'name': m.group(1).strip().rstrip('.,!?'), 'path': ''},
+        )
+
+        # ── Rename file / folder ─────────────────────────────────────────────
+        def _parse_rename(m: re.Match) -> dict:
+            try:
+                old = (m.group("old_name") or "").strip().rstrip(".,!?")
+            except IndexError:
+                old = ""
+            try:
+                new = (m.group("new_name") or "").strip().rstrip(".,!?")
+            except IndexError:
+                new = ""
+            try:
+                drv = (m.group("drive") or "").upper()
+            except IndexError:
+                drv = ""
+            path = f"{drv}:\\{old}" if drv and old else old
+            return {"path": path, "new_name": new}
+
+        add(
+            r'\brename\s+(?:(?:this|that|it|the)\s+)?(?:(?:folder|file|directory)\s+)?'
+            r'(?P<old_name>(?!(?:to|into|as)\b)[a-zA-Z0-9_\-\.]{2,40})\s+(?:to|into)\s+'
+            r'(?P<new_name>[a-zA-Z0-9_\-\.]+(?:\s+[a-zA-Z0-9_\-\.]+){0,2})',
+            'rename_file',
+            _parse_rename,
+        )
+        add(
+            r'\bchange\s+(?:the\s+)?(?:folder\s+|file\s+|its\s+)?name\s+'
+            r'(?P<old_name>[a-zA-Z0-9_\-\.]+)\s+(?:to|into)\s+'
+            r'(?P<new_name>[a-zA-Z0-9_\-\.]+)',
+            'rename_file',
+            _parse_rename,
+        )
+        add(
+            r'\bchange\s+(?:the\s+)?(?:folder\s+|file\s+)?name\s+(?:(?:to|into)\s+)?'
+            r'(?!(?:in|on|at|for|the|a)\b)(?P<new_name>[a-zA-Z0-9_\-\.]+)',
+            'rename_file',
+            lambda m: {"path": "", "new_name": m.group("new_name").strip().rstrip(".,!?")},
+        )
+        add(
+            r'^(?:call|name)\s+it\s+(?P<new_name>[a-zA-Z0-9_\-\.]+(?:\s+[a-zA-Z0-9_\-\.]+){0,3})',
+            'rename_file',
+            lambda m: {"path": "", "new_name": m.group("new_name").strip().rstrip(".,!?")},
+        )
+
+        # ── Find / locate file or folder ──────────────────────────────────────
+        add(
+            r'\b(?:find|locate|where\s+is|where\'s|search\s+for)\s+'
+            r'(?:(?:the|my|a|an)\s+)?(.+?)\s+(?:folder|directory|file|dir)\b',
+            'smart_open',
+            lambda m: {"query": m.group(1).strip().rstrip(".,!?"), "type": "folder"},
+        )
+
         # ── Open / close application ──────────────────────────────────────────
         add(r'\b(?:open|launch|start|run|fire\s+up|pull\s+up)\s+(.+)',
             "open_application",
@@ -351,13 +429,23 @@ class IntentRouter:
     # ────────────────────────────────────────────────────────────────────────
 
     def _load_classifier(self) -> None:
+        import os as _os_lc
+        if _os_lc.getenv("LOCAL_ONLY_MODE", "").lower() in ("1", "true", "yes"):
+            logger.info("[IntentRouter] LOCAL_ONLY_MODE=true — classifier load skipped")
+            return
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
             import numpy as np
             import torch as _torch
             _device = "cuda" if _torch.cuda.is_available() else "cpu"
             logger.info("[IntentRouter] Loading sentence-transformers on %s…", _device)
-            model = SentenceTransformer("all-MiniLM-L6-v2", device=_device)
+            # local_files_only=True — never contact HuggingFace during runtime.
+            # Model must be pre-cached: `python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"`
+            try:
+                model = SentenceTransformer("all-MiniLM-L6-v2", device=_device, local_files_only=True)
+            except Exception:
+                logger.warning("[IntentRouter] local cache miss — attempting download (set LOCAL_ONLY_MODE=1 to suppress)")
+                model = SentenceTransformer("all-MiniLM-L6-v2", device=_device)
             names = list(_TOOL_DESCS.keys())
             embs  = model.encode(list(_TOOL_DESCS.values()), show_progress_bar=False, batch_size=64)
             self._model = model
