@@ -44,6 +44,8 @@ class CognitiveState:
     code_mode:        bool           = False
     active_project:   Optional[str]  = None
     active_file:      Optional[str]  = None
+    # Tool waiting for a follow-up answer from the user (e.g. create_folder needs a location)
+    pending_action:   Optional[dict] = None
     _lock:            threading.RLock = field(
         default_factory=threading.RLock, repr=False, compare=False,
     )
