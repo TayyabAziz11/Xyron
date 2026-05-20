@@ -185,7 +185,11 @@ class IntentRouter:
             "brightness_control", lambda m: {"action": "set", "level": int(m.group(1))})
         add(r'\bbrightness\s+(?:up|higher|increase|raise|brighter)',
             "brightness_control", lambda m: {"action": "increase", "step": 10})
+        add(r'\b(?:increase|raise|boost)\s+(?:the\s+)?brightness\b',
+            "brightness_control", lambda m: {"action": "increase", "step": 10})
         add(r'\bbrightness\s+(?:down|lower|decrease|dim|darker)',
+            "brightness_control", lambda m: {"action": "decrease", "step": 10})
+        add(r'\b(?:decrease|lower|dim|reduce)\s+(?:the\s+)?brightness\b',
             "brightness_control", lambda m: {"action": "decrease", "step": 10})
 
         # ── Battery ─────────────────────────────────────────────────────────
