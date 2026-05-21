@@ -29,7 +29,7 @@ from .config import settings
 if settings.onnx_provider and not _os.environ.get("ONNX_PROVIDER"):
     _os.environ["ONNX_PROVIDER"] = settings.onnx_provider
     logging.getLogger(__name__).info("[Config] ONNX_PROVIDER=%s", settings.onnx_provider)
-from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity, dev
+from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity, dev, brain, takeover, dashboard
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,30 @@ async def startup() -> None:
             _l.info("[Warmup] WakeWordService ready — oww=%s", _wws._oww_ready)
         except Exception as exc:
             _l.warning("[Warmup] WakeWordService: %s", exc)
-        # 5. Pre-generate TTS ack cache for instant playback (On it / Opening / Done)
+        # 5. Ollama — preload voice model so first request isn't a cold start (~18s → <2s)
+        try:
+            import os as _os_w, time as _owt
+            _voice_model = _os_w.getenv("OLLAMA_VOICE_MODEL", "qwen2.5:1.5b")
+            _os_w.environ.setdefault("OLLAMA_MODEL", _voice_model)
+            # Check model exists before warmup — avoids long download stall
+            try:
+                import ollama as _olc
+                _olc_client = _olc.Client(host=_os_w.getenv("OLLAMA_API_URL", "http://localhost:11434"))
+                _olc_models = [m.model for m in _olc_client.list().models]
+                _model_ready = any(_voice_model in m for m in _olc_models)
+            except Exception:
+                _model_ready = False
+            if _model_ready:
+                _wt0 = _owt.monotonic()
+                from api.services.openai_client import offline_generate as _og
+                _og("hi", system="You are Xyron.", num_predict=5)
+                _wms = (_owt.monotonic() - _wt0) * 1000
+                _l.info("[Warmup] Ollama preloaded model=%s keep_alive=30m warmup_ms=%.0f", _voice_model, _wms)
+            else:
+                _l.warning("[Warmup] Ollama model %r not found — run: ollama pull %s", _voice_model, _voice_model)
+        except Exception as exc:
+            _l.warning("[Warmup] Ollama: %s", exc)
+        # 6. Pre-generate TTS ack cache for instant playback (On it / Opening / Done)
         try:
             from .routers.voice import _kokoro_to_wav
             import pathlib as _pl
@@ -163,6 +186,16 @@ async def startup() -> None:
     except Exception as _exc3:
         logger.warning("[REFLECTION] startup skipped: %s", _exc3)
 
+    # Core tools — pre-warm app index and drive cache in background
+    try:
+        from .tools.core.app_finder import build_app_index
+        from .tools.core.drives import get_drives as _get_drives
+        asyncio.create_task(build_app_index())
+        asyncio.create_task(_get_drives())
+        logger.info("[CORE_TOOLS] app_finder index and drive cache warming started")
+    except Exception as _exc4:
+        logger.warning("[CORE_TOOLS] warmup skipped: %s", _exc4)
+
 
 # CORS — allow the Next.js dashboard
 app.add_middleware(
@@ -199,3 +232,6 @@ app.include_router(environment.router)
 app.include_router(voice_identity.router)
 app.include_router(cognition.router)
 app.include_router(dev.router)
+app.include_router(brain.router)
+app.include_router(takeover.router)
+app.include_router(dashboard.router)

@@ -713,11 +713,25 @@ def _exec_open_application(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolR
     if not app_name:
         return ToolResult(success=False, text="App name required.", spoken="Which application should I open?")
 
+    # Try app_finder: 4-source index + hardcoded aliases + fuzzy match (fully sync — no asyncio.run)
+    try:
+        from api.tools.core.app_finder import _search_index, _launch_via_interop as _interop
+        _entry, _match = _search_index(app_name)
+        if _entry is not None:
+            _path = _entry.get("path", "")
+            _name = _entry.get("name", app_name)
+            if _interop(_path, _name):
+                msg = f"Opening {_name}."
+                _store_last_action(ctx, "open_application", params, _name)
+                return ToolResult(success=True, text=msg, spoken=msg, action_app=_name)
+    except Exception:
+        pass
+
+    # Legacy fallback: hardcoded _APP_MAP + Start Menu index + PowerShell
     ok, msg = _launch_app(app_name)
     if ok:
         _store_last_action(ctx, "open_application", params, app_name)
-    return ToolResult(success=ok, text=msg, spoken=msg,
-                      action_app=app_name if ok else None)
+    return ToolResult(success=ok, text=msg, spoken=msg, action_app=app_name if ok else None)
 
 
 def _exec_search_files(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
@@ -1350,6 +1364,99 @@ def _exec_move_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
         return ToolResult(success=False, text="Permission denied.", spoken="I don't have permission to move that file.")
     except Exception as exc:
         return ToolResult(success=False, text=str(exc), spoken="Couldn't move the file.", error=str(exc))
+
+
+# ── Rename file / folder ───────────────────────────────────────────────────────
+
+def _exec_rename_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    path_raw = params.get("path", "").strip()
+    new_name = params.get("new_name", "").strip()
+
+    if not path_raw or not new_name:
+        return ToolResult(success=False, text="Path and new name are required.",
+                          spoken="Please tell me what to rename and what to call it.")
+
+    new_name = re.sub(r'[<>:"|?*\\/]', "", new_name).strip()
+    if not new_name:
+        return ToolResult(success=False, text="Invalid new name.", spoken="That name isn't valid.")
+
+    src_win = resolve_path(path_raw)
+    if not is_safe_path(src_win):
+        return ToolResult(success=False, text="Path blocked by safety layer.",
+                          spoken="That path is restricted.", error="Blocked")
+
+    src_fs = _fs_path(src_win)
+    if not src_fs.exists():
+        return ToolResult(success=False, text=f"Not found: {path_raw}",
+                          spoken=f"I couldn't find {src_fs.name or path_raw}.")
+
+    dst_fs = src_fs.parent / new_name
+    if dst_fs.exists():
+        return ToolResult(success=False,
+                          text=f"'{new_name}' already exists in that location.",
+                          spoken=f"There's already something named {new_name} there.")
+    try:
+        src_fs.rename(dst_fs)
+        _store_last_action(ctx, "rename_file", params, str(dst_fs))
+        return ToolResult(
+            success=True,
+            text=f"Renamed '{src_fs.name}' → '{new_name}'",
+            spoken=f"Done — renamed to {new_name}.",
+            data={"old_name": src_fs.name, "new_name": new_name, "path": wsl_to_win(str(dst_fs))},
+        )
+    except PermissionError:
+        return ToolResult(success=False, text="Permission denied.",
+                          spoken="I don't have permission to rename that.")
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Rename failed.", error=str(exc))
+
+
+# ── Copy file / folder ────────────────────────────────────────────────────────
+
+def _exec_copy_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    src_raw = params.get("source", "").strip()
+    dst_raw = params.get("destination", "").strip()
+
+    if not src_raw or not dst_raw:
+        return ToolResult(success=False, text="Source and destination are required.",
+                          spoken="Please tell me what to copy and where to put it.")
+
+    src_win = resolve_path(src_raw)
+    dst_win = resolve_path(dst_raw)
+
+    if not is_safe_path(src_win) or not is_safe_path(dst_win):
+        return ToolResult(success=False, text="Path blocked by safety layer.",
+                          spoken="That path is restricted.", error="Blocked")
+
+    src_fs = _fs_path(src_win)
+    if not src_fs.exists():
+        return ToolResult(success=False, text=f"Source not found: {src_raw}",
+                          spoken=f"I couldn't find {src_fs.name or src_raw}.")
+
+    dst_fs = _fs_path(dst_win)
+    try:
+        if dst_fs.is_dir():
+            dst_fs = dst_fs / src_fs.name
+        dst_fs.parent.mkdir(parents=True, exist_ok=True)
+
+        import shutil as _shutil
+        if src_fs.is_dir():
+            _shutil.copytree(str(src_fs), str(dst_fs))
+        else:
+            _shutil.copy2(str(src_fs), str(dst_fs))
+
+        _store_last_action(ctx, "copy_file", params, str(dst_fs))
+        return ToolResult(
+            success=True,
+            text=f"Copied '{src_fs.name}' → '{dst_fs}'",
+            spoken=f"Done — copied {src_fs.name}.",
+            data={"source": src_win, "destination": wsl_to_win(str(dst_fs))},
+        )
+    except PermissionError:
+        return ToolResult(success=False, text="Permission denied.",
+                          spoken="I don't have permission to copy there.")
+    except Exception as exc:
+        return ToolResult(success=False, text=str(exc), spoken="Copy failed.", error=str(exc))
 
 
 # ── Delete file ───────────────────────────────────────────────────────────────
@@ -2200,6 +2307,58 @@ registry.register(
     },
     executor=_exec_delete_file,
     risk="high",
+    category="system",
+)
+
+registry.register(
+    name="rename_file",
+    definition={
+        "type": "function",
+        "function": {
+            "name": "rename_file",
+            "description": (
+                "Rename a file or folder. Use when user says 'rename X to Y', 'change name of X to Y'. "
+                "Examples: 'rename report.txt to final_report.txt' → path='report.txt', new_name='final_report.txt'; "
+                "'rename the Projects folder to Work' → path='Projects', new_name='Work'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":     {"type": "string", "description": "Current path or name of the file/folder to rename"},
+                    "new_name": {"type": "string", "description": "New name only (not a full path)"},
+                },
+                "required": ["path", "new_name"],
+            },
+        },
+    },
+    executor=_exec_rename_file,
+    risk="medium",
+    category="system",
+)
+
+registry.register(
+    name="copy_file",
+    definition={
+        "type": "function",
+        "function": {
+            "name": "copy_file",
+            "description": (
+                "Copy a file or folder to another location. Use when user says 'copy X to Y', 'duplicate X in Y', 'make a copy of X'. "
+                "Examples: 'copy report.pdf to D drive' → source='report.pdf', destination='D:\\\\'; "
+                "'copy the Projects folder to Desktop' → source='Projects', destination='Desktop'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source":      {"type": "string", "description": "Path of file/folder to copy"},
+                    "destination": {"type": "string", "description": "Destination folder (e.g. 'Desktop', 'D:\\\\', 'E:\\\\Backup')"},
+                },
+                "required": ["source", "destination"],
+            },
+        },
+    },
+    executor=_exec_copy_file,
+    risk="medium",
     category="system",
 )
 
@@ -3529,6 +3688,22 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     if not query:
         return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
 
+    # Normalize "X folder" → query="X", type="folder" so voice commands work naturally.
+    # Handles: "ios folder", "music folder", "downloads directory", "project file", etc.
+    _SUFFIX_TYPE: dict[str, str] = {
+        " folders": "folder", " folder": "folder",
+        " directories": "folder", " directory": "folder", " dir": "folder",
+        " files": "file", " file": "file",
+    }
+    for _sfx, _tp in _SUFFIX_TYPE.items():
+        if query.lower().endswith(_sfx):
+            query = query[:-len(_sfx)].strip()
+            open_type = _tp
+            break
+
+    if not query:
+        return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
+
     cmd_exe = _find_cmdexe()
     if not cmd_exe:
         return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't open files on this system.")
@@ -3540,7 +3715,15 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
             _type_filter = "folder" if open_type == "folder" else (
                 "file" if open_type in ("file", "video", "image") else None
             )
-            _hits = fs_index.search(query, type_filter=_type_filter, limit=3)
+            _hits = fs_index.search(query, type_filter=_type_filter, limit=8)
+            # Filter out cache/temp/system paths that are not user content
+            _JUNK_PARTS = {"appdata", "cache", "temp", "temporary internet files",
+                           "node_modules", "programdata", "$recycle.bin", ".tmp"}
+            _hits = [
+                h for h in _hits
+                if not any(p.lower() in _JUNK_PARTS for p in h.parts)
+            ]
+            _hits = _hits[:3]
             if _hits:
                 # Apply extension filter for video/image
                 VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
@@ -3560,6 +3743,7 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
                     subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     spoken = f"Opening {_hit.name}."
+                    _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_path}, spoken)
                     return ToolResult(success=True, text=spoken, spoken=spoken,
                                       data={"path": str(_hit), "source": "index"})
     except Exception as _idx_exc:
@@ -3657,7 +3841,7 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
         subprocess.Popen([cmd_exe, "/c", f'start "" "{win_target}"'])
         name = found_path.name
         spoken = f"Opening {name}."
-        _store_last_action(ctx, "smart_open", params, spoken)
+        _store_last_action(ctx, "smart_open", {**params, "_found_path": win_target}, spoken)
         return ToolResult(success=True, text=f"Opened: {win_target}", spoken=spoken,
                           action_path=win_target)
     except Exception as exc:

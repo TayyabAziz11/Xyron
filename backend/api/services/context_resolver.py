@@ -49,6 +49,13 @@ _VAGUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Commands where "the folder" is part of the syntax, NOT a vague pronoun.
+# Context resolution must be skipped for these to avoid corrupting the intent.
+_RENAME_SKIP_RE = re.compile(
+    r'\b(?:rename|call\s+it|name\s+it)\b|\bchange\s+(?:\w+\s+){0,3}name\b',
+    re.IGNORECASE,
+)
+
 # Patterns to extract last-mentioned entity from assistant turns
 _ENTITY_PATTERNS = [
     # File with extension: "Opening video 1.mp4"
@@ -147,6 +154,11 @@ def resolve(text: str, session_id: str) -> str:
     Returns original text unchanged if no pronouns found or no entity to substitute.
     """
     if not _VAGUE_RE.search(text):
+        return text
+
+    # Skip resolution for rename/change-name commands — "the folder" is part of
+    # the command syntax here, not a vague pronoun needing substitution.
+    if _RENAME_SKIP_RE.search(text):
         return text
 
     # Priority 1: typed slot / active window

@@ -61,14 +61,21 @@ def _get_initial_prompt(lang: Optional[str]) -> str:
 
 # Post-processing: fix common phonetic mistakes from Whisper before routing.
 _CORRECTIONS: list[tuple[re.Pattern, str | object]] = [
+    # "in D drive" — Whisper commonly mishears this phrase
+    (re.compile(r'\bindeed\s+derive[d]?\b',   re.I), 'in D drive'),
+    (re.compile(r'\bindeed\s+drive\b',        re.I), 'in D drive'),
+    (re.compile(r'\bindividually\s+drive\b',  re.I), 'in D drive'),
+    (re.compile(r'\b(?:in\s+)?indie\s+drive\b', re.I), 'in D drive'),
+    (re.compile(r'\bin\s+dee\s+drive\b',      re.I), 'in D drive'),
+    (re.compile(r'\bdeep\s+drive\b',          re.I), 'D drive'),
     # Drive letter mishears
-    (re.compile(r'\bsee\s+drive\b',         re.I), 'C drive'),
-    (re.compile(r'\bsea\s+drive\b',         re.I), 'C drive'),
-    (re.compile(r'\bsi\s+drive\b',          re.I), 'C drive'),
-    (re.compile(r'\bthe\s+c\s+drive\b',     re.I), 'C drive'),
-    (re.compile(r'\bdee\s+drive\b',         re.I), 'D drive'),
-    (re.compile(r'\bee\s+drive\b',          re.I), 'E drive'),
-    (re.compile(r'\beff\s+drive\b',         re.I), 'F drive'),
+    (re.compile(r'\bsee\s+drive\b',           re.I), 'C drive'),
+    (re.compile(r'\bsea\s+drive\b',           re.I), 'C drive'),
+    (re.compile(r'\bsi\s+drive\b',            re.I), 'C drive'),
+    (re.compile(r'\bthe\s+c\s+drive\b',       re.I), 'C drive'),
+    (re.compile(r'\bdee\s+drive\b',           re.I), 'D drive'),
+    (re.compile(r'\bee\s+drive\b',            re.I), 'E drive'),
+    (re.compile(r'\beff\s+drive\b',           re.I), 'F drive'),
     # Inline "C:" or "C/" notation → spoken form
     (re.compile(r'\b([a-fA-F])\s*[:/]',    re.I),
      lambda m: f'{m.group(1).upper()} drive '),
