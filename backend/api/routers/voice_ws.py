@@ -56,6 +56,19 @@ router = APIRouter(prefix="/api/v1/voice", tags=["voice-ws"])
 
 FRAME_BYTES = 1280 * 4  # 5120 bytes per 80ms frame
 
+# Whisper transcripts to drop unconditionally — known silence/TTS-bleed artifacts.
+_KNOWN_HALLUCINATIONS: frozenset[str] = frozenset({
+    "voice assistant command, urdu aur english mixed.",
+    "voice assistant command urdu aur english mixed",
+    "voice assistant command",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "like and subscribe",
+    "subscribe and like",
+    "thanks for listening",
+})
+
 # Ensure backend/ is on sys.path for voice.* imports
 _BACKEND = str(Path(__file__).parent.parent.parent)
 if _BACKEND not in sys.path:
@@ -223,10 +236,57 @@ _MIN_SPEECH_FRAMES = 5       # < 400ms → too short, discard
 _INTERRUPT_RMS     = 0.020   # RMS above this during TTS = user interrupt
 
 # Session constants
-SESSION_TIMEOUT  = 8.0        # seconds of silence before session auto-ends
+SESSION_TIMEOUT  = 45.0       # seconds of silence before session auto-ends
 
 # TTS chunking: split response at sentence boundaries, max N chars per chunk
 _TTS_MAX_CHARS   = 80
+
+
+def _normalize_clock_for_tts(text: str) -> str:
+    """
+    Normalize clock/time responses for Kokoro TTS.
+    Phonemizer struggles with contractions and colon-notation times.
+    "It's 9:47 AM." → "It is nine forty-seven A M."
+    """
+    # Expand common contractions
+    text = re.sub(r"\bIt's\b", "It is", text)
+    text = re.sub(r"\bit's\b", "it is", text)
+    text = re.sub(r"\bI'm\b",  "I am",  text)
+    text = re.sub(r"\bI've\b", "I have", text)
+
+    _ONES  = ['', 'one', 'two', 'three', 'four', 'five', 'six',
+              'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve']
+    _TEENS = ['ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen',
+              'sixteen', 'seventeen', 'eighteen', 'nineteen']
+    _TENS  = ['', '', 'twenty', 'thirty', 'forty', 'fifty']
+
+    def _spell_time(m: re.Match) -> str:
+        h   = int(m.group(1))
+        mn  = int(m.group(2))
+        per = (m.group(3) or "").strip().upper()
+
+        h_str = _ONES[h] if 1 <= h <= 12 else str(h)
+
+        if mn == 0:
+            mn_str = "o'clock"
+        elif mn < 10:
+            mn_str = f"oh {_ONES[mn]}"
+        elif mn < 20:
+            mn_str = _TEENS[mn - 10]
+        else:
+            t, o   = divmod(mn, 10)
+            mn_str = _TENS[t] + (" " + _ONES[o] if o else "")
+
+        result = f"{h_str} {mn_str}" if mn else h_str
+        if per in ("AM", "PM"):
+            result += " " + " ".join(per)   # "AM" → "A M", "PM" → "P M"
+        return result
+
+    text = re.sub(r'\b(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?\b', _spell_time, text)
+    # Standalone AM/PM left after substitution
+    text = re.sub(r'\bAM\b', 'A M', text)
+    text = re.sub(r'\bPM\b', 'P M', text)
+    return text
 
 
 def _split_for_tts(text: str) -> list[str]:
@@ -270,12 +330,22 @@ async def _synthesize_chunk(text: str, voice: str, speed: float) -> Optional[byt
     for attempt in range(2):
         try:
             from api.routers.voice import _kokoro_to_wav
-            wav = await asyncio.to_thread(_kokoro_to_wav, text, voice, speed)
+            wav = await asyncio.wait_for(
+                asyncio.to_thread(_kokoro_to_wav, text, voice, speed),
+                timeout=25.0,
+            )
             if wav:
                 return wav
             if attempt == 0:
                 logger.warning("[WS/session] Kokoro returned None, retrying...")
                 await asyncio.sleep(0.15)
+        except asyncio.TimeoutError:
+            logger.warning("[WS/session] Kokoro timed out (attempt %d) text=%r",
+                           attempt + 1, text[:40])
+            if attempt == 0:
+                await asyncio.sleep(0.15)
+            else:
+                return None
         except Exception as exc:
             if attempt == 0:
                 logger.warning("[WS/session] Kokoro attempt 1 failed, retrying: %s", exc)
@@ -289,8 +359,9 @@ async def _synthesize_chunk(text: str, voice: str, speed: float) -> Optional[byt
 async def ws_session(websocket: WebSocket) -> None:
     await websocket.accept()
 
-    voice = "nova"
-    speed = 1.0
+    voice          = "nova"
+    speed          = 1.0
+    preferred_name = ""  # set via config frame; used in greeting + responses
 
     # Config frame (first message — wait up to 5s)
     try:
@@ -298,12 +369,13 @@ async def ws_session(websocket: WebSocket) -> None:
         if first.get("text"):
             cfg = json.loads(first["text"])
             if cfg.get("type") == "config":
-                voice = cfg.get("voice", voice)
-                speed = float(cfg.get("speed", speed))
+                voice          = cfg.get("voice", voice)
+                speed          = float(cfg.get("speed", speed))
+                preferred_name = (cfg.get("preferred_name") or "").strip()
     except (asyncio.TimeoutError, WebSocketDisconnect, json.JSONDecodeError):
         pass
 
-    logger.info("[SESSION_STARTED] voice=%s speed=%.1f", voice, speed)
+    logger.info("[SESSION_STARTED] voice=%s speed=%.1f name=%r", voice, speed, preferred_name)
 
     # Block wake word for the duration of this session
     try:
@@ -312,27 +384,6 @@ async def ws_session(websocket: WebSocket) -> None:
     except Exception:
         pass
 
-    # ── Instant "Yes?" ACK ────────────────────────────────────────────────────
-    ack_path = Path("/tmp/xyron-ack/on_it.wav")
-    ack_has_audio = False
-    if ack_path.exists():
-        try:
-            ack_b64 = base64.b64encode(ack_path.read_bytes()).decode()
-            await _send(websocket, {"type": "ack", "text": "Yes?", "audio": ack_b64})
-            ack_has_audio = True
-        except Exception:
-            pass
-    if not ack_has_audio:
-        await _send(websocket, {"type": "ack", "text": "Yes?"})
-
-    # Post-TTS deaf window: give the client time to finish playing the ack audio
-    # before we start recording. Without this, machines with no hardware echo
-    # cancellation (WSL2, USB mics) pick up the ack TTS in the mic and send it
-    # to Whisper, causing hallucinated transcriptions.
-    if ack_has_audio:
-        await asyncio.sleep(1.2)
-
-    await _send(websocket, {"type": "listening"})
 
     # ── Session state ─────────────────────────────────────────────────────────
     pcm_buffer: list[np.ndarray] = []
@@ -342,6 +393,10 @@ async def ws_session(websocket: WebSocket) -> None:
     last_activity_t     = time.time()
     interrupt_event     = asyncio.Event()
     last_response_text: str = ""     # for CLARIFY repetition
+    current_turn_id     = 0          # monotonic counter; stale tasks self-abort when this advances
+
+    import uuid as _uuid
+    _session_id = str(_uuid.uuid4())  # stable ID for context_resolver within this WS session
 
     from brain.memory_manager import new_session_memory
     memory = new_session_memory()
@@ -370,19 +425,12 @@ async def ws_session(websocket: WebSocket) -> None:
     # ── TTS helper: sequential synthesis for short (tool/memory) responses ────
 
     async def _tts_sequential(text: str) -> bool:
-        """Synthesize `text` chunk-by-chunk with interrupt check. Returns True if interrupted."""
-        interrupt_event.clear()
+        """Synthesize `text` chunk-by-chunk and stream to client. Interruption disabled."""
         logger.info("[TTS_STARTED] chars=%d", len(text))
         chunks = _split_for_tts(text)
         n = len(chunks)
         for i, chunk in enumerate(chunks, 1):
-            if interrupt_event.is_set():
-                logger.info("[TTS_INTERRUPTED] at chunk %d/%d", i, n)
-                return True
             wav = await _synthesize_chunk(chunk, voice, speed)
-            if interrupt_event.is_set():
-                logger.info("[TTS_INTERRUPTED] post-synth chunk %d/%d", i, n)
-                return True
             if wav:
                 sent = await _send(websocket, {
                     "type":  "audio",
@@ -436,7 +484,6 @@ async def ws_session(websocket: WebSocket) -> None:
         Returns (full_response_text, interrupted).
         """
         from api.services.response_pipeline import stream_response_with_tts
-        interrupt_event.clear()
         logger.info("[TTS_STARTED] streaming LLM+TTS pipeline")
         full_text  = ""
         interrupted = False
@@ -444,10 +491,6 @@ async def ws_session(websocket: WebSocket) -> None:
             async for sentence, wav, chunk_idx, is_final in stream_response_with_tts(
                 transcript, history, voice=voice, speed=speed
             ):
-                if interrupt_event.is_set():
-                    interrupted = True
-                    logger.info("[TTS_INTERRUPTED] LLM stream at chunk %d", chunk_idx)
-                    break
                 full_text += sentence + " "
                 await _send(websocket, {"type": "response", "text": sentence, "chunk": chunk_idx})
                 if wav:
@@ -471,17 +514,38 @@ async def ws_session(websocket: WebSocket) -> None:
 
     # ── Utterance processor ───────────────────────────────────────────────────
 
-    async def process_utterance(frames: list[np.ndarray]) -> None:
+    async def process_utterance(frames: list[np.ndarray], my_turn: int) -> None:
         nonlocal is_speaking, last_activity_t, last_response_text
+
+        if my_turn != current_turn_id:
+            logger.info("[STALE_RESPONSE_DROPPED] turn=%d stale on entry (current=%d) — discarding",
+                        my_turn, current_turn_id)
+            is_speaking = False
+            return
 
         last_activity_t = time.time()
         audio = np.concatenate(frames).astype(np.float32)
 
+        # ── Pre-STT energy gate — skip Whisper for silence/noise ─────────────
+        # Whisper hallucinates command lists when given audio with very low energy.
+        # RMS < 0.010 reliably indicates no real speech was recorded.
+        _pre_rms = float(np.sqrt(np.mean(audio ** 2)))
+        if _pre_rms < 0.010:
+            logger.info("[STT_SKIPPED_SILENCE] rms=%.5f (threshold=0.010)", _pre_rms)
+            is_speaking = False
+            last_activity_t = time.time()
+            await _send(websocket, {"type": "listening"})
+            return
+        logger.debug("[STT_AUDIO_RMS] rms=%.5f frames=%d", _pre_rms, len(frames))
+
         # STT — fast mode: beam_size=1, English only, no internal VAD
+        _stt_t0 = time.time()
         try:
             from voice.whisper_service import transcribe_audio
             result = await asyncio.to_thread(transcribe_audio, audio, fast=True)
             transcript = result.get("text", "").strip()
+            _stt_ms = (time.time() - _stt_t0) * 1000
+            logger.info("[VOICE_SESSION_LATENCY] stage=stt ms=%.0f", _stt_ms)
         except Exception as exc:
             logger.warning("[WS/session] STT error: %s", exc)
             await _send(websocket, {"type": "error", "message": "STT failed"})
@@ -494,10 +558,161 @@ async def ws_session(websocket: WebSocket) -> None:
             await _send(websocket, {"type": "listening"})
             return
 
+        # ── Exact-phrase hallucination filter — known Whisper artifacts ──────
+        _t_norm = transcript.lower().strip().rstrip('.!?,')
+        if _t_norm in _KNOWN_HALLUCINATIONS or transcript.lower().strip() in _KNOWN_HALLUCINATIONS:
+            logger.info("[TRANSCRIPT_DROPPED_SILENCE_HALLUCINATION] exact_match text=%r", transcript[:80])
+            is_speaking = False
+            last_activity_t = time.time()
+            await _send(websocket, {"type": "listening"})
+            return
+
+        # ── Hallucination filter — reject command-list garbage from Whisper ──
+        # Whisper hallucinates sorted command lists when processing ambient TTS
+        # audio or mic noise during the post-wake stabilization window.
+        # Two patterns caught:
+        #   1. Comma-separated list: "Close, screenshot, volume up, shutdown."
+        #   2. Space-separated chain: "Close screenshot volume down folder settings"
+        _CMD_WORDS = {
+            'close', 'screenshot', 'volume', 'folder', 'settings', 'lock',
+            'shutdown', 'restart', 'sleep', 'open', 'launch', 'start', 'stop',
+            'play', 'pause', 'mute', 'search', 'create', 'delete', 'copy',
+            'paste', 'save', 'print', 'minimize', 'maximize', 'scroll',
+            'refresh', 'undo', 'redo', 'cut', 'select', 'send', 'cancel',
+        }
+        _hallu = False
+        # Pattern 1: comma-separated (3+ segments, each 1-3 words, 3+ cmd hits)
+        _segments = [s.strip().rstrip('.!?').lower() for s in transcript.split(',')]
+        if len(_segments) >= 3:
+            _cmd_hits = sum(
+                1 for seg in _segments
+                if 1 <= len(seg.split()) <= 3 and any(w in _CMD_WORDS for w in seg.split())
+            )
+            if _cmd_hits >= 3:
+                _hallu = True
+        # Pattern 2: space-separated command chain (5+ words, 4+ are cmd words, >60% density)
+        if not _hallu:
+            _words = transcript.rstrip('.!?,').lower().split()
+            if len(_words) >= 5:
+                _hits = sum(1 for w in _words if w in _CMD_WORDS)
+                if _hits >= 4 and (_hits / len(_words)) >= 0.60:
+                    _hallu = True
+        if _hallu:
+            logger.info("[TRANSCRIPT_DROPPED_SILENCE_HALLUCINATION] text=%r", transcript[:80])
+            is_speaking = False
+            last_activity_t = time.time()
+            await _send(websocket, {"type": "listening"})
+            return
+
+        # Staleness check — a new utterance may have arrived while Whisper was running
+        if my_turn != current_turn_id:
+            logger.info("[STALE_RESPONSE_DROPPED] turn=%d dropped after STT (current=%d)",
+                        my_turn, current_turn_id)
+            is_speaking = False
+            await _send(websocket, {"type": "listening"})
+            return
+
+        # ── Context resolution — replace vague pronouns before routing ──────
+        try:
+            from api.services.context_resolver import resolve as _ctx_resolve
+            resolved = _ctx_resolve(transcript, _session_id)
+            if resolved != transcript:
+                logger.info("[CTX_RESOLVED] %r → %r", transcript[:60], resolved[:60])
+                transcript = resolved
+        except Exception as _exc:
+            logger.debug("[CTX_RESOLVE] skipped: %s", _exc)
+
         await _send(websocket, {"type": "transcript", "text": transcript, "final": True})
         logger.info("[WS/session] transcript: %r", transcript)
         memory.add_user(transcript)
         logger.info("[VOICE_TRACE] stage=stt transcript=%r", transcript[:80])
+
+        # ── Tier 0: Local clock — instant, offline, no LLM ───────────────────
+        try:
+            from api.services.intent_router import _local_clock_route
+            _clock = _local_clock_route(transcript.lower().strip())
+            if _clock and _clock.tool_name and _clock.tool_name.startswith("local_clock_"):
+                _clock_response = _clock.params.get("response", "")
+                if _clock_response:
+                    logger.info("[LOCAL_CLOCK_RESPONSE] tool=%s response=%r", _clock.tool_name, _clock_response)
+                    _clock_tts = _normalize_clock_for_tts(_clock_response)
+                    await _send(websocket, {"type": "response", "text": _clock_response, "chunk": 1})
+                    _interrupted = await _tts_sequential(_clock_tts)
+                    logger.info("[VOICE_TRACE] stage=audio_stream done response=%r", _clock_response[:60])
+                    logger.info("[TTS_STOPPED] interrupted=%s", _interrupted)
+                    memory.add_assistant(_clock_response, tool_name=_clock.tool_name)
+                    last_response_text  = _clock_response
+                    is_speaking         = False
+                    last_activity_t     = time.time()
+                    if not _interrupted:
+                        await _send(websocket, {"type": "done"})
+                        await _send(websocket, {"type": "listening"})
+                        logger.info("[SESSION_TRANSITION] → listening (tts_done clock_route)")
+                    return
+        except Exception as _ce:
+            logger.debug("[LOCAL_CLOCK] skipped: %s", _ce)
+
+        # ── Tier 0b: Live system metrics — instant, no LLM ───────────────────
+        try:
+            from api.services.intent_router import intent_router as _ir
+            _sys_route = _ir.route(transcript.lower().strip())
+            if _sys_route.tool_name == "get_live_system_metrics":
+                from api.services.system_monitor_service import system_monitor as _sysmon
+                snap = _sysmon.get_snapshot()
+                metric = _sys_route.params.get("metric", "all")
+                if metric == "cpu":
+                    _sr = f"CPU is at {snap.get('cpu_pct', 0):.0f}%."
+                    if snap.get("cpu_freq_mhz"):
+                        _sr = _sr.rstrip('.') + f", running at {snap['cpu_freq_mhz']/1000:.1f} GHz."
+                elif metric == "ram":
+                    _sr = (f"RAM usage is {snap.get('ram_pct', 0):.0f}% — "
+                           f"{snap.get('ram_used_gb', 0):.1f} of {snap.get('ram_total_gb', 0):.1f} GB used.")
+                elif metric == "gpu":
+                    gpu_pct = snap.get("gpu_pct")
+                    gpu_name = snap.get("gpu_name", "")
+                    if gpu_pct is not None:
+                        _sr = f"GPU is at {gpu_pct:.0f}%"
+                        if gpu_name:
+                            _sr += f" on {gpu_name}"
+                        _sr += "."
+                    else:
+                        _sr = "GPU data isn't available right now."
+                elif metric == "disk":
+                    _sr = (f"Disk is {snap.get('disk_pct', 0):.0f}% full — "
+                           f"{snap.get('disk_used_gb', 0):.0f} of {snap.get('disk_total_gb', 0):.0f} GB used.")
+                elif metric == "network":
+                    _sr = (f"Network: uploading at {snap.get('net_up_str', '0 KB/s')}, "
+                           f"downloading at {snap.get('net_down_str', '0 KB/s')}.")
+                elif metric == "battery":
+                    batt = snap.get("battery_pct")
+                    charging = snap.get("battery_charging")
+                    if batt is not None:
+                        _sr = f"Battery is at {batt:.0f}%"
+                        _sr += ", charging." if charging else ", not charging."
+                    else:
+                        _sr = "No battery detected — probably running on AC power."
+                else:  # "all"
+                    _sr = (f"CPU {snap.get('cpu_pct', 0):.0f}%, "
+                           f"RAM {snap.get('ram_pct', 0):.0f}%, "
+                           f"disk {snap.get('disk_pct', 0):.0f}%.")
+                    if snap.get("gpu_pct") is not None:
+                        _sr = _sr.rstrip('.') + f", GPU {snap['gpu_pct']:.0f}%."
+                logger.info("[SYSTEM_METRICS_VOICE] metric=%s response=%r", metric, _sr)
+                await _send(websocket, {"type": "response", "text": _sr, "chunk": 1})
+                _interrupted = await _tts_sequential(_sr)
+                logger.info("[VOICE_TRACE] stage=audio_stream done response=%r", _sr[:60])
+                logger.info("[TTS_STOPPED] interrupted=%s", _interrupted)
+                memory.add_assistant(_sr, tool_name="get_live_system_metrics")
+                last_response_text = _sr
+                is_speaking        = False
+                last_activity_t    = time.time()
+                if not _interrupted:
+                    await _send(websocket, {"type": "done"})
+                    await _send(websocket, {"type": "listening"})
+                    logger.info("[SESSION_TRANSITION] → listening (tts_done metrics_route)")
+                return
+        except Exception as _se:
+            logger.debug("[SYSTEM_METRICS_VOICE] skipped: %s", _se)
 
         # ── Emotion detection + mood update (runs before ANY routing) ─────────
         _emo          = None
@@ -652,10 +867,18 @@ async def ws_session(websocket: WebSocket) -> None:
 
         # ── Orchestrator decision ─────────────────────────────────────────────
         from brain.orchestrator import orchestrator as _orch, ActionType
+        logger.info("[TURN_START] turn=%d routing transcript=%r", my_turn, transcript[:60])
         decision = await _orch.decide(transcript, memory.history_for_llm())
         logger.info("[ORCHESTRATOR] action=%s reason=%s", decision.action.name, decision.reason)
         logger.info("[VOICE_TRACE] stage=tool_route action=%s tool=%s",
                     decision.action.name, decision.tool_name)
+
+        if my_turn != current_turn_id:
+            logger.info("[STALE_RESPONSE_DROPPED] turn=%d dropped after orchestrator (current=%d)",
+                        my_turn, current_turn_id)
+            is_speaking = False
+            await _send(websocket, {"type": "listening"})
+            return
 
         response_text: str = ""
         interrupted:   bool = False
@@ -792,6 +1015,54 @@ async def ws_session(websocket: WebSocket) -> None:
             await _send(websocket, {"type": "listening"})
         # If interrupted: VAD in the main loop already detected speech; it re-arms naturally
 
+    # ── Opening greeting ──────────────────────────────────────────────────────
+    import datetime as _dt
+    _hour = _dt.datetime.now().hour
+    _tod  = "morning" if _hour < 12 else "afternoon" if _hour < 18 else "evening"
+    _greet_name = preferred_name or "boss"
+    _greeting_text = (
+        f"Good {_tod}, {_greet_name}. I'm Xyron, ready and at your service. Just give the word."
+    )
+    logger.info("[GREETING_STARTED] name=%r text=%r", _greet_name, _greeting_text)
+    is_speaking = True
+    _g_wav = await _synthesize_chunk(_greeting_text, "onyx", 1.0)
+    if _g_wav:
+        await _send(websocket, {
+            "type":  "audio",
+            "data":  base64.b64encode(_g_wav).decode(),
+            "chunk": 1,
+            "total": 1,
+            "final": True,
+            "text":  _greeting_text,
+        })
+        logger.info("[GREETING_SENT] bytes=%d", len(_g_wav))
+        _deadline = time.time() + 15.0
+        while websocket.client_state == WebSocketState.CONNECTED and time.time() < _deadline:
+            try:
+                _d = await asyncio.wait_for(websocket.receive(), timeout=2.0)
+                if _d.get("type") == "websocket.disconnect":
+                    break
+                _txt = _d.get("text")
+                if _txt:
+                    try:
+                        _m = json.loads(_txt)
+                        if _m.get("type") == "tts_done":
+                            logger.info("[GREETING_DONE]")
+                            break
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        pass
+            except asyncio.TimeoutError:
+                continue
+            except WebSocketDisconnect:
+                break
+    else:
+        logger.warning("[GREETING] synthesis failed — proceeding to listen")
+    is_speaking = False
+    last_activity_t = time.time()  # reset idle timer after greeting completes
+    await _send(websocket, {"type": "listening"})
+
     # ── Main receive loop ─────────────────────────────────────────────────────
     try:
         while websocket.client_state == WebSocketState.CONNECTED:
@@ -823,9 +1094,11 @@ async def ws_session(websocket: WebSocket) -> None:
                             silence_count   = 0
                             is_speaking     = True
                             interrupt_event.clear()
-                            asyncio.create_task(process_utterance(frames))
+                            current_turn_id += 1
+                            asyncio.create_task(process_utterance(frames, current_turn_id))
                     elif t == "tts_done":
                         is_speaking = False
+                        last_activity_t = time.time()  # reset idle timer so session stays alive after response
                         await _send(websocket, {"type": "listening"})
                 except Exception:
                     pass
@@ -840,12 +1113,7 @@ async def ws_session(websocket: WebSocket) -> None:
             rms = float(np.sqrt(np.mean(pcm ** 2)))
 
             if is_speaking:
-                # Interrupt detection: significant user speech during TTS
-                if rms > _INTERRUPT_RMS:
-                    interrupt_event.set()
-                    logger.info("[TTS_INTERRUPTED] user speech rms=%.4f", rms)
-                    await _send(websocket, {"type": "listening"})
-                continue  # always skip VAD accumulation while TTS plays
+                continue  # drop all mic frames during TTS — no interrupt detection
 
             # Normal VAD accumulation
             if rms > _SILENCE_RMS:
@@ -866,7 +1134,8 @@ async def ws_session(websocket: WebSocket) -> None:
                         silence_count   = 0
                         is_speaking     = True
                         interrupt_event.clear()
-                        asyncio.create_task(process_utterance(frames))
+                        current_turn_id += 1
+                        asyncio.create_task(process_utterance(frames, current_turn_id))
                     else:
                         pcm_buffer.clear()
                         speech_started = False

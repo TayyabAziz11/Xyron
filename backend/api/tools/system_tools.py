@@ -713,19 +713,39 @@ def _exec_open_application(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolR
     if not app_name:
         return ToolResult(success=False, text="App name required.", spoken="Which application should I open?")
 
-    # Try app_finder: 4-source index + hardcoded aliases + fuzzy match (fully sync — no asyncio.run)
-    try:
-        from api.tools.core.app_finder import _search_index, _launch_via_interop as _interop
-        _entry, _match = _search_index(app_name)
-        if _entry is not None:
-            _path = _entry.get("path", "")
-            _name = _entry.get("name", app_name)
-            if _interop(_path, _name):
-                msg = f"Opening {_name}."
-                _store_last_action(ctx, "open_application", params, _name)
-                return ToolResult(success=True, text=msg, spoken=msg, action_app=_name)
-    except Exception:
-        pass
+    # For URI-based apps (ms-settings:, http://) skip app_finder — it finds the wrong Linux/WSL app.
+    _norm = _normalise_app(app_name)
+    _plat = "wsl" if _ON_WSL else ("win32" if _ON_WINDOWS else "linux")
+    _map_cmd = (_APP_MAP.get(_norm) or {}).get(_plat, "")
+    _is_uri_app = bool(_map_cmd) and (
+        _map_cmd.startswith("ms-settings:")
+        or _map_cmd.startswith("http://")
+        or _map_cmd.startswith("https://")
+    )
+
+    if not _is_uri_app:
+        # Try app_finder: 4-source index + hardcoded aliases + fuzzy match (fully sync — no asyncio.run)
+        try:
+            from api.tools.core.app_finder import _search_index, _launch_via_interop as _interop
+            _entry, _match = _search_index(app_name)
+            if _entry is not None:
+                _path = _entry.get("path", "")
+                _name = _entry.get("name", app_name)
+                if _interop(_path, _name):
+                    msg = f"Opening {_name}."
+                    _store_last_action(ctx, "open_application", params, _name)
+                    return ToolResult(success=True, text=msg, spoken=msg, action_app=_name)
+        except Exception:
+            pass
+
+    # Settings: give a friendly spoken label for Windows Settings URI
+    if _norm == "settings" and _map_cmd.startswith("ms-settings:"):
+        logger.info("[TOOL_EXEC] open_application settings target=%s", _map_cmd)
+        ok, _ = _launch_app(app_name)
+        if ok:
+            _store_last_action(ctx, "open_application", params, "Windows Settings")
+            msg = "Opening Windows Settings."
+            return ToolResult(success=True, text=msg, spoken=msg, action_app="Windows Settings")
 
     # Legacy fallback: hardcoded _APP_MAP + Start Menu index + PowerShell
     ok, msg = _launch_app(app_name)
@@ -3680,16 +3700,47 @@ registry.register(name="open_wifi_panel",
 
 # ── Smart open: search and open files/folders/videos/pictures by name ────────
 
+def _wsl_to_win_path(p_str: str) -> str:
+    """Convert /mnt/X/... → X:\\..."""
+    m = re.match(r'^/mnt/([a-z])(?:/(.*))?$', p_str)
+    if m:
+        letter = m.group(1).upper()
+        rest   = (m.group(2) or "").replace("/", "\\")
+        return f"{letter}:\\{rest}" if rest else f"{letter}:\\"
+    return p_str.replace("/", "\\")
+
+
+def _verify_accessible(path: Path) -> tuple[bool, str]:
+    """
+    Verify a path is accessible before attempting to open it.
+    Returns (ok, error_type).  error_type is one of:
+        'not_found' | 'access_denied' | 'ok'
+    """
+    try:
+        if not path.exists():
+            return False, "not_found"
+        if path.is_dir():
+            os.listdir(str(path))   # raises PermissionError if denied
+        else:
+            with open(str(path), "rb"):
+                pass
+        return True, "ok"
+    except PermissionError:
+        return False, "access_denied"
+    except OSError:
+        return True, "ok"   # some Windows mounts exist but listdir fails on WSL side; Explorer still works
+
+
 def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     """Find anything on the system by name and open it."""
     query     = params.get("query", "").strip()
     open_type = params.get("type", "any").lower()   # folder | file | video | image | any
+    drive     = (params.get("drive") or "").upper()[:1]  # "E", "D", "C", etc. — empty = search all
 
     if not query:
         return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
 
     # Normalize "X folder" → query="X", type="folder" so voice commands work naturally.
-    # Handles: "ios folder", "music folder", "downloads directory", "project file", etc.
     _SUFFIX_TYPE: dict[str, str] = {
         " folders": "folder", " folder": "folder",
         " directories": "folder", " directory": "folder", " dir": "folder",
@@ -3704,9 +3755,15 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     if not query:
         return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
 
+    # Validate drive letter
+    if drive and not drive.isalpha():
+        drive = ""
+
     cmd_exe = _find_cmdexe()
     if not cmd_exe:
         return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't open files on this system.")
+
+    _drive_suffix = f" in {drive} drive" if drive else ""
 
     # ── Fast path: check the file-system index first (<5ms) ──────────────────
     try:
@@ -3715,59 +3772,90 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
             _type_filter = "folder" if open_type == "folder" else (
                 "file" if open_type in ("file", "video", "image") else None
             )
-            _hits = fs_index.search(query, type_filter=_type_filter, limit=8)
-            # Filter out cache/temp/system paths that are not user content
+            _hits = fs_index.search_fuzzy(
+                query, type_filter=_type_filter, drive=drive or None, limit=10
+            )
             _JUNK_PARTS = {"appdata", "cache", "temp", "temporary internet files",
                            "node_modules", "programdata", "$recycle.bin", ".tmp"}
-            _hits = [
-                h for h in _hits
-                if not any(p.lower() in _JUNK_PARTS for p in h.parts)
-            ]
-            _hits = _hits[:3]
-            if _hits:
-                # Apply extension filter for video/image
-                VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
-                IMAGE_EXTS_IDX = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
-                for _hit in _hits:
-                    if open_type == "video" and _hit.suffix.lower() not in VIDEO_EXTS_IDX:
-                        continue
-                    if open_type == "image" and _hit.suffix.lower() not in IMAGE_EXTS_IDX:
-                        continue
-                    # Found — open it directly (/mnt/e/foo → E:\foo)
-                    _p_str = str(_hit)
-                    _mnt_m = re.match(r'^/mnt/([a-z])/(.*)', _p_str)
-                    if _mnt_m:
-                        _win_path = _mnt_m.group(1).upper() + ":\\" + _mnt_m.group(2).replace("/", "\\")
-                    else:
-                        _win_path = _p_str
-                    subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    spoken = f"Opening {_hit.name}."
-                    _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_path}, spoken)
-                    return ToolResult(success=True, text=spoken, spoken=spoken,
-                                      data={"path": str(_hit), "source": "index"})
+            _hits = [h for h in _hits if not any(p.lower() in _JUNK_PARTS for p in h.parts)]
+            _hits = _hits[:5]
+
+            if len(_hits) > 2:
+                # Multiple strong candidates — report them instead of guessing
+                _win_paths = [_wsl_to_win_path(str(h)) for h in _hits[:3]]
+                _names     = [h.name for h in _hits[:3]]
+                spoken = (f"I found {len(_hits)} folders named '{query}'{_drive_suffix}. "
+                          f"Which one? {', '.join(_names[:3])}.")
+                return ToolResult(
+                    success=False,
+                    text=f"Multiple matches for '{query}': {_win_paths}",
+                    spoken=spoken,
+                    data={"error_type": "multiple_matches", "matches": _win_paths, "query": query},
+                )
+
+            VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+            IMAGE_EXTS_IDX = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
+            for _hit in _hits:
+                if open_type == "video" and _hit.suffix.lower() not in VIDEO_EXTS_IDX:
+                    continue
+                if open_type == "image" and _hit.suffix.lower() not in IMAGE_EXTS_IDX:
+                    continue
+
+                # ── Verify before speaking ───────────────────────────────────
+                _ok, _err = _verify_accessible(_hit)
+                if not _ok:
+                    _win_path = _wsl_to_win_path(str(_hit))
+                    if _err == "access_denied":
+                        return ToolResult(
+                            success=False,
+                            text=f"Access denied: {_win_path}",
+                            spoken=f"I found the {_hit.name} folder, but Windows denied access.",
+                            data={"path": _win_path, "error_type": "access_denied"},
+                        )
+                    continue  # not_found → try next hit (index may be stale)
+
+                _win_path = _wsl_to_win_path(str(_hit))
+                subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                spoken = f"Opened {_hit.name}{_drive_suffix}."
+                logger.info("[FS_INDEX_HIT] query=%r path=%s", query, _win_path)
+                _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_path}, spoken)
+                return ToolResult(success=True, text=spoken, spoken=spoken,
+                                  action_path=_win_path,
+                                  data={"path": _win_path, "source": "index"})
+
+            # All index hits were stale or inaccessible — fall through to disk scan
+            logger.debug("[FS_INDEX_MISS] query=%r drive=%s all hits invalid", query, drive or "any")
+
     except Exception as _idx_exc:
-        import logging as _l
-        _l.getLogger(__name__).debug("fs_index fast-path skipped: %s", _idx_exc)
+        logger.debug("fs_index fast-path skipped: %s", _idx_exc)
+
     # ── Slow path: incremental find ───────────────────────────────────────────
 
     VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
 
-    # Search data drives first (D:, E:, F:, G:) — user content lives here.
-    # Then the user profile on C: (not all of C: — too large).
-    home_fs = _fs_path(_windows_home())
-    search_roots_fs = []
-    for drive in ("d", "e", "f", "g"):
-        mount = Path(f"/mnt/{drive}")
-        if mount.exists():
-            search_roots_fs.append(str(mount))
-    # User profile on C: (Desktop, Documents, Downloads, etc.)
-    if home_fs.exists():
-        search_roots_fs.append(str(home_fs))
+    # Restrict search to specified drive, or scan all data drives.
+    if drive:
+        mount = Path(f"/mnt/{drive.lower()}")
+        if not mount.exists():
+            return ToolResult(
+                success=False,
+                text=f"Drive {drive}: is not accessible.",
+                spoken=f"I can't access the {drive} drive. Is it connected?",
+                data={"error_type": "drive_unavailable", "drive": drive},
+            )
+        search_roots_fs = [str(mount)]
+    else:
+        home_fs = _fs_path(_windows_home())
+        search_roots_fs = []
+        for drv_letter in ("d", "e", "f", "g"):
+            mount = Path(f"/mnt/{drv_letter}")
+            if mount.exists():
+                search_roots_fs.append(str(mount))
+        if home_fs.exists():
+            search_roots_fs.append(str(home_fs))
 
-    # Incremental depth search — finds shallow matches first (prefers "IT Course" over
-    # deeply nested "course" folders inside project trees). Stops immediately on first hit.
     _prune_names = [
         "node_modules", ".git", "__pycache__", ".next", ".venv", "venv",
         "AppData", "Windows", "ProgramData", "$RECYCLE.BIN",
@@ -3818,34 +3906,57 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
             else:
                 proc.wait()
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
         if found_path:
             break
 
     if not found_path:
+        _type_word = open_type if open_type != "any" else "item"
         return ToolResult(
-            success=False, text=f"Nothing found matching '{query}'.",
-            spoken=f"I couldn't find anything named '{query}' on your system.",
+            success=False,
+            text=f"Nothing found matching '{query}'{_drive_suffix}.",
+            spoken=(f"I couldn't find any {_type_word} named '{query}'"
+                    + (_drive_suffix + "." if drive else " on your system.")),
+            data={"error_type": "not_found", "query": query, "drive": drive or None},
         )
 
-    # Convert WSL path → Windows path
-    win_target = (str(found_path)
-                  .replace("/mnt/c/", "C:\\")
-                  .replace("/mnt/d/", "D:\\")
-                  .replace("/mnt/e/", "E:\\")
-                  .replace("/mnt/f/", "F:\\")
-                  .replace("/mnt/g/", "G:\\")
-                  .replace("/", "\\"))
+    # ── Verify before speaking ────────────────────────────────────────────────
+    _ok, _err = _verify_accessible(found_path)
+    win_target = _wsl_to_win_path(str(found_path))
+    if not _ok:
+        if _err == "access_denied":
+            return ToolResult(
+                success=False,
+                text=f"Access denied: {win_target}",
+                spoken=f"I found the folder, but Windows denied access to {found_path.name}.",
+                data={"path": win_target, "error_type": "access_denied"},
+            )
 
     try:
-        subprocess.Popen([cmd_exe, "/c", f'start "" "{win_target}"'])
-        name = found_path.name
-        spoken = f"Opening {name}."
+        subprocess.Popen([cmd_exe, "/c", "start", "", win_target],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        spoken = f"Opened {found_path.name}{_drive_suffix}."
         _store_last_action(ctx, "smart_open", {**params, "_found_path": win_target}, spoken)
         return ToolResult(success=True, text=f"Opened: {win_target}", spoken=spoken,
-                          action_path=win_target)
+                          action_path=win_target,
+                          data={"path": win_target, "source": "disk_scan"})
+    except PermissionError:
+        return ToolResult(
+            success=False,
+            text=f"Permission denied: {win_target}",
+            spoken=f"I found the folder, but Windows denied access.",
+            data={"path": win_target, "error_type": "access_denied"},
+        )
     except Exception as exc:
-        return ToolResult(success=False, text=str(exc), spoken="Couldn't open that.", error=str(exc))
+        return ToolResult(
+            success=False, text=str(exc),
+            spoken="I found it but couldn't open it.",
+            error=str(exc),
+            data={"error_type": "open_failed"},
+        )
 
 # ── Takeover Mode ─────────────────────────────────────────────────────────────
 

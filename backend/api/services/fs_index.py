@@ -178,6 +178,7 @@ class FSIndex:
         self,
         query: str,
         type_filter: Optional[str] = None,
+        drive: Optional[str] = None,
         limit: int = 5,
     ) -> List[Path]:
         """
@@ -187,42 +188,105 @@ class FSIndex:
         ----------
         query       : substring to search for in the *name* column
         type_filter : 'file', 'folder', or None (both)
+        drive       : single drive letter ('E', 'D', etc.) to restrict search
         limit       : max results to return
 
         Returns
         -------
         List of Path objects, ordered by path length (shorter = shallower).
+        Logs [FS_INDEX_HIT] on match or [FS_INDEX_MISS] on empty result.
         """
         if not query:
             return []
 
-        pattern = f"%{query}%"
+        name_pattern = f"%{query}%"
+        conditions = ["name LIKE ? COLLATE NOCASE"]
+        params: list = [name_pattern]
 
         if type_filter in ("file", "folder"):
-            sql = (
-                "SELECT path FROM entries "
-                "WHERE name LIKE ? COLLATE NOCASE AND type = ? "
-                "ORDER BY length(path) "
-                f"LIMIT {int(limit)}"
-            )
-            params: tuple = (pattern, type_filter)
-        else:
-            sql = (
-                "SELECT path FROM entries "
-                "WHERE name LIKE ? COLLATE NOCASE "
-                "ORDER BY length(path) "
-                f"LIMIT {int(limit)}"
-            )
-            params = (pattern,)
+            conditions.append("type = ?")
+            params.append(type_filter)
+
+        if drive:
+            drive_prefix = f"/mnt/{drive.lower()}/%"
+            conditions.append("(path LIKE ? OR drive = ?)")
+            params.extend([drive_prefix, f"/mnt/{drive.lower()}"])
+
+        where = " AND ".join(conditions)
+        sql = (
+            f"SELECT path FROM entries WHERE {where} "
+            f"ORDER BY length(path) LIMIT {int(limit)}"
+        )
 
         try:
             conn = _get_thread_conn(self._db_path)
             cur = conn.execute(sql, params)
             rows = cur.fetchall()
-            return [Path(row[0]) for row in rows]
+            results = [Path(row[0]) for row in rows]
+            if results:
+                logger.debug("[FS_INDEX_HIT] query=%r drive=%s type=%s results=%d first=%s",
+                             query, drive or "any", type_filter or "any", len(results), results[0])
+            else:
+                logger.debug("[FS_INDEX_MISS] query=%r drive=%s type=%s",
+                             query, drive or "any", type_filter or "any")
+            return results
         except sqlite3.Error as exc:
             logger.error("fs_index search error: %s", exc)
             return []
+
+    def search_fuzzy(
+        self,
+        query: str,
+        type_filter: Optional[str] = None,
+        drive: Optional[str] = None,
+        limit: int = 5,
+    ) -> List[Path]:
+        """
+        Try exact substring first; fall back to fuzzy matching via difflib.
+
+        Returns list of (path, score) where score is 0–1 similarity.
+        """
+        exact = self.search(query, type_filter=type_filter, drive=drive, limit=limit)
+        if exact:
+            return exact
+
+        # Fuzzy fallback — pull candidate names and score them
+        conditions = ["1=1"]
+        params: list = []
+        if type_filter in ("file", "folder"):
+            conditions.append("type = ?")
+            params.append(type_filter)
+        if drive:
+            conditions.append("(path LIKE ? OR drive = ?)")
+            params.extend([f"/mnt/{drive.lower()}/%", f"/mnt/{drive.lower()}"])
+        where = " AND ".join(conditions)
+        sql = f"SELECT path, name FROM entries WHERE {where} ORDER BY length(path) LIMIT 50000"
+
+        try:
+            conn = _get_thread_conn(self._db_path)
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            return []
+
+        import difflib
+        q_lower = query.lower()
+        scored: list[tuple[float, str]] = []
+        for path_str, name in rows:
+            name_l = name.lower()
+            if q_lower in name_l:
+                score = 1.0
+            else:
+                score = difflib.SequenceMatcher(None, q_lower, name_l).ratio()
+            if score >= 0.6:
+                scored.append((score, path_str))
+
+        scored.sort(key=lambda x: (-x[0], len(x[1])))
+        results = [Path(p) for _, p in scored[:limit]]
+        if results:
+            logger.debug("[FS_INDEX_FUZZY_HIT] query=%r results=%d", query, len(results))
+        else:
+            logger.debug("[FS_INDEX_FUZZY_MISS] query=%r", query)
+        return results
 
     # ------------------------------------------------------------------
     # Internal — DB setup
@@ -275,7 +339,7 @@ class FSIndex:
 
     def _rebuild(self) -> None:
         """Full scan of SCAN_ROOTS and (re)populate the SQLite table."""
-        logger.info("fs_index: starting full rebuild")
+        logger.info("[FS_INDEX] starting full rebuild — roots=%s", [str(r) for r in SCAN_ROOTS])
         start = time.monotonic()
         now = time.time()
 
@@ -284,7 +348,7 @@ class FSIndex:
             if not root.exists():
                 continue
             drive = _drive_for(root)
-            logger.debug("fs_index: scanning %s", root)
+            logger.info("[FS_INDEX] indexing drive=%s root=%s", drive, root)
             for entry_path, entry_type, entry_size in self._walk(root):
                 rows.append((
                     str(entry_path),  # path
@@ -296,18 +360,12 @@ class FSIndex:
                 ))
 
         scan_elapsed = time.monotonic() - start
-        logger.info(
-            "fs_index: scan complete — %d entries in %.1fs, writing to DB",
-            len(rows), scan_elapsed,
-        )
+        logger.info("[FS_INDEX] scan complete — entries=%d elapsed=%.1fs", len(rows), scan_elapsed)
 
         self._bulk_upsert(rows)
 
         total_elapsed = time.monotonic() - start
-        logger.info(
-            "fs_index: rebuild complete — %d entries in %.1fs total",
-            len(rows), total_elapsed,
-        )
+        logger.info("[FS_INDEX] ready entries=%d total_elapsed=%.1fs", len(rows), total_elapsed)
 
     def _walk(self, root: Path):
         """
