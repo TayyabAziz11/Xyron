@@ -64,7 +64,7 @@ backend/system_log.md
 
 # Runtime data (vector DB, brain state — rebuilt automatically)
 backend/data/chroma/
-backend/data/brain/brain_state.json
+backend/data/brain/
 
 # Audio test recordings (generated locally, not needed for dev)
 backend/data/rvc_tests/
