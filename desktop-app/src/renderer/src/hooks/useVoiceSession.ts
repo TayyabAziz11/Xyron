@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import { readAssistantSettings, buildGreeting } from './useAssistantSettings'
+import { useAuthStore } from '@desktop/stores/authStore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -75,7 +76,8 @@ const IDENTITY: Array<{ pattern: RegExp; response: string | (() => string) }> = 
     response: "Quite a lot, actually! I can open any app or setting, play YouTube, check live prices, read the news, answer questions, and handle voice commands for your whole system. Just ask.",
   },
   {
-    pattern: /\b(what('?s| is)( the| today'?s?)? (date|day)|what day is (it )?today|today'?s? date|current (date|day)|tell me (the )?(date|day)|day (and|or) date)\b/i,
+    // Date queries — English + Urdu/broken English variants
+    pattern: /\b(what(?:'?s|\s+is)?(?:\s+the)?(?:\s+today'?s?)?\s+date|today'?s?\s+date|current\s+date|tell\s+me\s+(?:the\s+)?date|can\s+you\s+tell\s+me\s+(?:the\s+)?(?:today'?s?\s+)?date|today\s+ki\s+date|aaj\s+ki\s+date|date\s+(?:kya\s+hai|batao|bata)|kya\s+date\s+hai)\b/i,
     response: () => {
       const now  = new Date()
       const day  = now.toLocaleDateString('en-US', { weekday: 'long' })
@@ -84,9 +86,18 @@ const IDENTITY: Array<{ pattern: RegExp; response: string | (() => string) }> = 
     },
   },
   {
-    pattern: /\b(what('?s| is) the time|what time is it|current time)\b/i,
+    // Day-of-week queries
+    pattern: /\b(what(?:'?s|\s+is)?(?:\s+the)?(?:\s+today'?s?)?\s+day|what\s+day\s+(?:is\s+it|is\s+today|are\s+we)|which\s+day\s+(?:is\s+(?:it|today)|are\s+we)|today(?:'?s?)?\s+(?:is\s+)?(?:konsa|kaunsa|which|what)\s*day|(?:aaj|today)\s+konsa\s+(?:day|din)(?:\s+hai)?|konsa\s+(?:day|din)\s+(?:hai|hua)|bro\s+(?:today|aaj)\s+konsa\s+day)\b/i,
     response: () => {
-      const now  = new Date()
+      const now = new Date()
+      return `It's ${now.toLocaleDateString('en-US', { weekday: 'long' })}.`
+    },
+  },
+  {
+    // Time queries — English + Urdu/broken English variants
+    pattern: /\b(what(?:'?s|\s+is)?(?:\s+the)?\s+(?:current\s+)?time|what\s+time\s+(?:is\s+it|are\s+we\s+at|do\s+(?:we|i)\s+have)|tell\s+me\s+(?:the\s+)?time|current\s+time|time\s+(?:kya\s+hai|batao|bata|hai|abhi)|kya\s+(?:time|waqt|baja)\s+(?:hai|hua)|bro\s+(?:what(?:'?s)?|kya)?\s*(?:time|waqt)|yo\s+(?:what\s+)?time|(?:time|waqt)\s+(?:kya|batao|bata))\b/i,
+    response: () => {
+      const now = new Date()
       return `It's ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}.`
     },
   },
@@ -952,6 +963,7 @@ export function useVoiceSession() {
   const [messages,     setMessages]     = useState<ConvMessage[]>([])
   const [error,        setError]        = useState<string | null>(null)
   const [followUp,     setFollowUp]     = useState<string | null>(null)
+  const getDisplayName = useAuthStore(s => s.getDisplayName)
 
   const activeRef      = useRef(false)
   const mediaRecRef    = useRef<MediaRecorder | null>(null)
@@ -1780,7 +1792,9 @@ export function useVoiceSession() {
     setSessionState('greeting')
 
     const { mode } = readAssistantSettings()
-    const greeting = buildGreeting(mode)
+    const displayName = getDisplayName()
+    const greeting = buildGreeting(mode, displayName)
+    console.log('[AUTH_USER_LOADED] voice greeting name=%s', displayName)
     addMsg('assistant', greeting)
 
     try {

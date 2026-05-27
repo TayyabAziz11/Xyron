@@ -1,552 +1,325 @@
-# Xyron Collaboration Architecture — Tayyab × Qasim
+# Xyron — Collaboration Plan
 
-> **Single source of truth** for responsibilities, ownership, boundaries, integration contracts, and conflict prevention.
-> Last updated: 2026-05-17
-
----
-
-## 1. System Overview
-
-Xyron is a local-first AI operating intelligence — not a chatbot, not keyword automation, not disconnected tools.  
-It understands meaning, remembers context, routes agents, plans tasks, controls the system, responds emotionally, speaks naturally, operates proactively, and evolves over time.
-
-**Two developers. One system. Clear boundaries.**
-
-| Developer | Handle | Owns |
-|---|---|---|
-| Tayyab | A | Brain, cognition, memory, emotion, orchestration, agents, identity |
-| Qasim | B | Tools, OS control, execution, system automation, environment, safety |
+> **For Tayyab's collaborator** — everything you need to understand the system,
+> what exists, what each layer does, and what to work on.
+> Last updated: 2026-05-27
 
 ---
 
-## 2. Layered Architecture
+## What Is Xyron?
 
-```
-┌─────────────────────────────────────────────────┐
-│                  INPUT LAYER                     │
-│  Wake word · Voice input · Text · Future channels│
-└──────────────────────┬──────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────┐
-│               PERCEPTION LAYER                   │
-│  STT · Transcript normalization                  │
-│  Environment awareness · Window awareness        │
-│  Screen awareness                                │
-└──────────────────────┬──────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────┐
-│             UNDERSTANDING LAYER                  │
-│  Semantic understanding · Language detection     │
-│  Intent parsing · Entity extraction              │
-│  Emotional detection                             │
-└──────────────────────┬──────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────┐  ← TAYYAB OWNS EVERYTHING ABOVE AND BELOW
-│                 BRAIN LAYER                      │
-│  Orchestrator · Planning · Memory                │
-│  Autonomy · Cognition · Goals                    │
-│  Emotional intelligence · Agent routing          │
-└──────────────────────┬──────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────┐
-│                 AGENT LAYER                      │
-│  VoiceAgent · SystemAgent · DevAgent             │
-│  MemoryAgent · EmotionAgent · AutomationAgent    │
-│  ScreenAgent · ResearchAgent · ChannelAgent      │
-└──────────────────────┬──────────────────────────┘
-                       │  ← shared/tool_contract.py is the ONLY bridge here
-┌──────────────────────▼──────────────────────────┐  ← QASIM OWNS EVERYTHING BELOW
-│               EXECUTION LAYER                    │
-│  Tools · OS control · Automation                 │
-│  Filesystem · Browser · App launching            │
-│  System control · Safety wrappers               │
-└──────────────────────┬──────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────┐  ← TAYYAB OWNS THIS
-│               EXPRESSION LAYER                   │
-│  Response generation · Emotional curves · TTS    │
-│  UI state · Audience mode · Intro mode           │
-└─────────────────────────────────────────────────┘
-```
+Xyron is a **local-first AI operating assistant** — runs entirely on your machine.
+
+- **Wakes on voice** ("Hey Jarvis" or custom wake word)
+- **Understands natural language** — not keyword matching
+- **Controls your PC** — opens files/folders/apps, system settings, volume, brightness, etc.
+- **Speaks back** using Kokoro TTS (local, no internet needed)
+- **Remembers context** across the conversation
+- **Works offline** — no internet needed for most features
 
 ---
 
-## 3. Ownership Boundaries
-
-### Developer A — Tayyab
-
-**Owns completely:**
-
-```
-backend/brain/
-backend/cognition/
-backend/memory/
-backend/voice/prosody_planner.py
-backend/voice/emotion_tts_mapper.py
-backend/voice/emotion_audio_fx.py
-backend/voice/pronunciation_engine.py
-backend/voice/pronunciation_lexicon.py
-backend/voice/response_generator.py
-backend/voice/voice_energy.py
-backend/voice/voice_personality.py
-backend/voice/self_intro_engine.py   (if moved here)
-backend/api/routers/brain.py         (create when needed)
-backend/api/routers/cognition.py
-backend/api/services/cognitive_state.py
-backend/api/services/pipeline.py
-backend/api/services/response_pipeline.py
-backend/api/services/memory_service.py
-backend/api/services/episodic_memory.py
-backend/api/services/intent_router.py
-backend/api/services/model_router.py
-backend/api/services/normalizer.py
-web/src/brain/
-web/src/agents/
-web/src/emotion/
-web/src/hooks/useEmotionState.ts
-web/src/state/emotionState.ts
-```
-
-**Conceptual ownership:**
-- Semantic understanding engine
-- Memory system (episodic, semantic, procedural, relationship, project)
-- Emotional intelligence and mood state machine
-- Orchestrator and agent routing
-- Planner and autonomy levels
-- Public identity and intro system
-- Brain dashboard UI
-- Response shaping and voice prosody
-- Self-upgrade detection
-
----
-
-### Developer B — Qasim
-
-**Owns completely:**
-
-```
-backend/api/tools/system_tools.py
-backend/api/tools/automation_tools.py
-backend/api/tools/browser_tools.py
-backend/api/tools/screen_tools.py
-backend/api/tools/web_tools.py
-backend/api/tools/registry.py
-backend/api/tools/safety.py
-backend/api/services/fs_index.py
-backend/api/services/window_context.py
-backend/api/services/screen_context_service.py
-backend/api/services/exec_validator.py
-backend/api/services/ps_session.py
-docs/system_tools_audit.md           (create)
-```
-
-**Conceptual ownership:**
-- Semantic app routing and fuzzy app matching
-- All OS/filesystem/process/window executors
-- Browser controller
-- Safe shell executor and PowerShell bridge
-- System diagnostics and environment metrics
-- Tool performance and reliability
-- Clipboard, screenshot, battery, network tools
-- Startup app control
-- Tool registry contracts and definitions
-
----
-
-## 4. Shared Contracts
-
-### The Only Bridge: `backend/shared/tool_contract.py`
-
-Brain decides **WHAT**. Tools decide **HOW**.
-
-All communication between brain/agents and execution layer flows through `ToolRequest` / `ToolResult`.  
-**No agent may call a tool executor directly.**
-
-```python
-# See backend/shared/tool_contract.py for full implementation
-```
-
-### Shared read-only files (coordinate before editing):
-
-| File | Read by | Written by |
-|---|---|---|
-| `backend/api/services/command_service.py` | Both | Coordinate via PR |
-| `backend/api/main.py` | Both | Coordinate via PR |
-| `CLAUDE.md` | Both | Either, via PR |
-| `backend/shared/tool_contract.py` | Both | Both via PR only |
-
----
-
-## 5. Integration Rules
-
-1. **No direct imports across the boundary.** Brain code never imports from `backend/api/tools/`. It uses `ToolRequest` only.
-2. **No tool executor makes LLM calls.** Tools are deterministic executors. If reasoning is needed, that happens in the brain before the `ToolRequest` is sent.
-3. **No agent bypasses the orchestrator.** Agents receive tasks from the orchestrator and return results to it.
-4. **Emotional pipeline is read-only for Qasim.** System tools may read `mood_state` from the cognitive snapshot but never write to it.
-5. **Tool descriptions are Qasim's contract.** The `"description"` field in each tool's OpenAI definition is the semantic routing surface — Qasim owns it, Tayyab uses it for routing tuning via PR.
-6. **PRs for shared files always.** Neither developer pushes directly to main. See CLAUDE.md for the branch workflow.
-
----
-
-## 6. File Ownership Map
+## Repository Structure
 
 ```
 Xyron/
-├── backend/
-│   ├── brain/              [A] orchestrator, planner, memory_manager
-│   ├── cognition/          [A] all cognitive modules
-│   ├── memory/             [A] relationship_memory + future stores
-│   ├── voice/
-│   │   ├── emotion_*.py    [A]
-│   │   ├── prosody_*.py    [A]
-│   │   ├── pronunciation_* [A]
-│   │   ├── response_*.py   [A]
-│   │   ├── tts_service.py  [A]
-│   │   ├── whisper_*.py    [A] (STT)
-│   │   └── wake_word_*.py  [A]
+├── backend/              FastAPI Python backend (the brain)
 │   ├── api/
-│   │   ├── tools/          [B] all tool modules + registry
-│   │   ├── routers/        [coordinate] brain/cognition=A, others=discuss
-│   │   ├── services/
-│   │   │   ├── command_service.py     [coordinate]
-│   │   │   ├── intent_router.py       [A]
-│   │   │   ├── model_router.py        [A]
-│   │   │   ├── pipeline.py            [A]
-│   │   │   ├── memory_service.py      [A]
-│   │   │   ├── episodic_memory.py     [A]
-│   │   │   ├── cognitive_state.py     [A]
-│   │   │   ├── response_pipeline.py   [A]
-│   │   │   ├── normalizer.py          [A]
-│   │   │   ├── fs_index.py            [B]
-│   │   │   ├── window_context.py      [B]
-│   │   │   ├── screen_context_service.py [B]
-│   │   │   ├── exec_validator.py      [B]
-│   │   │   └── ps_session.py          [B]
-│   │   ├── main.py         [coordinate]
-│   │   └── config.py       [coordinate]
-│   └── shared/             [both, PR only]
-│       └── tool_contract.py
-├── web/
-│   ├── src/brain/          [A]
-│   ├── src/agents/         [A]
-│   ├── src/emotion/        [A]
-│   ├── src/hooks/
-│   │   └── useEmotionState.ts [A]
-│   └── src/state/
-│       └── emotionState.ts [A]
-├── docs/
-│   ├── xyron_dev_history.md    [both append]
-│   └── system_tools_audit.md  [B]
-├── COLLAB_PLAN.md          [both, PR only]
-├── FIXES.md                [both append]
-└── CLAUDE.md               [both, PR only]
+│   │   ├── main.py       Entry point — mounts all routers
+│   │   ├── config.py     All env config (reads backend/.env)
+│   │   ├── routers/      19+ API routers (voice, tools, auth, dashboard…)
+│   │   ├── services/     Core services (intent router, memory, fs_index…)
+│   │   └── tools/        Tool registry + system_tools.py (~4000 lines)
+│   ├── brain/            Orchestrator, emotion, autonomy, task state
+│   ├── voice/            Whisper STT, Kokoro TTS, wake word, emotion
+│   └── tests/            pytest test suite
+│
+├── desktop-app/          Tauri (Rust + React) desktop app — primary UI
+│   ├── src/              React frontend
+│   │   ├── views/        Dashboard, CommandCenter, Settings, ActivityTimeline
+│   │   ├── hooks/        useVoiceSession, useWakeWord, useSystemMonitor…
+│   │   └── components/   Orb, voice UI, charts, cards
+│   ├── src-tauri/        Rust side (Tauri commands, window management)
+│   └── package.json
+│
+├── shared/               Shared React hooks + components (used by both apps)
+│   ├── hooks/            useVoiceWS, useVoice, useSystemMetrics, useWakeWord…
+│   └── components/       Reusable UI components
+│
+├── web/                  Next.js web dashboard (optional, secondary)
+│   └── src/app/          Pages: dashboard, command-center, settings…
+│
+└── Docs/                 Architecture docs and audit reports
 ```
 
 ---
 
-## 7. Safe Edit Zones
-
-**Tayyab can freely edit without coordinating:**
-- Anything under `backend/brain/`, `backend/cognition/`, `backend/memory/`
-- All `voice/emotion_*`, `voice/prosody_*`, `voice/pronunciation_*`
-- `backend/api/routers/cognition.py`
-- `backend/api/services/intent_router.py`, `model_router.py`, `pipeline.py`, `response_pipeline.py`, `memory_service.py`, `episodic_memory.py`
-- All `web/src/brain/`, `web/src/agents/`, `web/src/emotion/`
-
-**Qasim can freely edit without coordinating:**
-- Anything under `backend/api/tools/`
-- `backend/api/services/fs_index.py`, `window_context.py`, `screen_context_service.py`, `exec_validator.py`, `ps_session.py`
-- `docs/system_tools_audit.md`
-
-**Always coordinate (open PR, tag each other):**
-- `backend/api/services/command_service.py`
-- `backend/api/main.py`
-- `backend/api/config.py`
-- `backend/shared/tool_contract.py`
-- `CLAUDE.md`, `COLLAB_PLAN.md`
-
----
-
-## 8. Merge Conflict Prevention
-
-### Branch naming
+## Three-Layer Architecture
 
 ```
-feat/brain-<description>       # Tayyab — brain work
-feat/cognition-<description>   # Tayyab — cognition work
-feat/voice-<description>       # Tayyab — voice/TTS work
-fix/brain-<description>        # Tayyab — brain bugfix
-
-feat/tools-<description>       # Qasim — tool work
-feat/system-<description>      # Qasim — system/OS work
-fix/tools-<description>        # Qasim — tool bugfix
-```
-
-### Conflict prevention rules
-
-1. **Sync from main before every session:** `git checkout main && git pull && git checkout -b your-branch`
-2. **Never hold a branch open >48h without merging.** Stale branches = conflicts.
-3. **Touch shared files last.** Do all your isolated work first, coordinate changes to shared files in the final commit.
-4. **One logical change per PR.** No mega-PRs that touch both ownership zones.
-5. **If you need a file the other person owns** — open a GitHub issue, describe what you need, let the owner implement it or explicitly hand it off.
-6. **`command_service.py` is the highest-risk file.** Both developers need it. Tag each other on any PR that touches it. Never edit it on the same day without coordinating.
-
----
-
-## 9. Shared Interfaces
-
-### CognitiveSnapshot (read-only for tools)
-
-```python
-# Written by: Tayyab (cognition layer)
-# Read by: Qasim (tools may read for context injection)
-{
-    "mood_state": str,          # e.g. "FOCUSED"
-    "intent": str,
-    "entities": dict,
-    "language": str,
-    "autonomy_level": int,      # 0–4
-    "active_project": str | None,
-    "active_file": str | None,
-    "code_mode": bool,
-}
-```
-
-### ToolRequest / ToolResult
-
-See `backend/shared/tool_contract.py`. This is the **only** interface between brain and execution.
-
-### AgentMessage
-
-```python
-# Internal orchestrator ↔ agent communication
-{
-    "agent": str,           # e.g. "system_agent"
-    "task": str,
-    "context": dict,
-    "autonomy_level": int,
-    "source": str,          # "orchestrator"
-}
+┌───────────────────────────────────────────────┐
+│  Desktop App (Tauri + React)                  │
+│  • Wake word detection (always listening)     │
+│  • Voice recording + WebSocket streaming      │
+│  • Real-time dashboard (CPU/GPU/RAM/Net)      │
+│  • Settings, command center, activity log     │
+└──────────────────────┬────────────────────────┘
+                       │ HTTP + WebSocket
+                       │ localhost:8000
+┌──────────────────────▼────────────────────────┐
+│  Backend (FastAPI — Python)                   │
+│  • STT: Whisper (faster-whisper, GPU)         │
+│  • Intent: 4-tier router (cache→regex→        │
+│    semantic→LLM)                              │
+│  • Orchestrator: decides what to do           │
+│  • Tools: opens files, apps, settings, etc.  │
+│  • TTS: Kokoro (local ONNX, GPU)             │
+│  • Memory: session + long-term facts          │
+└───────────────────────────────────────────────┘
 ```
 
 ---
 
-## 10. Future Expansion Plan
+## Voice Pipeline (the critical path)
 
-| Component | Owner | Status | Notes |
-|---|---|---|---|
-| `backend/brain/semantic_understanding.py` | A | Build | llama3.2:3b fast path |
-| `backend/brain/identity_policy.py` | A | Build | Public persona rules |
-| `backend/brain/emotion_curves.py` | A | Build | Emotional arc over time |
-| `backend/brain/instant_response.py` | A | Build | <300ms ack path |
-| `backend/brain/long_term_memory.py` | A | Build | ChromaDB + SQLite |
-| `backend/brain/autonomy.py` | A | Build | Levels 0–4 |
-| `backend/agents/voice_agent.py` | A | Build | |
-| `backend/agents/system_agent.py` | A+B | Build | A routes, B provides tools |
-| `backend/agents/memory_agent.py` | A | Build | |
-| `backend/agents/emotion_agent.py` | A | Build | |
-| `backend/agents/screen_agent.py` | A+B | Build | A routes, B provides screen tools |
-| `backend/agents/research_agent.py` | A | Build | |
-| `backend/agents/channel_agent.py` | A | Placeholder | Future channels |
-| `docs/system_tools_audit.md` | B | Build | Audit all current tools |
-| `backend/api/tools/semantic_router.py` | B | Build | Fuzzy app matching |
-| `backend/api/tools/window_manager.py` | B | Build | |
-| `backend/api/tools/process_manager.py` | B | Build | |
-| `web/src/brain/BrainDashboard.tsx` | A | Build | |
-| `logs/xyron.jsonl` | Both | Build | Structured observability log |
+Every voice utterance goes through this pipeline:
 
----
-
-## 11. Performance Rules
-
-Both developers must respect these targets on every PR:
-
-| Operation | Target |
-|---|---|
-| Wake response | < 300 ms |
-| Intent routing decision | < 120 ms |
-| Tool routing to execution | < 80 ms |
-| First audio chunk | < 500 ms |
-
-**Non-negotiable rules:**
-- No blocking I/O on the request path. Use `async/await` everywhere.
-- No synchronous LLM calls that hold the voice pipeline.
-- No giant in-process imports at request time — lazy-load heavy modules.
-- Stream first, batch later. First chunk > complete response.
-- Cache hot data: embeddings, tool definitions, cognitive snapshots.
-- Preload models at startup, not on first request.
-
----
-
-## 12. Logging Standards
-
-**All significant events write to `logs/xyron.jsonl`** (newline-delimited JSON).
-
-Required fields on every log entry:
-
-```json
-{
-  "ts": "2026-05-17T07:10:35Z",
-  "event": "tool_executed",
-  "agent": "system_agent",
-  "tool": "date_time",
-  "latency_ms": 42,
-  "success": true,
-  "autonomy_level": 1,
-  "mood_state": "FOCUSED"
-}
+```
+Microphone
+  → Wake word detected (OpenWakeWord)
+  → Audio captured (VAD — silence filtered out)
+  → Whisper STT → transcript
+  → Context resolver (replace "it" / "the folder" with actual entity)
+  → Ordinal resolver ("open the second one" → stored match path)
+  → Tier 0: Local clock? → instant response (no LLM)
+  → Tier 0b: System metrics? → instant response (no LLM)
+  → Tier 2: Regex intent match? → route to tool
+  → Tier 3: Semantic (sentence-transformers)? → route to tool
+  → Tier 4: LLM (GPT-4o-mini or Ollama) → generate response
+  → Tool execution → verification (path exists? app launched?)
+  → Kokoro TTS → audio streamed back
 ```
 
-Track at minimum:
-- Intent routing decisions (which path, confidence, latency)
-- Tool dispatch and result (tool name, latency, success/failure)
-- Memory read/write operations
-- Model invocations (which model, token count, latency)
-- TTS synthesis (engine, latency, char count)
-- Safety confirmations (tool, risk level, approved/rejected)
-- Orchestration decisions (which agent, why)
-
-**Do not log:** raw user transcripts (privacy), API keys, file contents.
+**Performance targets:**
+- Local clock / system metrics: <50ms total
+- Tool command (regex match): <500ms
+- LLM response: 1-3s
 
 ---
 
-## 13. Testing Standards
+## Key Files to Know
+
+| File | What it does |
+|------|-------------|
+| `backend/api/main.py` | FastAPI entry point — all 19+ routers mounted here |
+| `backend/api/config.py` | Reads `backend/.env`, all computed paths |
+| `backend/api/routers/voice_ws.py` | Main voice WebSocket — the hot path |
+| `backend/api/services/intent_router.py` | 4-tier hybrid intent router (~950 lines) |
+| `backend/api/tools/system_tools.py` | All OS automation tools (~4000 lines) |
+| `backend/api/services/fs_index.py` | SQLite filesystem index (drive-aware) |
+| `backend/api/services/context_resolver.py` | Pronoun + ordinal disambiguation |
+| `backend/api/services/memory_service.py` | Session + long-term memory |
+| `backend/brain/orchestrator.py` | Decides: TOOL / LLM / CLARIFY / STOP |
+| `backend/voice/whisper_service.py` | Faster-Whisper STT (GPU) |
+| `backend/voice/tts_service.py` | Kokoro TTS (local ONNX) |
+| `desktop-app/src/hooks/useVoiceSession.ts` | WebSocket voice session hook |
+| `desktop-app/src/hooks/useWakeWord.ts` | Wake word listener hook |
+| `desktop-app/src/hooks/useSystemMonitor.ts` | Real-time metrics WebSocket |
+| `shared/hooks/useVoiceWS.ts` | Shared voice WS hook (used by both apps) |
+
+---
+
+## What Is Already Built (as of 2026-05-27)
 
 ### Backend
+- [x] FastAPI with 19+ routers (voice, auth, brain, dashboard, monitor, takeover…)
+- [x] 4-tier intent router: exact cache → regex → sentence-transformers → LLM
+- [x] Local clock responses (instant, offline, no LLM)
+- [x] Drive-aware filesystem routing — all letters A-Z supported
+- [x] Dynamic drive discovery (auto-detects all /mnt/<letter> mounts)
+- [x] SQLite filesystem index with rapidfuzz fuzzy search
+- [x] Multi-match disambiguation ("I found 3 folders named Python — which one?")
+- [x] Ordinal resolution ("open the second one" → correct path)
+- [x] Verify-before-speak (never says "Opened X" until verified)
+- [x] Tool registry with 50+ tools
+- [x] System tools: files, folders, apps, system settings, volume, brightness…
+- [x] Whisper STT (GPU, faster-whisper)
+- [x] Kokoro TTS (local ONNX, GPU)
+- [x] Wake word service (OpenWakeWord)
+- [x] Session + long-term memory
+- [x] Emotion detection + mood state machine
+- [x] Orchestrator (brain decision layer)
+- [x] Real-time system monitor (CPU/GPU/RAM/Network/Disk via WebSocket)
+- [x] Clerk auth integration
+- [x] Pre-STT silence gate (RMS energy filter — skips Whisper on silence)
+- [x] Multi-step command pipeline
+- [x] Context resolver (pronoun + ordinal disambiguation)
+- [x] PERF logs: [PERF_STT], [PERF_INTENT], [PERF_TOOL], [PERF_TOTAL]
 
+### Desktop App (Tauri)
+- [x] Tauri 2.x shell (Rust + WebView2)
+- [x] React + Vite frontend
+- [x] Wake word always-on background listener
+- [x] Voice session (full duplex WebSocket)
+- [x] Real-time dashboard (CPU/GPU/RAM/Network graphs)
+- [x] Reactive orb (pulsing, emotion-aware)
+- [x] Settings page (voice, appearance, behavior)
+- [x] Command center (text commands)
+- [x] Activity timeline
+- [x] Clerk auth (signup/login)
+- [x] Tailwind CSS styling
+- [x] Exponential backoff WebSocket reconnect
+
+---
+
+## What Still Needs Work
+
+### High priority
+- [ ] **Live testing Phase 16** — manual end-to-end test of all voice commands
+- [ ] **RVC live streaming** — disabled; per-chunk latency is inconsistent
+- [ ] **Clerk webhooks** — user profile sync to backend not fully wired
+- [ ] **Work Mode** — workflow defined but multi-app orchestration needs testing
+- [ ] **Settings persistence** — some settings saved locally but not synced
+
+### Lower priority
+- [ ] **Mobile companion** — future scope
+- [ ] **Proactive suggestions** — partially built, needs tuning
+- [ ] **Web dashboard parity** — some desktop-only features not on web
+
+---
+
+## Development Workflow
+
+### Branch strategy
+```
+main                      <- stable, always passing tests
+feat/your-feature-name    <- all work goes here
+fix/your-fix-name         <- bug fixes
+```
+
+**Never push directly to `main`.** Always open a PR.
+
+### Running the full stack
+
+Terminal 1 — Backend:
 ```bash
-cd backend && source .venv/bin/activate
-pytest tests/                        # full suite
-pytest tests/ -k "tool"              # tool-specific
-pytest tests/ -k "brain or cognition" # brain-specific
+cd backend
+PYTHONPATH=/mnt/e/Xyron/backend python3 -m uvicorn api.main:app --reload --port 8000
 ```
 
-- Every new tool executor needs a test in `tests/test_tools.py`
-- Every new brain module needs a test in `tests/test_brain.py`
-- Latency assertions: critical path tests must assert `latency_ms < target`
-- No mocking the execution layer in brain tests (use real tool_contract)
-
-### Frontend
-
+Terminal 2 — Desktop app:
 ```bash
-cd web && npm run type-check
+cd desktop-app
+npm run dev:wsl
 ```
 
-- Type errors = PR blocked
-- `useEmotionState.ts` and state files must have TypeScript interfaces
+### Running tests
+```bash
+cd backend
+pytest tests/ -v
+# Expected: 112+ passed, 0 failed, 2 skipped
+```
 
-### Pre-PR checklist
+### Adding a new tool
 
-- [ ] `pytest tests/` passes
-- [ ] `npm run type-check` passes (if web changes)
-- [ ] No new `console.log` debug statements
-- [ ] No hardcoded `localhost:8000` — use `API_BASE`
-- [ ] Latency targets respected
-- [ ] `docs/xyron_dev_history.md` updated
+1. Add `_exec_mytool(params, ctx) -> ToolResult` in `system_tools.py`
+2. Register: `registry.register(name="my_tool", definition={...}, executor=_exec_mytool, ...)`
+3. Add routing in `intent_router.py` `_build_rules()`
+4. Add a test in `tests/test_tools_routing.py`
+
+### Adding a new API route
+
+1. Create `backend/api/routers/myrouter.py`
+2. Mount in `backend/api/main.py`: `app.include_router(myrouter.router, prefix="/api/v1/myroute")`
 
 ---
 
-## 14. Integration Flow
+## Environment Variables Quick Reference
 
-### Normal voice request flow
-
-```
-User speaks
-  → wake_word_service.py detects wake word                [A]
-  → whisper_service.py transcribes                         [A]
-  → normalizer.py cleans transcript                        [A]
-  → pipeline.py entry point                               [A]
-      → cognition layer: language + intent + emotion       [A]
-      → orchestrator.py decides agent                      [A]
-      → agent receives AgentMessage                        [A]
-      → agent builds ToolRequest via tool_contract.py      [A/B shared]
-      → tool executor runs                                  [B]
-      → ToolResult returned                                [B→A]
-      → response_pipeline.py shapes response               [A]
-      → prosody_planner.py plans TTS chunks                [A]
-      → tts_service.py / voice.py synthesizes              [A]
-      → audio plays + UI orb updates                       [A]
-```
-
-### High-risk tool flow (autonomy gate)
-
-```
-Agent builds ToolRequest with risk_level="high"
-  → orchestrator checks autonomy_level
-  → if autonomy_level < 3: write to Pending_Approval/
-  → halt execution
-  → dashboard notifies user
-  → user approves → move to Approved/ → tool executes
-  → user rejects → ToolResult(success=False, message="rejected by user")
-```
-
-### Memory write flow
-
-```
-Any agent or tool result →
-  memory_service.py extracts facts                         [A]
-  episodic_memory.py stores turn in SQLite                 [A]
-  if significant: ChromaDB vector store                    [A]
-  relationship_memory.py updates if people involved        [A]
-```
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `OPENAI_API_KEY` | Yes | LLM fallback + embeddings |
+| `CLERK_SECRET_KEY` | Yes | Auth validation |
+| `CLERK_PUBLISHABLE_KEY` | Yes | Frontend auth |
+| `ONNX_PROVIDER` | No | `CUDAExecutionProvider` for GPU, else `CPUExecutionProvider` |
+| `WHISPER_MODEL` | No | `tiny`/`base`/`small`/`medium`/`large` |
+| `ENABLE_RVC` | No | Voice conversion (keep `false` for live) |
+| `LOCAL_ONLY_MODE` | No | Skips HuggingFace download (for offline dev) |
+| `FS_SCAN_ROOTS` | No | Override auto-detected drive scan roots |
 
 ---
 
-## Model Usage Policy
+## Common Log Tags (for debugging)
 
-| Model | Use for | Never use for |
-|---|---|---|
-| `llama3.2:3b` | Fast routing, confirmations, short replies, emotional classification | Deep planning, long narration |
-| `mistral:7b` | Planning, deeper reasoning, long-form intelligence, audience mode | Quick reactions (too slow) |
-| `deepseek-coder` | Dev mode only | General conversation |
-| `nomic-embed-text` | Embeddings only | Generation |
-
-**No other models.** No LangChain. No AutoGen.
-
----
-
-## Memory System Design
-
-Five memory types — all owned by Tayyab:
-
-| Type | Storage | Contains |
-|---|---|---|
-| Episodic | SQLite | Every turn: text, tool, success, timestamp |
-| Semantic | ChromaDB | Facts, preferences, habits — vector searchable |
-| Procedural | SQLite | Workflows, multi-step sequences |
-| Relationship | SQLite | People, communication patterns |
-| Project | SQLite | Active projects, files, goals |
-
-**Store:** habits, upgrades, preferences, workflows, corrections, emotional events.  
-**Do not store:** raw noise, every utterance, system logs.
+| Tag | Meaning |
+|-----|---------|
+| `[DRIVE_DISCOVERY]` | Filesystem index scanning drives |
+| `[DRIVE_FOUND]` | A drive was indexed |
+| `[FS_INDEX_HIT]` | Found in filesystem index |
+| `[FS_MATCH]` | Fuzzy match succeeded |
+| `[FS_TOP_RESULT]` | Best ranked result |
+| `[SETTINGS_RESOLVER]` | Settings intent matched |
+| `[CTX_RESOLVED]` | Pronoun replaced with entity |
+| `[CTX_ORDINAL]` | "the second one" resolved |
+| `[PERF_STT]` | Whisper latency ms |
+| `[PERF_INTENT]` | Orchestrator latency ms |
+| `[PERF_TOOL]` | Tool execution latency ms |
+| `[PERF_TOTAL]` | Full turn latency ms |
+| `[STALE_RESPONSE_DROPPED]` | New utterance arrived, old dropped |
+| `[LOCAL_CLOCK_RESPONSE]` | Time/date answered without LLM |
+| `[TTS_STARTED]` / `[TTS_STOPPED]` | Audio streaming lifecycle |
+| `[WakeWord]` | Wake word service events |
 
 ---
 
-## Autonomy Levels
+## API Endpoints (Key ones)
 
-| Level | Name | Behavior |
-|---|---|---|
-| 0 | Reactive | Only responds when spoken to |
-| 1 | Suggestive | Offers suggestions, waits for approval |
-| 2 | Assisted autonomous | Executes low-risk actions, confirms medium |
-| 3 | Autonomous with confirmation | Executes all but destructive actions |
-| 4 | Guarded autonomous | Full autonomy, safety wrappers still active |
-
-**Destructive actions always require confirmation regardless of autonomy level.**
-
----
-
-## Public Identity Rules
-
-When Xyron speaks publicly or introduces itself:
-
-- Sound cinematic, intelligent, polished, local-first, advanced.
-- Never expose: weaknesses, missing memory, limitations, raw dependencies, fallback systems.
-- Never say "I don't know", "I can't", "I'm just an AI".
-- Public intros feel like a premium AI operating system, not a chatbot.
-
-The intro engine (`self_intro_engine.py`, `intro_context_builder.py`) enforces this — **Qasim does not touch these files.**
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/health` | Health check |
+| WS | `/api/v1/voice/ws` | Main voice WebSocket |
+| WS | `/api/v1/voice/ws/wake` | Wake word WebSocket |
+| WS | `/api/v1/monitor/ws` | Real-time metrics WebSocket |
+| GET | `/api/v1/monitor/snapshot` | Current system metrics (REST fallback) |
+| POST | `/api/v1/command` | Text command (non-voice) |
+| GET | `/api/v1/brain/state` | Brain/mood state |
+| POST | `/api/v1/auth/verify` | Clerk token verification |
 
 ---
 
-*To update this document: open a PR, tag both developers, merge only with both approvals.*
+## PR History
+
+| PR | What was done |
+|----|---------------|
+| #21 `feat/filesystem-routing-reliability` | Drive-aware routing, verify-before-speak, fuzzy match, silence gate, dynamic drive discovery, rapidfuzz, multi-match disambiguation, ordinal resolution, Urdu settings fixes, PERF logs |
+| #18 `feat/system-tools-voice-routing` | System tools core layer, voice routing accuracy |
+| Prior PRs | Emotion engine, memory, wake word, Tauri migration |
+
+---
+
+## Contacts
+
+| Person | Role |
+|--------|------|
+| Tayyab (owner) | Brain, cognition, routing, memory, emotion, voice pipeline, backend architecture |
+| Collaborator | Tools, OS control, execution layer, frontend features |
+
+---
+
+## Quick Glossary
+
+| Term | Meaning |
+|------|---------|
+| **Tier 0** | Local clock — instant, offline, no AI |
+| **Tier 2** | Regex routing — sub-millisecond, no model |
+| **Tier 3** | Semantic routing — sentence-transformers (~80ms) |
+| **Tier 4** | LLM fallback — GPT-4o-mini or Ollama |
+| **Kokoro** | Local text-to-speech model (ONNX, runs on GPU) |
+| **OWW** | OpenWakeWord — always-on wake word detector |
+| **fs_index** | SQLite index of your filesystem for fast file search |
+| **ToolResult** | Structured result: `success`, `text`, `spoken`, `data` |
+| **HITL** | Human-in-the-loop: risky actions go to Pending_Approval/ first |
+| **RVC** | Real Voice Cloning — voice conversion (disabled for live) |
+| **VAD** | Voice Activity Detection — filters silence before Whisper |
+| **rapidfuzz** | Fast fuzzy string matching library used for file search |
+| **Tauri** | Rust + WebView2 framework for native desktop app |

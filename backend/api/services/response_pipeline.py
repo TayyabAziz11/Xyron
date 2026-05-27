@@ -13,9 +13,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import AsyncIterator, Optional
 
 logger = logging.getLogger(__name__)
+
+# Circuit-breaker: if OpenAI times out, route to Ollama for 60s
+_OPENAI_TIMEOUT_S  = 8.0          # give up on OpenAI after 8s (streaming first-token)
+_FALLBACK_DURATION = 60.0         # use Ollama for this many seconds after one failure
+_OLLAMA_BASE       = "http://localhost:11434/v1"
+_OLLAMA_MODEL      = "llama3.2"   # override with OLLAMA_MODEL env var at startup
+_openai_failed_until: float = 0.0 # epoch time; 0 = circuit closed (use OpenAI)
 
 # Sentence boundary after .  !  ?  followed by whitespace or end-of-string
 _SENT_RE = re.compile(r'(?<=[.!?])(?:\s+|$)')
@@ -56,6 +64,42 @@ async def _kokoro_async(text: str, voice: str, speed: float) -> Optional[bytes]:
     return None
 
 
+async def _ollama_stream(
+    transcript: str,
+    history: list[dict],
+    voice: str,
+    speed: float,
+) -> AsyncIterator[tuple[str, Optional[bytes], int, bool]]:
+    """Fallback: non-streaming Ollama call wrapped as a single-chunk stream."""
+    import os as _os
+    model = _os.getenv("OLLAMA_MODEL", _OLLAMA_MODEL)
+    messages: list[dict] = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
+    for h in history[-6:]:
+        role = h.get("role", "user")
+        text = h.get("text", h.get("content", ""))
+        if role in ("user", "assistant") and text:
+            messages.append({"role": role, "content": text})
+    messages.append({"role": "user", "content": transcript})
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(base_url=_OLLAMA_BASE, timeout=15.0) as client:
+            resp = await client.post(
+                "/chat/completions",
+                json={"model": model, "messages": messages, "max_tokens": 150, "stream": False},
+            )
+            resp.raise_for_status()
+            text_out = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    except Exception as exc:
+        logger.warning("[MODEL_FALLBACK] ollama failed: %s", exc)
+        text_out = "I'm having trouble connecting right now. Please try again."
+
+    text_out = _strip_md(text_out)
+    if text_out:
+        wav = await _kokoro_async(text_out, voice, speed)
+        yield text_out, wav, 1, True
+
+
 async def stream_response_with_tts(
     transcript: str,
     history: list[dict],
@@ -69,6 +113,7 @@ async def stream_response_with_tts(
     starts synthesizing it while OpenAI continues generating the next sentence.
     The consumer receives the audio chunk as soon as synthesis completes.
     """
+    global _openai_failed_until
     from api.config import settings as _cfg
     from api.services.model_router import select_model
 
@@ -76,10 +121,20 @@ async def stream_response_with_tts(
         logger.warning("[Pipeline] No OpenAI key — returning empty stream")
         return
 
+    # Circuit-breaker: OpenAI failed recently → route to Ollama immediately
+    use_ollama = time.time() < _openai_failed_until
+    if use_ollama:
+        logger.info("[MODEL_SWITCH_LOCAL] [MODEL_ROUTE] using=ollama reason=circuit_open remaining=%.0fs",
+                    _openai_failed_until - time.time())
+        async for item in _ollama_stream(transcript, history, voice, speed):
+            yield item
+        return
+
     # Pick model based on complexity
     model = select_model(transcript)
     if model in ("local", "offline"):
         model = "gpt-4o-mini"
+    logger.info("[MODEL_ROUTE] using=openai model=%s", model)
 
     messages: list[dict] = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
     for h in history[-10:]:
@@ -95,12 +150,13 @@ async def stream_response_with_tts(
 
     async def _producer() -> None:
         """Stream OpenAI, detect sentence boundaries, fire TTS tasks into queue."""
+        global _openai_failed_until
         pending   = ""
         chunk_idx = 0
 
         try:
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=_cfg.openai_api_key)
+            client = AsyncOpenAI(api_key=_cfg.openai_api_key, timeout=_OPENAI_TIMEOUT_S)
 
             async with await client.chat.completions.create(
                 model=model,
@@ -132,7 +188,9 @@ async def stream_response_with_tts(
                         pending = parts[-1]
 
         except Exception as exc:
-            logger.warning("[Pipeline] LLM stream error: %s", exc)
+            _openai_failed_until = time.time() + _FALLBACK_DURATION
+            logger.warning("[MODEL_SWITCH_LOCAL] [MODEL_FALLBACK] openai stream failed: %s — using ollama for %.0fs",
+                           exc, _FALLBACK_DURATION)
         finally:
             # Flush remaining fragment as final
             remaining = _strip_md(pending)
@@ -181,30 +239,62 @@ async def quick_response(
     transcript: str,
     history: list[dict] | None = None,
     model: str = "gpt-4o-mini",
+    system_override: Optional[str] = None,
 ) -> str:
     """
     Non-streaming LLM call. Returns the full response text.
     Used for tool narration, clarification prompts, and low-latency paths.
     """
+    global _openai_failed_until
     from api.config import settings as _cfg
     if not _cfg.openai_api_key:
         return "I'm not sure how to help with that."
 
-    messages: list[dict] = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
+    # Circuit-breaker: OpenAI failed recently → call Ollama instead
+    if time.time() < _openai_failed_until:
+        import os as _os
+        import httpx
+        ol_model = _os.getenv("OLLAMA_MODEL", _OLLAMA_MODEL)
+        logger.info("[MODEL_ROUTE] quick_response using=ollama model=%s", ol_model)
+        sys_prompt = system_override or VOICE_SYSTEM_PROMPT
+        msgs = [{"role": "system", "content": sys_prompt}]
+        for h in (history or [])[-6:]:
+            r = h.get("role", "user")
+            t = h.get("text", h.get("content", ""))
+            if r in ("user", "assistant") and t:
+                msgs.append({"role": r, "content": t})
+        msgs.append({"role": "user", "content": transcript})
+        try:
+            async with httpx.AsyncClient(base_url=_OLLAMA_BASE, timeout=15.0) as client:
+                resp = await client.post(
+                    "/chat/completions",
+                    json={"model": ol_model, "messages": msgs, "max_tokens": 150, "stream": False},
+                )
+                resp.raise_for_status()
+                return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        except Exception as exc:
+            logger.warning("[MODEL_FALLBACK] ollama quick_response failed: %s", exc)
+            return "I'm having trouble connecting right now."
+
+    sys_prompt = system_override or VOICE_SYSTEM_PROMPT
+    messages: list[dict] = [{"role": "system", "content": sys_prompt}]
     for h in (history or [])[-6:]:
         role = h.get("role", "user")
-        text = h.get("text", h.get("content", ""))
-        if role in ("user", "assistant") and text:
-            messages.append({"role": role, "content": text})
+        txt = h.get("text", h.get("content", ""))
+        if role in ("user", "assistant") and txt:
+            messages.append({"role": role, "content": txt})
     messages.append({"role": "user", "content": transcript})
 
     try:
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=_cfg.openai_api_key)
+        client = AsyncOpenAI(api_key=_cfg.openai_api_key, timeout=_OPENAI_TIMEOUT_S)
+        logger.info("[MODEL_ROUTE] quick_response using=openai model=%s", model)
         resp = await client.chat.completions.create(
             model=model, messages=messages, max_tokens=150, temperature=0.7,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
-        logger.warning("[Pipeline] quick_response error: %s", exc)
+        _openai_failed_until = time.time() + _FALLBACK_DURATION
+        logger.warning("[MODEL_FALLBACK] openai quick_response failed: %s — ollama for %.0fs",
+                       exc, _FALLBACK_DURATION)
         return "I ran into an issue. Please try again."

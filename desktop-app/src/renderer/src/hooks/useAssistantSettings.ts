@@ -47,15 +47,16 @@ function _timeOfDay(): string {
   return 'evening'
 }
 
-export function buildGreeting(mode: BehaviorMode): string {
-  const tod = _timeOfDay()
-  if (mode === 'friendly')     return "Hey! I'm Xyron, your personal AI assistant. I can play music, read the news, open apps, answer questions, and a whole lot more. Just speak naturally!"
-  if (mode === 'professional') return `Good ${tod}. I'm Xyron — ready to assist with voice commands, news briefings, web searches, media playback, and system controls. Speak whenever you're ready.`
-  if (mode === 'boss')         return `Good ${tod}, boss. I'm Xyron, ready and at your service. Just give the word.`
-  if (mode === 'work')         return `Good ${tod}. Work mode active — I'll keep things focused and brief. What's first?`
-  if (mode === 'chill')        return `Hey, Xyron here. No rush — just say what you need and I've got you.`
+export function buildGreeting(mode: BehaviorMode, displayName?: string): string {
+  const tod  = _timeOfDay()
+  const name = displayName && displayName !== 'boss' ? displayName : null
+  if (mode === 'friendly')     return `Hey${name ? `, ${name}` : ''}! I'm Xyron, your personal AI assistant. I can play music, read the news, open apps, answer questions, and a whole lot more. Just speak naturally!`
+  if (mode === 'professional') return `Good ${tod}${name ? `, ${name}` : ''}. I'm Xyron — ready to assist. Speak whenever you're ready.`
+  if (mode === 'boss')         return `Good ${tod}, ${name ?? 'boss'}. I'm Xyron, ready and at your service. Just give the word.`
+  if (mode === 'work')         return `Good ${tod}${name ? `, ${name}` : ''}. Work mode active — I'll keep things focused and brief. What's first?`
+  if (mode === 'chill')        return `Hey${name ? `, ${name}` : ''}, Xyron here. No rush — just say what you need and I've got you.`
   if (mode === 'focus')        return `Focus mode on. I'll keep it short. Go ahead.`
-  return "Hey! I'm Xyron, ready to help. You can ask me to play videos, get the news, open apps, or answer any question — just speak naturally."
+  return `Hey${name ? `, ${name}` : ''}! I'm Xyron, ready to help. You can ask me to play videos, get the news, open apps, or answer any question — just speak naturally.`
 }
 
 const STORAGE_KEY = 'xyron:assistant-settings-v2'

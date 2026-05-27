@@ -3,7 +3,11 @@ module.exports = {
   content: [
     './index.html',
     './src/**/*.{js,ts,jsx,tsx}',
-    '../shared/**/*.{js,ts,jsx,tsx}',
+    '../shared/components/**/*.{tsx,jsx}',
+    '../shared/hooks/**/*.{ts,tsx}',
+    '../shared/contexts/**/*.{ts,tsx}',
+    '../shared/lib/**/*.{ts,tsx}',
+    '../shared/styles/**/*.css',
   ],
   theme: {
     extend: {

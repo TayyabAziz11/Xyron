@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' http://localhost:8000 ws://localhost:8000 ipc: asset: https://asset.localhost blob: https://*.clerk.accounts.dev https://*.clerk.com https://*.lcl.dev; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://*.clerk.accounts.dev https://*.clerk.com; style-src 'self' 'unsafe-inline' https://*.clerk.accounts.dev https://*.clerk.com; img-src 'self' data: asset: https://asset.localhost blob: https://*.clerk.com https://*.gravatar.com https://img.clerk.com; media-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' https://*.clerk.accounts.dev https://*.clerk.com;" />
+    <title>Xyron</title>
+    <link rel="icon" type="image/png" href="/icon-96.png" />
+  </head>
+  <body class="bg-[#08080f]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
