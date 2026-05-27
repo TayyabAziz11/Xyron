@@ -3740,6 +3740,31 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     if not query:
         return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
 
+    # Direct Windows path (from ordinal disambiguation or explicit path command)
+    # e.g. query = "E:\Projects\Python"
+    import re as _re_so
+    if _re_so.match(r'^[A-Za-z]:[\\\/]', query):
+        cmd_exe_direct = _find_cmdexe()
+        if cmd_exe_direct:
+            fs_path = _fs_path(query)
+            _ok_d, _err_d = _verify_accessible(fs_path)
+            if not _ok_d:
+                if _err_d == "access_denied":
+                    return ToolResult(success=False,
+                        text=f"Access denied: {query}",
+                        spoken=f"Windows denied access to that path.",
+                        data={"error_type": "access_denied", "path": query})
+                return ToolResult(success=False,
+                    text=f"Path not found: {query}",
+                    spoken="That path doesn't exist.",
+                    data={"error_type": "not_found", "path": query})
+            subprocess.Popen([cmd_exe_direct, "/c", "start", "", query],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            name = Path(query.replace("\\", "/")).name
+            spoken = f"Opened {name}."
+            return ToolResult(success=True, text=spoken, spoken=spoken,
+                              action_path=query, data={"path": query, "source": "direct_path"})
+
     # Normalize "X folder" → query="X", type="folder" so voice commands work naturally.
     _SUFFIX_TYPE: dict[str, str] = {
         " folders": "folder", " folder": "folder",
@@ -3781,16 +3806,20 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
             _hits = _hits[:5]
 
             if len(_hits) > 2:
-                # Multiple strong candidates — report them instead of guessing
-                _win_paths = [_wsl_to_win_path(str(h)) for h in _hits[:3]]
-                _names     = [h.name for h in _hits[:3]]
-                spoken = (f"I found {len(_hits)} folders named '{query}'{_drive_suffix}. "
-                          f"Which one? {', '.join(_names[:3])}.")
+                # Multiple strong candidates — ask user to disambiguate
+                _show = _hits[:4]
+                _win_paths = [_wsl_to_win_path(str(h)) for h in _show]
+                _numbered  = "; ".join(f"{i+1}. {h.name}" for i, h in enumerate(_show))
+                spoken = (
+                    f"I found {len(_hits)} items named '{query}'{_drive_suffix}: "
+                    f"{_numbered}. Which one should I open?"
+                )
                 return ToolResult(
                     success=False,
                     text=f"Multiple matches for '{query}': {_win_paths}",
                     spoken=spoken,
-                    data={"error_type": "multiple_matches", "matches": _win_paths, "query": query},
+                    data={"error_type": "multiple_matches", "matches": _win_paths,
+                          "query": query, "numbered": _numbered},
                 )
 
             VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
@@ -3849,11 +3878,12 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     else:
         home_fs = _fs_path(_windows_home())
         search_roots_fs = []
-        for drv_letter in ("d", "e", "f", "g"):
-            mount = Path(f"/mnt/{drv_letter}")
-            if mount.exists():
-                search_roots_fs.append(str(mount))
-        if home_fs.exists():
+        # Use dynamic drive discovery — never hardcode letters
+        for _drv_label, _drv_path in _get_all_windows_drives():
+            _m = Path(_drv_path)
+            if _m.exists() and str(_m) not in search_roots_fs:
+                search_roots_fs.append(str(_m))
+        if home_fs.exists() and str(home_fs) not in search_roots_fs:
             search_roots_fs.append(str(home_fs))
 
     _prune_names = [
@@ -3983,9 +4013,10 @@ registry.register(name="takeover_mode",
 
 registry.register(name="smart_open",
     definition={"type":"function","function":{"name":"smart_open",
-        "description":"Search the user's system for a file, folder, video, or picture by name and open it. Use for: 'open my course folder', 'play that video', 'show that picture', 'open the Downloads folder', 'play the movie'.",
+        "description":"Search the user's system for a file, folder, video, or picture by name and open it. Use for: 'open my course folder', 'play that video', 'show that picture', 'open the Downloads folder', 'play the movie', 'open python folder in E drive'.",
         "parameters":{"type":"object","properties":{
             "query":{"type":"string","description":"Name or partial name of the file/folder to find"},
-            "type":{"type":"string","enum":["folder","file","video","image","any"],"description":"Type to search for"}
+            "type":{"type":"string","enum":["folder","file","video","image","any"],"description":"Type to search for"},
+            "drive":{"type":"string","description":"Single drive letter to restrict search (e.g. 'E', 'D'). Omit to search all drives."}
         },"required":["query"]}}},
     executor=_exec_smart_open, risk="low", category="system")

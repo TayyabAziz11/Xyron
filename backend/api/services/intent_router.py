@@ -42,7 +42,7 @@ _TOOL_DESCS: dict[str, str] = {
     "open_application":       "launch start run open application program app chrome firefox vscode spotify discord steam notepad",
     "smart_open":             "open find show me a file folder picture photo video document on my system locally",
     "open_directory":         "open folder directory file explorer my documents downloads desktop pictures",
-    "open_drive":             "open drive c d e f disk explorer",
+    "open_drive":             "open drive c d e f g h i j k l disk partition explorer storage",
     "brightness_control":     "set increase decrease adjust screen brightness dim bright make screen brighter darker",
     "volume_control":         "set increase decrease adjust volume audio sound louder quieter turn volume up down",
     "mute_unmute":            "mute unmute toggle mute silence audio sound",
@@ -314,12 +314,12 @@ class IntentRouter:
         # ── Drive letters (must be before open_application catch-all) ───────────
         # "open C drive", "open the D drive", "go to E drive", "open C:"
         add(
-            r'\b(?:open|go\s+to|show|browse|navigate\s+to)\s+(?:the\s+)?([a-fA-F])\s+(?:drive|disk|partition)\b',
+            r'\b(?:open|go\s+to|show|browse|navigate\s+to)\s+(?:the\s+)?([a-zA-Z])\s+(?:drive|disk|partition)\b',
             "open_drive",
             lambda m: {"drive": m.group(1).upper()},
         )
         add(
-            r'\b(?:open|go\s+to|show|browse)\s+(?:the\s+)?([a-fA-F]):\s*[\\\/]?\b',
+            r'\b(?:open|go\s+to|show|browse)\s+(?:the\s+)?([a-zA-Z]):\s*[\\\/]?\b',
             "open_drive",
             lambda m: {"drive": m.group(1).upper()},
         )
@@ -406,7 +406,7 @@ class IntentRouter:
             name_raw = m.group(1).strip().rstrip('.,!?')
             loc_raw  = m.group(2).strip().rstrip('.,!?')
             # "C drive" / "C:" / "C disk" → "C:\"
-            loc_m = re.match(r'^([a-fA-F])\s*(?:drive|disk|:)?$', loc_raw, re.IGNORECASE)
+            loc_m = re.match(r'^([a-zA-Z])\s*(?:drive|disk|:)?$', loc_raw, re.IGNORECASE)
             path = loc_m.group(1).upper() + ':\\' if loc_m else loc_raw
             return {'name': name_raw, 'path': path}
 
@@ -485,7 +485,7 @@ class IntentRouter:
 
         # D1: drive FIRST → "in E drive open folder named python"
         add(
-            r'\b(?:in|on|from)\s+(?P<d1>[a-fA-F])\s+(?:drive|disk)\b'
+            r'\b(?:in|on|from)\s+(?P<d1>[a-zA-Z])\s+(?:drive|disk)\b'
             r'(?:\s+(?:open|find|locate|show|search(?:\s+for)?))?\s+'
             r'(?:(?:the|my|a)\s+)?'
             r'(?:(?P<t1>folder|directory|file|document|dir)\s+)?'
@@ -506,7 +506,7 @@ class IntentRouter:
             r'(?:(?P<t2>folder|directory|file|document|dir)\s+)?'
             r'(?:(?:named|called)\s+)?'
             r'(?P<q2>(?!(?:the|a|my|in|on|named|called)\b)\S+(?:\s+\S+){0,2}?)'
-            r'\s+(?:in|on|from)\s+(?P<d2>[a-fA-F])\s+(?:drive|disk)\b',
+            r'\s+(?:in|on|from)\s+(?P<d2>[a-zA-Z])\s+(?:drive|disk)\b',
             'smart_open',
             lambda m: {
                 "query": m.group("q2").strip().rstrip(".,!?"),
@@ -520,7 +520,7 @@ class IntentRouter:
             r'\b(?:find|locate|search(?:\s+for)?|look\s+for)\s+'
             r'(?:(?:the|my|a)\s+)?'
             r'(?P<q3>\S+(?:\s+\S+){0,3}?)'
-            r'\s+(?:in|on|from)\s+(?P<d3>[a-fA-F])\s+(?:drive|disk)\b',
+            r'\s+(?:in|on|from)\s+(?P<d3>[a-zA-Z])\s+(?:drive|disk)\b',
             'smart_open',
             lambda m: {
                 "query": m.group("q3").strip().rstrip(".,!?"),
@@ -531,7 +531,7 @@ class IntentRouter:
         # D4: drive letter + name + type-word at end
         # "E drive python folder"  /  "D drive resume file"
         add(
-            r'\b(?P<d4>[a-fA-F])\s+(?:drive|disk)\s+'
+            r'\b(?P<d4>[a-zA-Z])\s+(?:drive|disk)\s+'
             r'(?P<q4>(?!(?:folder|directory|file|document|dir)\b)\S+(?:\s+\S+){0,3}?)\s+'
             r'(?P<t4>folder|directory|file|document|dir)\b',
             'smart_open',
@@ -570,6 +570,24 @@ class IntentRouter:
             'smart_open',
             lambda m: {"query": m.group("q_file").strip().rstrip(".,!?"), "type": "file"},
         )
+
+        # ── Urdu settings shortcuts — MUST precede generic Urdu app catch-all ──
+        # "wifi kholo", "bluetooth kholo", "network on karo", etc.
+        _URDU_SETTINGS_EARLY: list[tuple[str, str]] = [
+            (r'wifi|wi-?fi',                   'wifi'),
+            (r'network',                       'network'),
+            (r'bluetooth',                     'bluetooth'),
+            (r'display|screen|monitor',        'display'),
+            (r'sound|audio',                   'sound'),
+            (r'updates?|windows?\s+updates?', 'update'),
+        ]
+        for _ukw2, _upage2 in _URDU_SETTINGS_EARLY:
+            _up2 = _upage2
+            add(
+                r'\b(?:' + _ukw2 + r')\s+(?:kholo|chalao|on\s+karo|dikao|dikhao|open\s+karo|show\s+karo|check\s+karo)\b',
+                "open_system_settings",
+                lambda m, p=_up2: {"page": p},
+            )
 
         # ── Urdu/colloquial app launch phrases ──────────────────────────────────
         # "chrome kholo", "settings kholo", "vs code chala", etc.
@@ -706,6 +724,14 @@ class IntentRouter:
             raw = m.group(1).strip().rstrip(".,!?")
             return {"app_name": _POLITE_TAIL_RE.sub('', raw).strip().rstrip(".,!?")}
 
+        # ── Direct Windows path (from ordinal disambiguation resolution) ────────
+        # e.g. "open C:\Users\tayyab\python"  or  "open E:\Projects\Python"
+        add(
+            r'^open\s+([A-Za-z]:[\\\/](?:[^\\\/\s]+[\\\/]?)+)\s*$',
+            'smart_open',
+            lambda m: {"query": m.group(1).strip(), "type": "any"},
+        )
+
         # ── Open arbitrary named folder (before open_application catch-all) ──────
         # Catches "open folder alpha", "open folder called My Projects", etc.
         # System-folder names are already handled by the open_directory rules above;
@@ -716,7 +742,7 @@ class IntentRouter:
             r'\b(?:open|show|go\s+to|browse|navigate\s+to)\s+(?:(?:the|my|a)\s+)?'
             r'folder\s+(?:called\s+|named\s+|with\s+(?:the\s+)?name\s+)?'
             r'(?P<q_dof>\S+(?:\s+\S+){0,3}?)'
-            r'\s+(?:in|on|from)\s+(?P<d_dof>[a-fA-F])\s+(?:drive|disk)\b',
+            r'\s+(?:in|on|from)\s+(?P<d_dof>[a-zA-Z])\s+(?:drive|disk)\b',
             'smart_open',
             lambda m: {
                 "query": m.group("q_dof").strip().rstrip(".,!?"),

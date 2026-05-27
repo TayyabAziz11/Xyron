@@ -50,6 +50,8 @@ class MemoryService:
         self._facts: dict[str, str] = {}
         # Last executed action — for "do it again" / "open it" resolution (legacy, kept for compat)
         self._last_action: dict | None = None
+        # Disambiguation state — stores multiple_matches list when user must choose
+        self._disambiguation: dict | None = None  # {"matches": [...], "query": str, "params": {...}}
         # Multi-slot context — typed slots for precise pronoun resolution
         # Each slot: None or a small dict with entity-specific fields.
         self._context: dict[str, dict | None] = {
@@ -148,6 +150,19 @@ class MemoryService:
     def get_last_action(self) -> dict | None:
         with self._lock:
             return dict(self._last_action) if self._last_action else None
+
+    def set_disambiguation_matches(self, matches: list, query: str, params: dict) -> None:
+        """Store a list of paths for the user to choose from (e.g. after multiple_matches)."""
+        with self._lock:
+            self._disambiguation = {"matches": list(matches), "query": query, "params": dict(params)}
+
+    def get_disambiguation_matches(self) -> dict | None:
+        with self._lock:
+            return dict(self._disambiguation) if self._disambiguation else None
+
+    def clear_disambiguation(self) -> None:
+        with self._lock:
+            self._disambiguation = None
 
     # ── Multi-slot context API ────────────────────────────────────────────────
 

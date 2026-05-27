@@ -61,14 +61,45 @@ def _detect_win_user_home() -> "Path | None":
     return None
 
 
+def _discover_all_drives() -> List[Path]:
+    """
+    Dynamically detect every mounted Windows drive on WSL2.
+
+    Scans /mnt/<letter> for all single-letter directories — covers
+    drives A–Z regardless of which letters the user actually has mounted.
+    Falls back to ~/.  Logs [DRIVE_DISCOVERY], [DRIVE_FOUND], [DRIVE_UNAVAILABLE].
+    """
+    found: List[Path] = []
+    logger.info("[DRIVE_DISCOVERY] scanning /mnt/ for mounted drives")
+    try:
+        mnt = Path("/mnt")
+        candidates = sorted(
+            d for d in mnt.iterdir()
+            if d.is_dir() and len(d.name) == 1 and d.name.isalpha()
+        )
+        for d in candidates:
+            if _is_readable(d):
+                found.append(d)
+                logger.info("[DRIVE_FOUND] drive=%s path=%s", d.name.upper(), d)
+            else:
+                logger.debug("[DRIVE_UNAVAILABLE] drive=%s path=%s (empty or dead mount)", d.name.upper(), d)
+    except Exception as exc:
+        logger.warning("[DRIVE_DISCOVERY] /mnt/ scan failed: %s — falling back to known letters", exc)
+        for letter in "cdefghij":
+            p = Path(f"/mnt/{letter}")
+            if _is_readable(p):
+                found.append(p)
+                logger.info("[DRIVE_FOUND] drive=%s path=%s (fallback)", letter.upper(), p)
+    return found
+
+
 _env_roots = os.getenv("FS_SCAN_ROOTS", "")
 if _env_roots:
     SCAN_ROOTS: List[Path] = [Path(p.strip()) for p in _env_roots.split(",") if p.strip()]
 else:
-    _candidates = [Path("/mnt/d"), Path("/mnt/e"), Path("/mnt/f"), Path("/mnt/g")]
     _win_home = _detect_win_user_home()
-    SCAN_ROOTS = [p for p in _candidates if _is_readable(p)]
-    if _win_home:
+    SCAN_ROOTS = _discover_all_drives()
+    if _win_home and _win_home not in SCAN_ROOTS:
         SCAN_ROOTS.append(_win_home)
     if not SCAN_ROOTS:
         SCAN_ROOTS.append(Path.home())
@@ -90,20 +121,36 @@ PRUNE_DIRS = {
 REBUILD_INTERVAL_SECONDS = 6 * 3600  # 6 hours
 STARTUP_DELAY_SECONDS = 5            # wait before first build on startup
 
-DDL = """
+# Base table DDL — no indexes yet (indexes are created after migrations).
+_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS entries (
-    id         INTEGER PRIMARY KEY,
-    path       TEXT    UNIQUE NOT NULL,
-    name       TEXT    NOT NULL,
-    type       TEXT    NOT NULL CHECK(type IN ('file', 'folder')),
-    drive      TEXT    NOT NULL,
-    size       INTEGER NOT NULL DEFAULT 0,
-    indexed_at REAL    NOT NULL
+    id             INTEGER PRIMARY KEY,
+    path           TEXT    UNIQUE NOT NULL,
+    name           TEXT    NOT NULL,
+    type           TEXT    NOT NULL CHECK(type IN ('file', 'folder')),
+    drive          TEXT    NOT NULL,
+    size           INTEGER NOT NULL DEFAULT 0,
+    indexed_at     REAL    NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_entries_name ON entries (name);
 CREATE INDEX IF NOT EXISTS idx_entries_type ON entries (type);
 """
+
+# Column migrations — always safe to run (errors = column already exists).
+_MIGRATIONS = [
+    "ALTER TABLE entries ADD COLUMN lowercase_name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE entries ADD COLUMN modified_time  REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE entries ADD COLUMN accessible     INTEGER NOT NULL DEFAULT 1",
+]
+
+# Index DDL — created AFTER migrations so all columns definitely exist.
+_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_entries_lowercase_name ON entries (lowercase_name);
+CREATE INDEX IF NOT EXISTS idx_entries_drive         ON entries (drive);
+"""
+
+# Legacy alias so existing callers that reference DDL still work.
+DDL = _TABLE_DDL
 
 # Module-level thread-local storage for SQLite connections.
 # Each OS thread gets its own sqlite3.Connection so we never share
@@ -199,9 +246,10 @@ class FSIndex:
         if not query:
             return []
 
-        name_pattern = f"%{query}%"
-        conditions = ["name LIKE ? COLLATE NOCASE"]
-        params: list = [name_pattern]
+        # Use lowercase_name index when possible (avoids COLLATE NOCASE full-scan).
+        name_pattern = f"%{query.lower()}%"
+        conditions = ["(lowercase_name LIKE ? OR name LIKE ? COLLATE NOCASE)"]
+        params: list = [name_pattern, f"%{query}%"]
 
         if type_filter in ("file", "folder"):
             conditions.append("type = ?")
@@ -268,25 +316,101 @@ class FSIndex:
         except sqlite3.Error:
             return []
 
-        import difflib
         q_lower = query.lower()
         scored: list[tuple[float, str]] = []
-        for path_str, name in rows:
-            name_l = name.lower()
-            if q_lower in name_l:
-                score = 1.0
-            else:
-                score = difflib.SequenceMatcher(None, q_lower, name_l).ratio()
-            if score >= 0.6:
-                scored.append((score, path_str))
+
+        try:
+            from rapidfuzz import fuzz as _rfuzz
+            for path_str, name in rows:
+                name_l = name.lower()
+                if q_lower in name_l:
+                    score = 1.0
+                else:
+                    # Combine token_set_ratio (handles word reordering) with partial_ratio
+                    s1 = _rfuzz.token_set_ratio(q_lower, name_l) / 100.0
+                    s2 = _rfuzz.partial_ratio(q_lower, name_l) / 100.0
+                    score = max(s1, s2)
+                if score >= 0.55:
+                    scored.append((score, path_str))
+            logger.debug("[FS_RANK] rapidfuzz scored %d candidates for query=%r", len(scored), query)
+        except ImportError:
+            import difflib
+            for path_str, name in rows:
+                name_l = name.lower()
+                if q_lower in name_l:
+                    score = 1.0
+                else:
+                    score = difflib.SequenceMatcher(None, q_lower, name_l).ratio()
+                if score >= 0.6:
+                    scored.append((score, path_str))
 
         scored.sort(key=lambda x: (-x[0], len(x[1])))
         results = [Path(p) for _, p in scored[:limit]]
         if results:
+            logger.info("[FS_MATCH] query=%r top=%s score=%.2f",
+                        query, results[0].name, scored[0][0] if scored else 0)
             logger.debug("[FS_INDEX_FUZZY_HIT] query=%r results=%d", query, len(results))
         else:
             logger.debug("[FS_INDEX_FUZZY_MISS] query=%r", query)
         return results
+
+    def get_discovered_drives(self) -> List[str]:
+        """Return list of drive letters that were indexed (e.g. ['D', 'E'])."""
+        drives: List[str] = []
+        for root in SCAN_ROOTS:
+            parts = root.parts
+            if len(parts) >= 3 and parts[1] == "mnt":
+                drives.append(parts[2].upper())
+        return drives
+
+    def search_ranked(
+        self,
+        query: str,
+        type_filter: Optional[str] = None,
+        drive: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[tuple]:
+        """
+        Search + rank results using rapidfuzz scoring.
+        Returns list of (score, Path) tuples, highest score first.
+        Logs [FS_TOP_RESULT] on success.
+        """
+        candidates = self.search(query, type_filter=type_filter, drive=drive, limit=200)
+        if not candidates:
+            return []
+
+        q_lower = query.lower()
+        scored: list[tuple[float, Path]] = []
+
+        try:
+            from rapidfuzz import fuzz as _rf
+            for p in candidates:
+                name_l = p.name.lower()
+                if name_l == q_lower:
+                    score = 1.0
+                elif q_lower in name_l:
+                    score = 0.95
+                else:
+                    score = max(
+                        _rf.token_set_ratio(q_lower, name_l) / 100.0,
+                        _rf.partial_ratio(q_lower, name_l) / 100.0,
+                    )
+                # Boost shallower paths (prefer top-level folders)
+                depth_penalty = len(p.parts) * 0.002
+                scored.append((max(0.0, score - depth_penalty), p))
+        except ImportError:
+            import difflib
+            for p in candidates:
+                name_l = p.name.lower()
+                score = 1.0 if q_lower in name_l else difflib.SequenceMatcher(None, q_lower, name_l).ratio()
+                scored.append((score, p))
+
+        scored.sort(key=lambda x: -x[0])
+        top = scored[:limit]
+        if top:
+            logger.info("[FS_TOP_RESULT] query=%r top=%s score=%.2f drive=%s",
+                        query, top[0][1].name, top[0][0], drive or "any")
+        return top
 
     # ------------------------------------------------------------------
     # Internal — DB setup
@@ -297,7 +421,16 @@ class FSIndex:
 
     def _init_db(self) -> None:
         conn = _get_thread_conn(self._db_path)
-        conn.executescript(DDL)
+        # 1. Create base table + original indexes (idempotent).
+        conn.executescript(_TABLE_DDL)
+        # 2. Add new columns (fail silently if already present).
+        for sql in _MIGRATIONS:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+        # 3. Create indexes that depend on new columns (now guaranteed to exist).
+        conn.executescript(_INDEX_DDL)
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -349,14 +482,17 @@ class FSIndex:
                 continue
             drive = _drive_for(root)
             logger.info("[FS_INDEX] indexing drive=%s root=%s", drive, root)
-            for entry_path, entry_type, entry_size in self._walk(root):
+            for entry_path, entry_type, entry_size, entry_mtime in self._walk(root):
                 rows.append((
-                    str(entry_path),  # path
-                    entry_path.name,  # name
-                    entry_type,       # type
-                    drive,            # drive
-                    entry_size,       # size
-                    now,              # indexed_at
+                    str(entry_path),          # path
+                    entry_path.name,          # name
+                    entry_path.name.lower(),  # lowercase_name
+                    entry_type,               # type
+                    drive,                    # drive
+                    entry_size,               # size
+                    entry_mtime,              # modified_time
+                    1,                        # accessible
+                    now,                      # indexed_at
                 ))
 
         scan_elapsed = time.monotonic() - start
@@ -395,14 +531,17 @@ class FSIndex:
             p = Path(entry.path)
 
             if is_dir:
-                yield p, "folder", 0
+                yield p, "folder", 0, 0.0
                 yield from self._walk(p)
             elif is_file:
                 try:
-                    size = entry.stat(follow_symlinks=False).st_size
+                    st = entry.stat(follow_symlinks=False)
+                    size = st.st_size
+                    mtime = st.st_mtime
                 except OSError:
                     size = 0
-                yield p, "file", size
+                    mtime = 0.0
+                yield p, "file", size, mtime
 
     def _bulk_upsert(self, rows: List[tuple]) -> None:
         """Bulk-insert/replace all rows under a single write lock."""
@@ -411,8 +550,8 @@ class FSIndex:
 
         sql = (
             "INSERT OR REPLACE INTO entries "
-            "(path, name, type, drive, size, indexed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)"
+            "(path, name, lowercase_name, type, drive, size, modified_time, accessible, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
 
         with self._lock:

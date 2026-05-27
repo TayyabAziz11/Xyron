@@ -457,7 +457,10 @@ async def ws_session(websocket: WebSocket) -> None:
         except Exception:
             _aw = None
         _ctx = {"openai_key": _cfg.openai_api_key, "active_window": _aw}
+        _tool_t0 = time.time()
         result = await asyncio.to_thread(_registry.execute, tool_name, tool_params, _ctx)
+        _tool_ms = (time.time() - _tool_t0) * 1000
+        logger.info("[PERF_TOOL] tool=%s ms=%.0f success=%s", tool_name, _tool_ms, result.success)
         # Persist to context memory for pronoun resolution next turn
         try:
             from api.services.context_memory import context_memory as _cm
@@ -472,6 +475,14 @@ async def ws_session(websocket: WebSocket) -> None:
         try:
             from api.services.memory_service import memory_service as _ms
             _ms.set_last_action(tool_name, tool_params, result.text)
+            # Store disambiguation list so next turn can resolve "the second one"
+            _rdata = result.data or {}
+            if _rdata.get("error_type") == "multiple_matches":
+                _ms.set_disambiguation_matches(
+                    _rdata.get("matches", []),
+                    _rdata.get("query", ""),
+                    tool_params,
+                )
         except Exception:
             pass
         return (result.spoken or result.text or "Done.").strip()
@@ -523,6 +534,7 @@ async def ws_session(websocket: WebSocket) -> None:
             is_speaking = False
             return
 
+        _turn_t0 = time.time()
         last_activity_t = time.time()
         audio = np.concatenate(frames).astype(np.float32)
 
@@ -868,7 +880,11 @@ async def ws_session(websocket: WebSocket) -> None:
         # ── Orchestrator decision ─────────────────────────────────────────────
         from brain.orchestrator import orchestrator as _orch, ActionType
         logger.info("[TURN_START] turn=%d routing transcript=%r", my_turn, transcript[:60])
+        _intent_t0 = time.time()
         decision = await _orch.decide(transcript, memory.history_for_llm())
+        logger.info("[PERF_INTENT] turn=%d ms=%.0f action=%s tool=%s",
+                    my_turn, (time.time() - _intent_t0) * 1000,
+                    decision.action.name, decision.tool_name or "none")
         logger.info("[ORCHESTRATOR] action=%s reason=%s", decision.action.name, decision.reason)
         logger.info("[VOICE_TRACE] stage=tool_route action=%s tool=%s",
                     decision.action.name, decision.tool_name)
@@ -1007,6 +1023,8 @@ async def ws_session(websocket: WebSocket) -> None:
         logger.info("[VOICE_TRACE] stage=audio_stream done response=%r", (response_text or "")[:60])
 
         logger.info("[TTS_STOPPED] interrupted=%s", interrupted)
+        _turn_total_ms = (time.time() - _turn_t0) * 1000
+        logger.info("[PERF_TOTAL] turn=%d ms=%.0f interrupted=%s", my_turn, _turn_total_ms, interrupted)
         is_speaking     = False
         last_activity_t = time.time()
 
