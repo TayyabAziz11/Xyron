@@ -46,6 +46,10 @@ class Settings(BaseSettings):
         "http://localhost:5173",  # electron-vite dev renderer
         "http://localhost:4173",  # electron-vite preview
         "http://localhost:5174",  # fallback if 5173 is taken
+        "http://localhost:1420",  # Tauri dev server
+        "http://127.0.0.1:1420",  # Tauri dev server (127 variant)
+        "tauri://localhost",       # Tauri production origin
+        "https://tauri.localhost", # Tauri HTTPS variant
     ]
 
     # Paths (auto-detected, can be overridden via env)

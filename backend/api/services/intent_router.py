@@ -42,7 +42,7 @@ _TOOL_DESCS: dict[str, str] = {
     "open_application":       "launch start run open application program app chrome firefox vscode spotify discord steam notepad",
     "smart_open":             "open find show me a file folder picture photo video document on my system locally",
     "open_directory":         "open folder directory file explorer my documents downloads desktop pictures",
-    "open_drive":             "open drive c d e f disk explorer",
+    "open_drive":             "open drive c d e f g h i j k l disk partition explorer storage",
     "brightness_control":     "set increase decrease adjust screen brightness dim bright make screen brighter darker",
     "volume_control":         "set increase decrease adjust volume audio sound louder quieter turn volume up down",
     "mute_unmute":            "mute unmute toggle mute silence audio sound",
@@ -111,7 +111,82 @@ _TOOL_DESCS: dict[str, str] = {
     "create_event":           "create add event meeting appointment calendar schedule",
     "get_summary":            "summary activity report what have I done recently history",
     "run_workflow":           "run workflow automation multi-step task sequence",
+    "open_system_settings":   (
+        "open windows settings display sound bluetooth wifi network privacy apps update power "
+        "storage accounts time language accessibility notifications personalization taskbar "
+        "screen resolution monitor settings preferences system settings page ms-settings "
+        "display wala setting kholo screen setting open karo monitor resolution change"
+    ),
 }
+
+# ── Tier 0: Local clock — no LLM, no internet, instant ───────────────────────
+# Catches all time/date/day queries before anything else.
+# Supports English + broken English + Urdu/Hindi colloquial variants.
+
+_TIME_RE = re.compile(
+    r'\b(?:'
+    r'(?:what(?:\'?s|\s+is)?(?:\s+the)?|tell(?:\s+me)?(?:\s+the)?|give(?:\s+me)?(?:\s+the)?|current|check|bata(?:o)?|batao|kya(?:\s+hai)?)\s+(?:the\s+)?(?:current\s+)?time'
+    r'|time\s+(?:hai|kya|batao|abhi|right\s+now|is\s+it|please|abi)'
+    r'|what\s+time\s+(?:is\s+it|are\s+we\s+at|do\s+(?:we|i)\s+have)'
+    r'|kya\s+(?:time|waqt|baja)\s+(?:hai|hua|ho\s+gaya)'
+    r'|(?:time|waqt)\s+(?:kya|batao|bata)'
+    r'|bro\s+(?:what|whats|kya)?\s*(?:time|waqt)'
+    r'|yo\s+(?:what\s+)?time'
+    r')\b',
+    re.IGNORECASE,
+)
+
+_DATE_RE = re.compile(
+    r'\b(?:'
+    r'(?:what(?:\'?s|\s+is)?(?:\s+the)?|tell(?:\s+me)?(?:\s+the)?|give(?:\s+me)?(?:\s+the)?|current|today(?:\'?s?)?|can\s+you\s+tell\s+me(?:\s+the)?)\s+(?:the\s+)?(?:today(?:\'?s?)?\s+)?date'
+    r'|today(?:\'?s?)?\s+(?:date|ki\s+date|kia\s+date)'
+    r'|(?:date|tariikh?|tarikh)\s+(?:kya\s+hai|batao|bata)'
+    r'|kya\s+(?:date|tarikh)\s+(?:hai|hua)'
+    r'|(?:current|aaj(?:\s+ki)?)\s+date'
+    r'|bro\s+(?:today|aaj)\s+(?:konsa|kya)?\s*date'
+    r')\b',
+    re.IGNORECASE,
+)
+
+_DAY_RE = re.compile(
+    r'\b(?:'
+    r'(?:what(?:\'?s|\s+is)?(?:\s+the)?|tell(?:\s+me)?|today(?:\'?s?)?|which)\s+(?:the\s+)?(?:today(?:\'?s?)?\s+)?day'
+    r'|what\s+day\s+(?:is\s+(?:it|today)|are\s+we)'
+    r'|today\s+(?:is\s+)?(?:konsa|kaunsa|which|what)\s*day'
+    r'|(?:aaj|today)\s+(?:konsa|kaunsa|kia)\s+(?:day|din)\s*(?:hai)?'
+    r'|(?:konsa|kaunsa)\s+(?:day|din)\s+(?:hai|ho\s+gaya|hua)'
+    r'|bro\s+(?:today|aaj)\s+konsa\s+day'
+    r'|which\s+day\s+(?:is\s+)?(?:it|today)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _local_clock_route(text: str) -> "RouteResult | None":
+    """Tier 0 — resolve time/date/day queries instantly using local system clock."""
+    import datetime as _dt
+    now = _dt.datetime.now()
+
+    if _TIME_RE.search(text):
+        t_str = now.strftime("%-I:%M %p") if hasattr(now, 'strftime') else now.strftime("%I:%M %p").lstrip('0')
+        response = f"It's {t_str}."
+        logger.info("[TIME_ROUTE] [LOCAL_CLOCK_RESPONSE] query=%r response=%r", text[:60], response)
+        return RouteResult("local_clock_time", {"response": response}, 0, 1.0)
+
+    if _DATE_RE.search(text):
+        d_str = now.strftime("%-d %B %Y") if hasattr(now, 'strftime') else now.strftime("%d %B %Y").lstrip('0')
+        response = f"Today is {d_str}."
+        logger.info("[DATE_ROUTE] [LOCAL_CLOCK_RESPONSE] query=%r response=%r", text[:60], response)
+        return RouteResult("local_clock_date", {"response": response}, 0, 1.0)
+
+    if _DAY_RE.search(text):
+        day_str = now.strftime("%A")
+        response = f"It's {day_str}."
+        logger.info("[DAY_ROUTE] [LOCAL_CLOCK_RESPONSE] query=%r response=%r", text[:60], response)
+        return RouteResult("local_clock_day", {"response": response}, 0, 1.0)
+
+    return None
+
 
 # Tools that should never be routed by the semantic classifier alone
 # (require explicit phrasing or confirmation — too dangerous to guess)
@@ -160,12 +235,33 @@ class IntentRouter:
                 "steps": 2,
             })
         add(r'\b(?:what.?s|get|check|current)\s+(?:the\s+)?volume\b', "get_volume")
+
+        # ── Live system metrics (instant, calls system_monitor.get_snapshot) ──
+        add(r'\b(?:what.?s|how.?s|check|show|get)\s+(?:my\s+|the\s+)?(?:cpu|processor)\s*(?:usage|load|utilization|percent|pct|speed)?\b',
+            "get_live_system_metrics", lambda m: {"metric": "cpu"})
+        add(r'\b(?:what.?s|how.?s|check|show|get)\s+(?:my\s+|the\s+)?(?:ram|memory)\s*(?:usage|load|utilization|percent|pct)?\b',
+            "get_live_system_metrics", lambda m: {"metric": "ram"})
+        add(r'\b(?:what.?s|how.?s|check|show|get)\s+(?:my\s+|the\s+)?(?:gpu|graphics card|graphics)\s*(?:usage|load|utilization|percent|pct)?\b',
+            "get_live_system_metrics", lambda m: {"metric": "gpu"})
+        add(r'\b(?:what.?s|how.?s|check|show|get)\s+(?:my\s+|the\s+)?(?:disk|storage|drive)\s*(?:usage|space|free|percent|pct)?\b',
+            "get_live_system_metrics", lambda m: {"metric": "disk"})
+        add(r'\b(?:what.?s|how.?s|check|show|get)\s+(?:my\s+|the\s+)?(?:network|internet|net)\s*(?:speed|usage|up|down)?\b',
+            "get_live_system_metrics", lambda m: {"metric": "network"})
+        add(r'\b(?:what.?s|how.?s|check|show|get)\s+(?:my\s+|the\s+)?battery\s*(?:level|charge|percent|pct|life)?\b',
+            "get_live_system_metrics", lambda m: {"metric": "battery"})
+        add(r'\b(?:system\s+stats?|system\s+metrics?|system\s+(?:monitor|info|status)|how(?:\'?s|\s+is)\s+(?:my\s+)?system(?:\s+doing)?)\b',
+            "get_live_system_metrics", lambda m: {"metric": "all"})
+
         add(r'\b(?:mute|unmute)\b', "mute_unmute",
             lambda m: {"action": m.group(0).lower().strip()})
         add(r'\btoggle\s+(?:the\s+)?mute\b', "mute_unmute", lambda m: {"action": "toggle"})
 
         # ── Media controls ───────────────────────────────────────────────────
-        add(r'\b(?:play|resume)\s*(?:music|song|audio|video|it|that)?\b',
+        # "play" — can be standalone; "resume" requires a media noun so that
+        # document names like "resume" (CV) are not hijacked as playback commands.
+        add(r'\b(?:play)\s*(?:music|song|audio|video|it|that)?\b',
+            "media_control", lambda m: {"action": "play_pause"})
+        add(r'\b(?:resume|unpause)\s+(?:music|song|audio|video|it|that|playback|the\s+(?:music|audio))\b',
             "media_control", lambda m: {"action": "play_pause"})
         add(r'\bpause\s*(?:music|song|audio|video|it|that)?\b',
             "media_control", lambda m: {"action": "play_pause"})
@@ -218,12 +314,12 @@ class IntentRouter:
         # ── Drive letters (must be before open_application catch-all) ───────────
         # "open C drive", "open the D drive", "go to E drive", "open C:"
         add(
-            r'\b(?:open|go\s+to|show|browse|navigate\s+to)\s+(?:the\s+)?([a-fA-F])\s+(?:drive|disk|partition)\b',
+            r'\b(?:open|go\s+to|show|browse|navigate\s+to)\s+(?:the\s+)?([a-zA-Z])\s+(?:drive|disk|partition)\b',
             "open_drive",
             lambda m: {"drive": m.group(1).upper()},
         )
         add(
-            r'\b(?:open|go\s+to|show|browse)\s+(?:the\s+)?([a-fA-F]):\s*[\\\/]?\b',
+            r'\b(?:open|go\s+to|show|browse)\s+(?:the\s+)?([a-zA-Z]):\s*[\\\/]?\b',
             "open_drive",
             lambda m: {"drive": m.group(1).upper()},
         )
@@ -310,7 +406,7 @@ class IntentRouter:
             name_raw = m.group(1).strip().rstrip('.,!?')
             loc_raw  = m.group(2).strip().rstrip('.,!?')
             # "C drive" / "C:" / "C disk" → "C:\"
-            loc_m = re.match(r'^([a-fA-F])\s*(?:drive|disk|:)?$', loc_raw, re.IGNORECASE)
+            loc_m = re.match(r'^([a-zA-Z])\s*(?:drive|disk|:)?$', loc_raw, re.IGNORECASE)
             path = loc_m.group(1).upper() + ':\\' if loc_m else loc_raw
             return {'name': name_raw, 'path': path}
 
@@ -371,18 +467,301 @@ class IntentRouter:
             lambda m: {"path": "", "new_name": m.group("new_name").strip().rstrip(".,!?")},
         )
 
-        # ── Find / locate file or folder ──────────────────────────────────────
+        # ── Drive-aware open / find (must be before generic smart_open patterns) ──────
+        # Supported phrases:
+        #   "in E drive open folder named python"  (drive-first)
+        #   "open folder named python in E drive"  (drive-last)
+        #   "find python in E drive"               (no type word)
+        #   "search resume in D drive"             (search verb)
+        #   "E drive python folder"                (drive + name + type)
+
+        def _drive_type_str(raw: str) -> str:
+            r = (raw or "").lower()
+            if r in ("folder", "directory", "dir"):
+                return "folder"
+            if r in ("file", "document"):
+                return "file"
+            return "any"
+
+        # D1: drive FIRST → "in E drive open folder named python"
         add(
-            r'\b(?:find|locate|where\s+is|where\'s|search\s+for)\s+'
-            r'(?:(?:the|my|a|an)\s+)?(.+?)\s+(?:folder|directory|file|dir)\b',
+            r'\b(?:in|on|from)\s+(?P<d1>[a-zA-Z])\s+(?:drive|disk)\b'
+            r'(?:\s+(?:open|find|locate|show|search(?:\s+for)?))?\s+'
+            r'(?:(?:the|my|a)\s+)?'
+            r'(?:(?P<t1>folder|directory|file|document|dir)\s+)?'
+            r'(?:(?:named|called)\s+)?'
+            r'(?P<q1>(?!(?:the|my|a|an|in|on|named|called)\b)\S+(?:\s+\S+){0,3})',
             'smart_open',
-            lambda m: {"query": m.group(1).strip().rstrip(".,!?"), "type": "folder"},
+            lambda m: {
+                "query": m.group("q1").strip().rstrip(".,!?"),
+                "type":  _drive_type_str(m.group("t1")),
+                "drive": m.group("d1").upper(),
+            },
+        )
+        # D2: open/find/show + [type] + [named] + query + drive LAST
+        # "open folder named python in E drive"  /  "find file resume in D drive"
+        add(
+            r'\b(?:open|find|locate|show|search(?:\s+for)?)\s+'
+            r'(?:(?:the|my|a)\s+)?'
+            r'(?:(?P<t2>folder|directory|file|document|dir)\s+)?'
+            r'(?:(?:named|called)\s+)?'
+            r'(?P<q2>(?!(?:the|a|my|in|on|named|called)\b)\S+(?:\s+\S+){0,2}?)'
+            r'\s+(?:in|on|from)\s+(?P<d2>[a-zA-Z])\s+(?:drive|disk)\b',
+            'smart_open',
+            lambda m: {
+                "query": m.group("q2").strip().rstrip(".,!?"),
+                "type":  _drive_type_str(m.group("t2")),
+                "drive": m.group("d2").upper(),
+            },
+        )
+        # D3: find/search + query (no type word) + in drive
+        # "find python in E drive"  /  "search resume in D drive"
+        add(
+            r'\b(?:find|locate|search(?:\s+for)?|look\s+for)\s+'
+            r'(?:(?:the|my|a)\s+)?'
+            r'(?P<q3>\S+(?:\s+\S+){0,3}?)'
+            r'\s+(?:in|on|from)\s+(?P<d3>[a-zA-Z])\s+(?:drive|disk)\b',
+            'smart_open',
+            lambda m: {
+                "query": m.group("q3").strip().rstrip(".,!?"),
+                "type":  "any",
+                "drive": m.group("d3").upper(),
+            },
+        )
+        # D4: drive letter + name + type-word at end
+        # "E drive python folder"  /  "D drive resume file"
+        add(
+            r'\b(?P<d4>[a-zA-Z])\s+(?:drive|disk)\s+'
+            r'(?P<q4>(?!(?:folder|directory|file|document|dir)\b)\S+(?:\s+\S+){0,3}?)\s+'
+            r'(?P<t4>folder|directory|file|document|dir)\b',
+            'smart_open',
+            lambda m: {
+                "query": m.group("q4").strip().rstrip(".,!?"),
+                "type":  _drive_type_str(m.group("t4")),
+                "drive": m.group("d4").upper(),
+            },
         )
 
+        # ── Find / locate file or folder ──────────────────────────────────────
+        # Pattern A: type-word at the END — "find the ios folder", "locate my resume file"
+        # Named group ftype detects whether the trailing word is file or folder.
+        add(
+            r'\b(?:find|locate|where\s+is|where\'s|search\s+for)\s+'
+            r'(?:(?:the|my|a|an)\s+)?(.+?)\s+(?P<ftype>folder|directory|file|dir)\b',
+            'smart_open',
+            lambda m: {
+                "query": m.group(1).strip().rstrip(".,!?"),
+                "type": "folder" if m.group("ftype") in ("folder", "directory") else "file",
+            },
+        )
+        # Pattern B: type-word at the START — "find folder ios", "find file resume"
+        # These must come after Pattern A so the more specific end-position wins
+        add(
+            r'\b(?:find|locate|where\s+is|where\'s)\s+(?:(?:the|my|a)\s+)?'
+            r'(?:folder|directory)\s+(?:called\s+|named\s+)?'
+            r'(?P<q_folder>\S+(?:\s+\S+){0,4})',
+            'smart_open',
+            lambda m: {"query": m.group("q_folder").strip().rstrip(".,!?"), "type": "folder"},
+        )
+        add(
+            r'\b(?:find|locate|look\s+for|search\s+for)\s+(?:(?:a|the|my)\s+)?'
+            r'file\s+(?:called\s+|named\s+)?'
+            r'(?P<q_file>\S+(?:\s+\S+){0,4})',
+            'smart_open',
+            lambda m: {"query": m.group("q_file").strip().rstrip(".,!?"), "type": "file"},
+        )
+
+        # ── Urdu settings shortcuts — MUST precede generic Urdu app catch-all ──
+        # "wifi kholo", "bluetooth kholo", "network on karo", etc.
+        _URDU_SETTINGS_EARLY: list[tuple[str, str]] = [
+            (r'wifi|wi-?fi',                   'wifi'),
+            (r'network',                       'network'),
+            (r'bluetooth',                     'bluetooth'),
+            (r'display|screen|monitor',        'display'),
+            (r'sound|audio',                   'sound'),
+            (r'updates?|windows?\s+updates?', 'update'),
+        ]
+        for _ukw2, _upage2 in _URDU_SETTINGS_EARLY:
+            _up2 = _upage2
+            add(
+                r'\b(?:' + _ukw2 + r')\s+(?:kholo|chalao|on\s+karo|dikao|dikhao|open\s+karo|show\s+karo|check\s+karo)\b',
+                "open_system_settings",
+                lambda m, p=_up2: {"page": p},
+            )
+
+        # ── Urdu/colloquial app launch phrases ──────────────────────────────────
+        # "chrome kholo", "settings kholo", "vs code chala", etc.
+        add(
+            r'\b(\w[\w\s]{1,30}?)\s+(?:kholo|khol\s+do|chala(?:o)?|open\s+kar(?:o)?|start\s+kar(?:o)?|launch\s+kar(?:o)?)\b',
+            "open_application",
+            lambda m: {"app_name": m.group(1).strip()},
+        )
+        # "wifi on karo", "wifi off karo"
+        add(r'\bwifi\s+on\s+(?:karo|kar|kro)\b', "open_wifi_panel")
+        add(r'\bwifi\s+off\s+(?:karo|kar|kro)\b', "wifi_disconnect")
+        # "volume barhao", "awaaz kam karo"
+        add(r'\b(?:volume|awaaz|sound)\s+(?:barhao|barha\s+do|increase\s+kar(?:o)?)\b',
+            "volume_control", lambda m: {"action": "increase", "steps": 2})
+        add(r'\b(?:volume|awaaz|sound)\s+(?:ghata(?:o)?|kam\s+(?:karo|kar|kro)|decrease\s+kar(?:o)?)\b',
+            "volume_control", lambda m: {"action": "decrease", "steps": 2})
+        # "brightness barhao", "screen dark kar"
+        add(r'\b(?:brightness|screen|display)\s+(?:barhao|barha\s+do|increase\s+kar(?:o)?|zyada\s+kar(?:o)?)\b',
+            "brightness_control", lambda m: {"action": "increase", "step": 10})
+        add(r'\b(?:brightness|screen)\s+(?:ghata(?:o)?|kam\s+(?:karo|kar|kro)|dark\s+kar(?:o)?)\b',
+            "brightness_control", lambda m: {"action": "decrease", "step": 10})
+
+        # ── Work mode / focus mode → run_workflow(name="work_mode") ─────────────
+        # Tier2 fast-path so "it's work time" never falls through to LLM
+        add(r"\bit['\s]+?s\s+work\s+time\b",
+            "run_workflow", lambda m: {"name": "work_mode"})
+        add(r'\b(?:it[\'s\s]+work\s+time|work\s+time(?:\s+buddy)?)\b',
+            "run_workflow", lambda m: {"name": "work_mode"})
+        add(r'\b(?:start|enable|activate|switch\s+to|set\s+up|begin|enter|go\s+into)\s+'
+            r'(?:work|coding|developer?|dev|focus|deep\s+work)\s+mode\b',
+            "run_workflow", lambda m: {"name": "work_mode"})
+        add(r'\b(?:work|coding|developer?|dev|focus)\s+mode\s*(?:on|start|activate|enable|please)?\b',
+            "run_workflow", lambda m: {"name": "work_mode"})
+        add(r'\b(?:get\s+me\s+ready\s+to\s+(?:work|code|dev)|open\s+my\s+work\s+apps|'
+            r'prepare\s+my\s+(?:work|dev(?:eloper)?)\s+(?:setup|environment|env))\b',
+            "run_workflow", lambda m: {"name": "work_mode"})
+
+        # ── Windows Settings deep-link resolver ──────────────────────────────
+        # MUST precede the open_application catch-all.
+        # Two patterns per page:
+        #   A) keyword + "settings/preferences/panel" (no verb required)
+        #   B) explicit verb + optional "windows/system" + keyword
+        # Both log [SETTINGS_RESOLVER] and route to open_system_settings.
+        #
+        # Handles: "display settings", "open display settings",
+        #   "open windows display settings please", "monitor settings",
+        #   "can you open display settings for me", "screen settings", etc.
+        #
+        # Order matters: more-specific keyword strings first so "wifi settings"
+        # does not accidentally fall inside a broader "network" pattern.
+
+        # ── Urdu / bare-verb settings shortcuts (not covered by Pattern A/B) ──────
+        # Pattern B requires an English verb like "open/show"; these use Urdu verbs.
+        _URDU_PAGE_KWS: list[tuple[str, str]] = [
+            (r'wifi|wi-?fi',                 'wifi'),
+            (r'network',                     'network'),
+            (r'bluetooth',                   'bluetooth'),
+            (r'display|screen|monitor',      'display'),
+            (r'sound|audio',                 'sound'),
+            (r'updates?|windows?\s+updates?','update'),
+        ]
+        for _ukw, _upage in _URDU_PAGE_KWS:
+            _up = _upage
+            add(
+                r'\b(?:' + _ukw + r')\s+(?:kholo|chalao|on\s+karo|dikao|dikhao|open\s+karo|show\s+karo|check\s+karo)\b',
+                "open_system_settings",
+                lambda m, p=_up: {"page": p},
+            )
+
+        _WIN_SETTINGS_PAGES: list[tuple[str, str]] = [
+            # (keyword_regex_fragment,                         page_name)
+            (r'display|screen(?:\s+res(?:olution)?)?|monitor|resolution', 'display'),
+            (r'sound\b|audio\s+settings?',                             'sound'),
+            (r'bluetooth',                                             'bluetooth'),
+            (r'wi-?fi|wireless',                                       'wifi'),
+            (r'network',                                               'network'),
+            (r'privacy',                                               'privacy'),
+            (r'apps?\s+(?:and\s+)?(?:features?|programs?|settings?)',  'apps'),
+            (r'(?:windows?\s+)?updates?',                              'update'),
+            (r'power(?:\s+(?:and\s+)?sleep)?',                         'power'),
+            (r'storage\s+(?:settings?|sense)',                         'storage'),
+            (r'accounts?',                                             'accounts'),
+            (r'date\s+(?:and\s+)?time|time\s+(?:and\s+date\s+)?',     'time'),
+            (r'language|region(?:al)?',                                'language'),
+            (r'accessibility|ease\s+of\s+access',                      'accessibility'),
+            (r'notifications?',                                        'notifications'),
+            (r'personaliz[ae]tion|themes?',                            'personalization'),
+            (r'taskbar\s+(?:settings?)?',                              'taskbar'),
+            (r'startup\s+(?:apps?|programs?)',                         'startup'),
+            (r'mouse\s+(?:settings?)?',                                'mouse'),
+            (r'keyboard\s+(?:settings?)?',                             'keyboard'),
+            (r'camera\s+(?:settings?)?',                               'camera'),
+        ]
+
+        _TRAIL = r'(?:\s+(?:for\s+me|please|buddy|now|right\s+now|mate|bro|yaar))*'
+        _OPT_WIN = r'(?:windows?\s+|system\s+|my\s+)?'
+
+        for _kw, _page in _WIN_SETTINGS_PAGES:
+            _p = _page   # close over value, not variable
+
+            # Pattern A: keyword immediately followed by settings/preferences/etc.
+            # "display settings", "sound settings", "bluetooth settings please"
+            add(
+                r'\b(?:' + _kw + r')\s+(?:settings?|preferences?|panel|page|options?|config(?:uration)?)' + _TRAIL + r'\b',
+                "open_system_settings",
+                lambda m, p=_p: (
+                    logger.info("[SETTINGS_RESOLVER] page=%s target=ms-settings:%s", p, p) or  # type: ignore[func-returns-value]
+                    {"page": p}
+                ),
+            )
+
+            # Pattern B: explicit intent verb + optional "windows/system" + keyword
+            # "open display settings", "open windows sound settings", "show bluetooth"
+            add(
+                r'\b(?:open|show|change|go\s+to|access|launch|take\s+me\s+to)\s+' + _OPT_WIN +
+                r'(?:' + _kw + r')(?:\s+(?:settings?|preferences?|panel|page|options?))?' + _TRAIL + r'\b',
+                "open_system_settings",
+                lambda m, p=_p: (
+                    logger.info("[SETTINGS_RESOLVER] page=%s target=ms-settings:%s", p, p) or  # type: ignore[func-returns-value]
+                    {"page": p}
+                ),
+            )
+
         # ── Open / close application ──────────────────────────────────────────
+        # Strip trailing polite suffixes from app_name so "open chrome for me please"
+        # → app_name="chrome" instead of app_name="chrome for me please".
+        _POLITE_TAIL_RE = re.compile(
+            r'\s+(?:for\s+me|please|buddy|now|right\s+now|mate|bro|yaar|dude|also)'
+            r'(?:\s+(?:for\s+me|please|buddy|now|right\s+now|mate|bro|yaar|dude|also))*\s*$',
+            re.IGNORECASE,
+        )
+
+        def _clean_app_name(m: re.Match) -> dict:
+            raw = m.group(1).strip().rstrip(".,!?")
+            return {"app_name": _POLITE_TAIL_RE.sub('', raw).strip().rstrip(".,!?")}
+
+        # ── Direct Windows path (from ordinal disambiguation resolution) ────────
+        # e.g. "open C:\Users\tayyab\python"  or  "open E:\Projects\Python"
+        add(
+            r'^open\s+([A-Za-z]:[\\\/](?:[^\\\/\s]+[\\\/]?)+)\s*$',
+            'smart_open',
+            lambda m: {"query": m.group(1).strip(), "type": "any"},
+        )
+
+        # ── Open arbitrary named folder (before open_application catch-all) ──────
+        # Catches "open folder alpha", "open folder called My Projects", etc.
+        # System-folder names are already handled by the open_directory rules above;
+        # this catches everything else so it doesn't fall through to app_finder.
+
+        # Drive-aware version first — "open folder named python in E drive"
+        add(
+            r'\b(?:open|show|go\s+to|browse|navigate\s+to)\s+(?:(?:the|my|a)\s+)?'
+            r'folder\s+(?:called\s+|named\s+|with\s+(?:the\s+)?name\s+)?'
+            r'(?P<q_dof>\S+(?:\s+\S+){0,3}?)'
+            r'\s+(?:in|on|from)\s+(?P<d_dof>[a-zA-Z])\s+(?:drive|disk)\b',
+            'smart_open',
+            lambda m: {
+                "query": m.group("q_dof").strip().rstrip(".,!?"),
+                "type": "folder",
+                "drive": m.group("d_dof").upper(),
+            },
+        )
+        # Generic version (no drive)
+        add(
+            r'\b(?:open|show|go\s+to|browse|navigate\s+to)\s+(?:(?:the|my|a)\s+)?'
+            r'folder\s+(?:called\s+|named\s+|with\s+(?:the\s+)?name\s+)?'
+            r'(?P<q_opfolder>\S+(?:\s+\S+){0,4})',
+            'smart_open',
+            lambda m: {"query": m.group("q_opfolder").strip().rstrip(".,!?"), "type": "folder"},
+        )
+
         add(r'\b(?:open|launch|start|run|fire\s+up|pull\s+up)\s+(.+)',
             "open_application",
-            lambda m: {"app_name": m.group(1).strip().rstrip(".,!?")})
+            _clean_app_name)
         add(r'\b(?:close|quit|exit|kill)\s+(?!window|tab)(.+)',
             "kill_app",
             lambda m: {"app_name": m.group(1).strip().rstrip(".,!?")})
@@ -494,6 +873,11 @@ class IntentRouter:
         Returns RouteResult with tool_name=None if no confident match (Tier 4).
         """
         key = text.lower().strip()
+
+        # Tier 0 — local clock (no LLM, no internet, instant)
+        _local = _local_clock_route(key)
+        if _local:
+            return _local
 
         # Tier 1 — exact cache
         with self._cache_lock:

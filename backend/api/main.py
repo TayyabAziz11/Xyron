@@ -30,6 +30,8 @@ if settings.onnx_provider and not _os.environ.get("ONNX_PROVIDER"):
     _os.environ["ONNX_PROVIDER"] = settings.onnx_provider
     logging.getLogger(__name__).info("[Config] ONNX_PROVIDER=%s", settings.onnx_provider)
 from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity, dev, brain, takeover, dashboard
+from .routers import auth as auth_router
+from .routers import monitor as monitor_router
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +132,7 @@ async def startup() -> None:
             if _model_ready:
                 _wt0 = _owt.monotonic()
                 from api.services.openai_client import offline_generate as _og
-                _og("hi", system="You are Xyron.", num_predict=5)
+                _og("hi", system="You are Xyron.")
                 _wms = (_owt.monotonic() - _wt0) * 1000
                 _l.info("[Warmup] Ollama preloaded model=%s keep_alive=30m warmup_ms=%.0f", _voice_model, _wms)
             else:
@@ -196,6 +198,20 @@ async def startup() -> None:
     except Exception as _exc4:
         logger.warning("[CORE_TOOLS] warmup skipped: %s", _exc4)
 
+    # System monitor — start background sampler
+    try:
+        from .services.system_monitor_service import system_monitor as _sysmon
+        _sysmon.start(asyncio.get_event_loop())
+    except Exception as _exc5:
+        logger.warning("[SystemMonitor] startup skipped: %s", _exc5)
+
+    # Filesystem index — trigger singleton import so background scan starts immediately
+    try:
+        from .services.fs_index import fs_index as _fsidx  # noqa: F401 — side-effect: starts bg scan
+        logger.info("[FS_INDEX] background scan started (ready=%s)", _fsidx.is_ready)
+    except Exception as _exc6:
+        logger.warning("[FS_INDEX] startup skipped: %s", _exc6)
+
 
 # CORS — allow the Next.js dashboard
 app.add_middleware(
@@ -235,3 +251,5 @@ app.include_router(dev.router)
 app.include_router(brain.router)
 app.include_router(takeover.router)
 app.include_router(dashboard.router)
+app.include_router(auth_router.router, prefix="/api/v1")
+app.include_router(monitor_router.router, prefix="/api/v1")

@@ -1,0 +1,140 @@
+/* Xyron Desktop Dashboard — Extended Theme Tokens */
+
+:root {
+  /* ── Base backgrounds ── */
+  --xbg-900: #050608;
+  --xbg-800: #08090d;
+  --xbg-700: #0c0e14;
+  --xbg-600: #111318;
+  --xbg-panel: rgba(10, 11, 16, 0.92);
+  --xbg-glass: rgba(12, 14, 20, 0.75);
+
+  /* ── Primary red ── */
+  --xred: #ff1f2d;
+  --xred-dim: rgba(255, 31, 45, 0.35);
+  --xred-glow: 0 0 10px rgba(255, 31, 45, 0.45), 0 0 24px rgba(255, 31, 45, 0.2);
+  --xred-glow-strong: 0 0 16px rgba(255, 31, 45, 0.7), 0 0 40px rgba(255, 31, 45, 0.35);
+  --xred-border: rgba(255, 35, 45, 0.35);
+  --xred-border-hover: rgba(255, 35, 45, 0.65);
+
+  /* ── Accents ── */
+  --xcyan: #00e5ff;
+  --xcyan-dim: rgba(0, 229, 255, 0.2);
+  --xgreen: #00ff88;
+  --xgreen-dim: rgba(0, 255, 136, 0.2);
+  --xorange: #ff8c00;
+  --xpurple: #a855f7;
+
+  /* ── Text ── */
+  --xtext-primary: #e8ecf0;
+  --xtext-secondary: #6b7280;
+  --xtext-muted: #374151;
+  --xtext-red: #ff1f2d;
+
+  /* ── Borders ── */
+  --xborder: rgba(255, 35, 45, 0.2);
+  --xborder-subtle: rgba(255, 255, 255, 0.05);
+}
+
+/* ── Glass panel ── */
+.x-panel {
+  background: var(--xbg-panel);
+  border: 1px solid var(--xred-border);
+  border-radius: 8px;
+  backdrop-filter: blur(12px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.x-panel:hover {
+  border-color: var(--xred-border-hover);
+  box-shadow: var(--xred-glow);
+}
+
+/* ── Glass card (lighter) ── */
+.x-card {
+  background: var(--xbg-glass);
+  border: 1px solid rgba(255, 35, 45, 0.18);
+  border-radius: 6px;
+  backdrop-filter: blur(8px);
+}
+
+/* ── Active/live indicator ── */
+.x-live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--xgreen);
+  box-shadow: 0 0 6px rgba(0, 255, 136, 0.8);
+  animation: xPulse 2s ease-in-out infinite;
+}
+
+.x-live-dot.red {
+  background: var(--xred);
+  box-shadow: 0 0 6px rgba(255, 31, 45, 0.8);
+}
+
+@keyframes xPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(0.8); }
+}
+
+/* ── Section label ── */
+.x-section-label {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--xred);
+}
+
+/* ── Glow text ── */
+.x-glow-text {
+  color: var(--xred);
+  text-shadow: 0 0 8px rgba(255, 31, 45, 0.8), 0 0 20px rgba(255, 31, 45, 0.4);
+}
+
+/* ── Thin scan-line overlay for panels ── */
+.x-scanlines::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent, transparent 3px,
+    rgba(0, 0, 0, 0.06) 3px, rgba(0, 0, 0, 0.06) 4px
+  );
+  pointer-events: none;
+  border-radius: inherit;
+  z-index: 0;
+}
+
+/* ── Progress bar fill animation ── */
+@keyframes xBarFill {
+  from { width: 0 }
+}
+
+.x-bar-fill {
+  animation: xBarFill 0.8s ease-out forwards;
+}
+
+/* ── Takeover active glow ring ── */
+.x-takeover-ring {
+  box-shadow:
+    0 0 0 2px var(--xred),
+    0 0 20px rgba(255, 31, 45, 0.6),
+    0 0 50px rgba(255, 31, 45, 0.3);
+  animation: xRingPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes xRingPulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--xred), 0 0 20px rgba(255,31,45,0.6), 0 0 50px rgba(255,31,45,0.3); }
+  50%       { box-shadow: 0 0 0 3px var(--xred), 0 0 30px rgba(255,31,45,0.9), 0 0 70px rgba(255,31,45,0.5); }
+}
+
+/* ── Waveform bar ── */
+@keyframes xWave {
+  0%, 100% { transform: scaleY(0.3); }
+  50%       { transform: scaleY(1); }
+}

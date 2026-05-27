@@ -1,0 +1,37 @@
+[data-ui-mode="focus"] {
+  --accent-primary: #00ffff44;
+  --sidebar-width: 0px;
+  --animation-speed: 0s;
+  --ui-opacity: 0.85;
+}
+
+[data-ui-mode="overdrive"] {
+  --accent-primary: #ff3333;
+  --pulse-speed: 0.3s;
+  --ui-opacity: 1;
+}
+
+[data-ui-mode="calm"] {
+  --accent-primary: #8855ff;
+  --pulse-speed: 3s;
+  --ui-opacity: 0.9;
+}
+
+[data-ui-mode="sentinel"] {
+  --border-color: #ff0000;
+  --ui-opacity: 1;
+}
+
+[data-ui-mode="default"] {
+  /* baseline — no overrides needed, inherits globals */
+}
+
+@keyframes border-flash {
+  0%, 100% { border-color: #ff0000; }
+  50%       { border-color: transparent; }
+}
+
+[data-ui-mode="sentinel"] {
+  animation: border-flash 0.5s infinite;
+  border: 2px solid var(--border-color);
+}

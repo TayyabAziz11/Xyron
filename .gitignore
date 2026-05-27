@@ -37,24 +37,38 @@ out/
 npm-debug.log*
 yarn-debug.log*
 
-# Electron build output — only binaries/build artifacts, NOT source code
+# Electron / Tauri build output — only binaries/build artifacts, NOT source code
 desktop/dist/
 desktop/out/
 desktop-app/node_modules/
 desktop-app/out/
 desktop-app/release/
+desktop-app/src-tauri/target/
 *.exe
 *.app
 *.deb
 *.dmg
 *.AppImage
 
+# Shared package node_modules
+shared/node_modules/
+
 # Runtime logs and checkpoints
 backend/Logs/
+logs/
 *_checkpoint.json
 *.pid
 ralph_loop.log
 **/ralph_loop.log
+backend/system_log.md
+
+# Runtime data (vector DB, brain state — rebuilt automatically)
+backend/data/chroma/
+backend/data/brain/brain_state.json
+
+# Audio test recordings (generated locally, not needed for dev)
+backend/data/rvc_tests/
+backend/data/voice_tests/
 
 # WhatsApp session (auth cookies — never commit)
 .secrets/whatsapp_session/

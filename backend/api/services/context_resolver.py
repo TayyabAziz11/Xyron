@@ -144,6 +144,61 @@ def _typed_slot_entity(text: str) -> str | None:
     return None
 
 
+_ORDINAL_RE = re.compile(
+    r'\b(?:'
+    r'(?:the\s+)?(?P<word>first|second|third|fourth|1st|2nd|3rd|4th)'
+    r'|(?:number|no\.?)\s+(?P<digit>[1-4])'
+    r'|open\s+(?P<nopen>[1-4])'
+    r')\s*(?:one|option|result|folder|file|match)?\b',
+    re.IGNORECASE,
+)
+
+_ORDINAL_MAP = {
+    "1st": 0, "first": 0, "2nd": 1, "second": 1,
+    "3rd": 2, "third": 2, "4th": 3, "fourth": 3,
+}
+
+
+def _resolve_ordinal(text: str) -> str | None:
+    """
+    If the user says 'open the second one', resolve to the stored disambiguation match.
+    Returns the win-path of the chosen item, or None if no disambiguation pending.
+    """
+    m = _ORDINAL_RE.search(text)
+    if not m:
+        return None
+
+    idx_raw = (
+        m.group("word") or
+        m.group("digit") or
+        m.group("nopen") or
+        ""
+    ).lower().strip()
+
+    if idx_raw.isdigit():
+        idx = int(idx_raw) - 1
+    else:
+        idx = _ORDINAL_MAP.get(idx_raw)
+
+    if idx is None:
+        return None
+
+    try:
+        from .memory_service import memory_service
+        dis = memory_service.get_disambiguation_matches()
+        if not dis:
+            return None
+        matches = dis.get("matches", [])
+        if 0 <= idx < len(matches):
+            chosen = matches[idx]
+            memory_service.clear_disambiguation()
+            logger.info("[CTX_ORDINAL] idx=%d → %r", idx, chosen)
+            return chosen
+    except Exception:
+        pass
+    return None
+
+
 def resolve(text: str, session_id: str) -> str:
     """
     Replace vague pronouns with the best available concrete entity.
@@ -153,6 +208,12 @@ def resolve(text: str, session_id: str) -> str:
       2. Entity extracted from recent episodic session history
     Returns original text unchanged if no pronouns found or no entity to substitute.
     """
+    # Ordinal disambiguation: "open the second one" / "the first one"
+    _ordinal_path = _resolve_ordinal(text)
+    if _ordinal_path:
+        # Rewrite to an explicit smart_open command so the router picks it up
+        return f"open {_ordinal_path}"
+
     if not _VAGUE_RE.search(text):
         return text
 

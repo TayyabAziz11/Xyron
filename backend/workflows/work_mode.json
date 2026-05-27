@@ -1,0 +1,29 @@
+{
+  "name": "work_mode",
+  "display_name": "Work Mode",
+  "triggers": [
+    "it's work time",
+    "it's work time buddy",
+    "work time",
+    "start work mode",
+    "enable work mode",
+    "activate work mode",
+    "switch to work mode",
+    "set up work mode",
+    "begin work mode",
+    "enter work mode",
+    "go into work mode",
+    "start coding mode",
+    "enable dev mode",
+    "start focus mode",
+    "get me ready to work",
+    "get me ready to code",
+    "open my work apps",
+    "prepare my work setup"
+  ],
+  "completion_message": "Work mode activated — VS Code and GitHub are open. Let's get it done.",
+  "steps": [
+    { "action": "open_app", "app_name": "vscode", "delay": 1.5 },
+    { "action": "browser.goto", "url": "https://github.com/TayyabAziz11", "delay": 1.0 }
+  ]
+}

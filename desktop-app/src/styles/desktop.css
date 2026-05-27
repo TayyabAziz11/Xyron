@@ -1,0 +1,21 @@
+/* Desktop-specific overrides */
+* { -webkit-user-select: none; user-select: none; }
+input, textarea, [contenteditable] { -webkit-user-select: text; user-select: text; }
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,32,32,0.3); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,32,32,0.6); }
+
+/* Window drag region */
+[data-tauri-drag-region] { -webkit-app-region: drag; cursor: default; }
+[data-tauri-drag-region] * { -webkit-app-region: no-drag; }
+
+/* Prevent focus outline on click (keep for keyboard) */
+:focus-visible { outline: 1px solid rgba(255,32,32,0.6); outline-offset: 2px; }
+:focus:not(:focus-visible) { outline: none; }
+
+/* Body */
+html, body, #root { height: 100%; overflow: hidden; }
+body { background: #08080f; color: #f1f5f9; font-family: system-ui, -apple-system, sans-serif; }
