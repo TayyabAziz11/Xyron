@@ -122,35 +122,40 @@ class TestVerifyBeforeSpeaking(unittest.TestCase):
         self.assertNotIn("Opened", result.spoken)
         self.assertNotIn("Opening", result.spoken)
 
-    @patch("api.tools.system_tools._verify_accessible")
-    def test_access_denied_returns_error(self, mock_verify):
-        """When verify_accessible returns access_denied, success=False and spoken is honest"""
+    def test_access_denied_returns_error(self):
+        """When fs_search._verify returns access_denied, success=False and spoken is honest"""
         from api.services.fs_index import FSIndex
-        mock_verify.return_value = (False, "access_denied")
+        from api.services import fs_search
+        from api.services.fs_search import SearchResult
 
         fake_path = Path("/mnt/e/Restricted/Python")
+        fake_result = SearchResult(fake_path, 0.9, "ranked")
+
         with patch.object(FSIndex, "is_ready", new_callable=PropertyMock, return_value=True), \
-             patch("api.services.fs_index.fs_index.search_fuzzy", return_value=[fake_path]):
+             patch.object(fs_search, "search", return_value=[fake_result]), \
+             patch.object(fs_search, "_verify", return_value=(False, "access_denied")):
             result = self._exec(self._make_params("Python", drive="E", open_type="folder"))
 
         self.assertFalse(result.success)
         self.assertIn("denied", result.spoken.lower())
         self.assertNotIn("Opened", result.spoken)
-        # result.success=False means we never called the opener
         self.assertEqual(result.data.get("error_type"), "access_denied")
 
-    @patch("api.tools.system_tools._verify_accessible")
-    @patch("api.tools.system_tools.subprocess.Popen")
-    def test_success_speaks_after_verification(self, mock_popen, mock_verify):
+    def test_success_speaks_after_verification(self):
         """When accessible, Popen is called and spoken says 'Opened'"""
         from api.services.fs_index import FSIndex
-        mock_verify.return_value = (True, "ok")
-        mock_popen.return_value = MagicMock()
+        from api.services import fs_search
+        from api.services.fs_search import SearchResult
+        import subprocess as _sp
 
         fake_path = Path("/mnt/e/Projects/Python")
+        fake_result = SearchResult(fake_path, 0.95, "ranked")
+
         with patch.object(FSIndex, "is_ready", new_callable=PropertyMock, return_value=True), \
-             patch("api.services.fs_index.fs_index.search_fuzzy", return_value=[fake_path]), \
-             patch("api.tools.system_tools._find_cmdexe", return_value="/mnt/c/Windows/System32/cmd.exe"):
+             patch.object(fs_search, "search", return_value=[fake_result]), \
+             patch.object(fs_search, "_verify", return_value=(True, "ok")), \
+             patch.object(fs_search, "_find_cmd_exe", return_value="/mnt/c/Windows/System32/cmd.exe"), \
+             patch.object(_sp, "Popen", return_value=MagicMock()) as mock_popen:
             result = self._exec(self._make_params("Python", drive="E", open_type="folder"))
 
         self.assertTrue(result.success)

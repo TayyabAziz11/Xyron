@@ -3732,7 +3732,7 @@ def _verify_accessible(path: Path) -> tuple[bool, str]:
 
 
 def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    """Find anything on the system by name and open it."""
+    """Find anything on the system by name and open it — uses fs_search ranked engine."""
     query     = params.get("query", "").strip()
     open_type = params.get("type", "any").lower()   # folder | file | video | image | any
     drive     = (params.get("drive") or "").upper()[:1]  # "E", "D", "C", etc. — empty = search all
@@ -3740,126 +3740,100 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     if not query:
         return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
 
-    # Direct Windows path (from ordinal disambiguation or explicit path command)
-    # e.g. query = "E:\Projects\Python"
-    import re as _re_so
-    if _re_so.match(r'^[A-Za-z]:[\\\/]', query):
-        cmd_exe_direct = _find_cmdexe()
-        if cmd_exe_direct:
-            fs_path = _fs_path(query)
-            _ok_d, _err_d = _verify_accessible(fs_path)
-            if not _ok_d:
-                if _err_d == "access_denied":
-                    return ToolResult(success=False,
-                        text=f"Access denied: {query}",
-                        spoken=f"Windows denied access to that path.",
-                        data={"error_type": "access_denied", "path": query})
-                return ToolResult(success=False,
-                    text=f"Path not found: {query}",
-                    spoken="That path doesn't exist.",
-                    data={"error_type": "not_found", "path": query})
-            subprocess.Popen([cmd_exe_direct, "/c", "start", "", query],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            name = Path(query.replace("\\", "/")).name
-            spoken = f"Opened {name}."
-            return ToolResult(success=True, text=spoken, spoken=spoken,
-                              action_path=query, data={"path": query, "source": "direct_path"})
-
-    # Normalize "X folder" → query="X", type="folder" so voice commands work naturally.
-    _SUFFIX_TYPE: dict[str, str] = {
-        " folders": "folder", " folder": "folder",
-        " directories": "folder", " directory": "folder", " dir": "folder",
-        " files": "file", " file": "file",
-    }
-    for _sfx, _tp in _SUFFIX_TYPE.items():
-        if query.lower().endswith(_sfx):
-            query = query[:-len(_sfx)].strip()
-            open_type = _tp
-            break
-
-    if not query:
-        return ToolResult(success=False, text="Query required.", spoken="What would you like me to open?")
-
-    # Validate drive letter
-    if drive and not drive.isalpha():
-        drive = ""
-
-    cmd_exe = _find_cmdexe()
-    if not cmd_exe:
-        return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't open files on this system.")
-
-    _drive_suffix = f" in {drive} drive" if drive else ""
-
-    # ── Fast path: check the file-system index first (<5ms) ──────────────────
+    # ── Fast path: fs_search ranked engine ───────────────────────────────────
     try:
-        from api.services.fs_index import fs_index
-        if fs_index.is_ready:
-            _type_filter = "folder" if open_type == "folder" else (
-                "file" if open_type in ("file", "video", "image") else None
-            )
-            _hits = fs_index.search_fuzzy(
-                query, type_filter=_type_filter, drive=drive or None, limit=10
-            )
-            _JUNK_PARTS = {"appdata", "cache", "temp", "temporary internet files",
-                           "node_modules", "programdata", "$recycle.bin", ".tmp"}
-            _hits = [h for h in _hits if not any(p.lower() in _JUNK_PARTS for p in h.parts)]
-            _hits = _hits[:5]
+        from api.services.fs_search import search as _fs_search, open_path as _fs_open, voice_response as _vr
+        from api.services.fs_index import fs_index as _idx
 
-            if len(_hits) > 2:
-                # Multiple strong candidates — ask user to disambiguate
-                _show = _hits[:4]
-                _win_paths = [_wsl_to_win_path(str(h)) for h in _show]
-                _numbered  = "; ".join(f"{i+1}. {h.name}" for i, h in enumerate(_show))
+        # Direct Windows path (e.g. query = "E:\Projects\Python")
+        import re as _re_so
+        if _re_so.match(r'^[A-Za-z]:[\\\/]', query):
+            from pathlib import Path as _P
+            _win_direct = query
+            _wsl_path   = _P("/mnt/" + query[0].lower() + "/" + query[3:].replace("\\", "/"))
+            _ok, _err = _verify_accessible(_wsl_path)
+            if _ok:
+                cmd_exe_d = _find_cmdexe()
+                if cmd_exe_d:
+                    import subprocess as _sp
+                    _sp.Popen([cmd_exe_d, "/c", "start", "", _win_direct],
+                              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    _name = _P(_win_direct.replace("\\", "/")).name
+                    spoken = f"Opened {_name}."
+                    _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_direct}, spoken)
+                    return ToolResult(success=True, text=spoken, spoken=spoken,
+                                      action_path=_win_direct,
+                                      data={"path": _win_direct, "source": "direct_path"})
+            err_map = {"not_found": f"That path doesn't exist.",
+                       "access_denied": "Windows denied access to that path."}
+            spoken = err_map.get(_err, "Couldn't open that path.")
+            return ToolResult(success=False, text=f"Error: {_win_direct}",
+                              spoken=spoken, data={"error_type": _err, "path": _win_direct})
+
+        if _idx.is_ready:
+            _type_filter = (
+                "folder" if open_type in ("folder",) else
+                "file"   if open_type in ("file", "video", "image") else None
+            )
+            _drive_suffix = f" in {drive} drive" if drive else ""
+
+            results = _fs_search(query, type_filter=_type_filter, drive=drive or None, limit=6)
+
+            # Filter video/image types from the result list
+            if open_type == "video":
+                _VIDEO = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+                results = [r for r in results if r.path.suffix.lower() in _VIDEO]
+            elif open_type == "image":
+                _IMG = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
+                results = [r for r in results if r.path.suffix.lower() in _IMG]
+
+            if len(results) > 2:
+                # Multiple strong matches — ask user to disambiguate
+                _show = results[:4]
+                _win_paths = [r.win_path for r in _show]
+                _numbered  = "; ".join(f"{i+1}. {r.path.name}" for i, r in enumerate(_show))
                 spoken = (
-                    f"I found {len(_hits)} items named '{query}'{_drive_suffix}: "
+                    f"I found {len(results)} items named '{query}'{_drive_suffix}: "
                     f"{_numbered}. Which one should I open?"
                 )
                 return ToolResult(
                     success=False,
-                    text=f"Multiple matches for '{query}': {_win_paths}",
+                    text=f"Multiple matches for '{query}'",
                     spoken=spoken,
                     data={"error_type": "multiple_matches", "matches": _win_paths,
                           "query": query, "numbered": _numbered},
                 )
 
-            VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
-            IMAGE_EXTS_IDX = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
-            for _hit in _hits:
-                if open_type == "video" and _hit.suffix.lower() not in VIDEO_EXTS_IDX:
-                    continue
-                if open_type == "image" and _hit.suffix.lower() not in IMAGE_EXTS_IDX:
-                    continue
+            for result in results:
+                success, win_path, err_type = _fs_open(result, query=query)
+                if success:
+                    spoken = _vr(True, result.path.name, drive_suffix=_drive_suffix)
+                    _store_last_action(ctx, "smart_open", {**params, "_found_path": win_path}, spoken)
+                    return ToolResult(success=True, text=spoken, spoken=spoken,
+                                      action_path=win_path,
+                                      data={"path": win_path, "source": result.source})
+                if err_type == "access_denied":
+                    spoken = _vr(False, result.path.name, error_type="access_denied")
+                    return ToolResult(success=False, text=f"Access denied: {win_path}",
+                                      spoken=spoken,
+                                      data={"error_type": "access_denied", "path": win_path})
+                # not_found or drive_unavailable → try next result (index may be stale)
 
-                # ── Verify before speaking ───────────────────────────────────
-                _ok, _err = _verify_accessible(_hit)
-                if not _ok:
-                    _win_path = _wsl_to_win_path(str(_hit))
-                    if _err == "access_denied":
-                        return ToolResult(
-                            success=False,
-                            text=f"Access denied: {_win_path}",
-                            spoken=f"I found the {_hit.name} folder, but Windows denied access.",
-                            data={"path": _win_path, "error_type": "access_denied"},
-                        )
-                    continue  # not_found → try next hit (index may be stale)
+            if results:
+                # All index results were stale — fall through to slow scan
+                logger.debug("[FS_SEARCH] all index results stale for query=%r, falling back", query)
+        else:
+            logger.debug("[FS_SEARCH] index not ready — falling back to disk scan")
+    except Exception as _fast_exc:
+        logger.debug("[FS_SEARCH] fast path error: %s", _fast_exc)
 
-                _win_path = _wsl_to_win_path(str(_hit))
-                subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                spoken = f"Opened {_hit.name}{_drive_suffix}."
-                logger.info("[FS_INDEX_HIT] query=%r path=%s", query, _win_path)
-                _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_path}, spoken)
-                return ToolResult(success=True, text=spoken, spoken=spoken,
-                                  action_path=_win_path,
-                                  data={"path": _win_path, "source": "index"})
-
-            # All index hits were stale or inaccessible — fall through to disk scan
-            logger.debug("[FS_INDEX_MISS] query=%r drive=%s all hits invalid", query, drive or "any")
-
-    except Exception as _idx_exc:
-        logger.debug("fs_index fast-path skipped: %s", _idx_exc)
-
-    # ── Slow path: incremental find ───────────────────────────────────────────
+    # ── Slow path: incremental disk find (fallback when index misses) ────────────
+    if drive and not drive.isalpha():
+        drive = ""
+    cmd_exe = _find_cmdexe()
+    if not cmd_exe:
+        return ToolResult(success=False, text="cmd.exe not found.", spoken="Can't open files on this system.")
+    _drive_suffix = f" in {drive} drive" if drive else ""
 
     VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
@@ -3970,6 +3944,12 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         spoken = f"Opened {found_path.name}{_drive_suffix}."
         _store_last_action(ctx, "smart_open", {**params, "_found_path": win_target}, spoken)
+        # Record this open so future searches rank this path higher (Part 7 — learning)
+        try:
+            from api.services.fs_index import fs_index as _fsi_slow
+            _fsi_slow.record_open(found_path)
+        except Exception:
+            pass
         return ToolResult(success=True, text=f"Opened: {win_target}", spoken=spoken,
                           action_path=win_target,
                           data={"path": win_target, "source": "disk_scan"})

@@ -978,7 +978,9 @@ export function useVoiceSession() {
   const taskCtrlRef       = useRef<AbortController | null>(null)
   const queueRef          = useRef<AudioQueue | null>(null)
   const isRunningRef      = useRef(false)   // single-instance guard — true while listen cycle is active
-  const sessionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sessionTimeoutRef  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const watchdogRef        = useRef<ReturnType<typeof setInterval> | null>(null)
+  const loopStartTsRef     = useRef<number>(0)   // when isRunningRef was last set true
 
   const historyRef = useRef<Array<{ role: string; text: string }>>([])
   const pendingFolderRef   = useRef<{ stage: 'name'; knownPath?: string } | { stage: 'path'; name: string } | null>(null)
@@ -1099,6 +1101,7 @@ export function useVoiceSession() {
     if (!activeRef.current) return
     if (isRunningRef.current) { console.log('[AUTO LISTEN] blocked (loop guard)'); return }
     isRunningRef.current = true
+    loopStartTsRef.current = Date.now()
 
     // Abort any in-flight AI task
     taskCtrlRef.current?.abort()
@@ -1777,6 +1780,15 @@ export function useVoiceSession() {
       personalityMode,
       detectedLang,
     )
+  } catch (err) {
+    // Safety net: any uncaught error in the loop would leave isRunningRef.current = true
+    // forever, freezing the session. This catch resets state and restarts.
+    console.error('[VOICE_RUNTIME] [MAIN_LOOP_BLOCK] uncaught loop error — resetting session:', err)
+    isRunningRef.current = false
+    stopMedia()
+    if (activeRef.current) {
+      setTimeout(() => maybeRestartListening(), 800)
+    }
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -1789,6 +1801,20 @@ export function useVoiceSession() {
     historyRef.current = []
     activeRef.current = true
     window.dispatchEvent(new Event('xyron:session-start'))
+
+    // Dead-man switch: if isRunningRef stays true for > 45s, something crashed silently.
+    // Reset it so the session can recover. Fires every 15s.
+    if (watchdogRef.current) clearInterval(watchdogRef.current)
+    watchdogRef.current = setInterval(() => {
+      if (!activeRef.current) { clearInterval(watchdogRef.current!); watchdogRef.current = null; return }
+      const stuckMs = isRunningRef.current ? Date.now() - loopStartTsRef.current : 0
+      if (stuckMs > 45_000) {
+        console.warn('[VOICE_RUNTIME] [PERF_WARN] loop stuck for', Math.round(stuckMs / 1000), 's — force-resetting')
+        isRunningRef.current = false
+        stopMedia()
+        maybeRestartListening()
+      }
+    }, 15_000)
     setSessionState('greeting')
 
     const { mode } = readAssistantSettings()
@@ -1813,6 +1839,10 @@ export function useVoiceSession() {
     if (sessionTimeoutRef.current) {
       clearTimeout(sessionTimeoutRef.current)
       sessionTimeoutRef.current = null
+    }
+    if (watchdogRef.current) {
+      clearInterval(watchdogRef.current)
+      watchdogRef.current = null
     }
     taskCtrlRef.current?.abort()
     queueRef.current?.abort()

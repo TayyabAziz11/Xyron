@@ -208,9 +208,24 @@ async def startup() -> None:
     # Filesystem index — trigger singleton import so background scan starts immediately
     try:
         from .services.fs_index import fs_index as _fsidx  # noqa: F401 — side-effect: starts bg scan
-        logger.info("[FS_INDEX] background scan started (ready=%s)", _fsidx.is_ready)
+        logger.info("[FS_INDEX] background staged scan started (ready=%s)", _fsidx.is_ready)
     except Exception as _exc6:
         logger.warning("[FS_INDEX] startup skipped: %s", _exc6)
+
+    # Filesystem watcher — starts after index is ready
+    try:
+        from .services.fs_watcher import fs_watcher as _fswatcher
+        _fswatcher.start()
+        logger.info("[WATCHDOG_START] live filesystem watcher started")
+    except Exception as _exc7:
+        logger.warning("[WATCHDOG_START] watcher startup skipped: %s", _exc7)
+
+    # Worker queue — pre-warm thread pool
+    try:
+        from .services.worker_queue import worker_queue as _wq
+        logger.info("[WORKER_QUEUE] thread pool ready max_workers=%d", _wq._pool._max_workers)
+    except Exception as _exc8:
+        logger.warning("[WORKER_QUEUE] startup skipped: %s", _exc8)
 
 
 # CORS — allow the Next.js dashboard
