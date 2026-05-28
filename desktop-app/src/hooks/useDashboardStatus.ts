@@ -22,10 +22,13 @@ const INITIAL: DashboardState = {
   commands: [], approvals: [], online: false, lastFetch: 0,
 }
 
-// Fast poll: health/metrics/cognition every 8s (reduced from 5s to cut render pressure)
-// Slow poll: brain/commands/approvals every 20s (reduced from 10s — less critical)
-const FAST_MS = 8_000
-const SLOW_MS = 20_000
+// Visibility-aware polling intervals:
+//   Visible   — fast: 8s, slow: 20s  (dashboard is being watched)
+//   Hidden    — fast: 30s, slow: 60s (window minimized or covered)
+const FAST_MS_VISIBLE  = 8_000
+const SLOW_MS_VISIBLE  = 20_000
+const FAST_MS_HIDDEN   = 30_000
+const SLOW_MS_HIDDEN   = 60_000
 
 export function useDashboardStatus() {
   const [state, setState] = useState<DashboardState>(INITIAL)
@@ -83,15 +86,30 @@ export function useDashboardStatus() {
       } catch { /* keep last state */ }
     }
 
+    const getIntervals = () => ({
+      fast: document.visibilityState === 'hidden' ? FAST_MS_HIDDEN : FAST_MS_VISIBLE,
+      slow: document.visibilityState === 'hidden' ? SLOW_MS_HIDDEN : SLOW_MS_VISIBLE,
+    })
+
+    const restart = () => {
+      if (!alive) return
+      if (fastRef.current) clearInterval(fastRef.current)
+      if (slowRef.current) clearInterval(slowRef.current)
+      const { fast: fMs, slow: sMs } = getIntervals()
+      fastRef.current = setInterval(fast, fMs)
+      slowRef.current = setInterval(slow, sMs)
+    }
+
     fast()
     slow()
-    fastRef.current = setInterval(fast, FAST_MS)
-    slowRef.current = setInterval(slow, SLOW_MS)
+    restart()
+    document.addEventListener('visibilitychange', restart)
 
     return () => {
       alive = false
       if (fastRef.current) clearInterval(fastRef.current)
       if (slowRef.current) clearInterval(slowRef.current)
+      document.removeEventListener('visibilitychange', restart)
     }
   }, [])
 
