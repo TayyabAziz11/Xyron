@@ -715,7 +715,9 @@ async def ws_session(websocket: WebSocket) -> None:
             finally:
                 _narration_queue.task_done()
 
-    async def _tts_sequential(text: str, _voice_override: str | None = None) -> bool:
+    async def _tts_sequential(
+        text: str, _voice_override: str | None = None, _speed_override: float | None = None,
+    ) -> bool:
         """Synthesize `text` chunk-by-chunk and stream to client. Interruption disabled."""
         # ── Multilingual routing: delegate to XTTS if response language is non-English ──
         _resp_lang = _session_state.get("ml_resp_lang", "en")
@@ -736,10 +738,11 @@ async def ws_session(websocket: WebSocket) -> None:
         _v = _voice_override or voice
         _tts_t0 = time.time()
         logger.info("[TTS_STATE_ENTER] chars=%d voice=%s", len(text), _v)
+        _spd = _speed_override if _speed_override is not None else speed
         chunks = _split_for_tts(text)
         n = len(chunks)
         for i, chunk in enumerate(chunks, 1):
-            wav = await _synthesize_chunk(chunk, _v, speed)
+            wav = await _synthesize_chunk(chunk, _v, _spd)
             if wav:
                 sent = await _send(websocket, {
                     "type":  "audio",
@@ -2424,19 +2427,13 @@ async def ws_session(websocket: WebSocket) -> None:
 
                 await _send(websocket, {"type": "response", "text": _shaped, "chunk": 1})
 
-                # Synthesize with emotion speed (bypasses closure `speed`)
-                _emo_chunks = _split_for_tts(_tts_r.text)
-                for _i, _ec in enumerate(_emo_chunks, 1):
-                    _wav = await _synthesize_chunk(_ec, voice, _tts_r.speed_hint)
-                    if _wav:
-                        await _send(websocket, {
-                            "type":  "audio",
-                            "data":  base64.b64encode(_wav).decode(),
-                            "chunk": _i,
-                            "total": len(_emo_chunks),
-                            "final": (_i == len(_emo_chunks)),
-                            "text":  _ec,
-                        })
+                # Same synth/send/state-tracking path every other route uses —
+                # was previously a hand-rolled chunk loop here that duplicated
+                # _tts_sequential's synth+send logic without its audio_sent/
+                # playback-done bookkeeping, so the SPEAKING_FLAG_SET/watchdog
+                # logic right after this branch was reading stale state left
+                # over from whatever the last _tts_sequential call had set.
+                await _tts_sequential(_tts_r.text, _speed_override=_tts_r.speed_hint)
 
             except Exception as _exc:
                 logger.warning("[VOICE_TRACE] emotional_response error: %s", _exc)
@@ -2768,7 +2765,7 @@ async def ws_session(websocket: WebSocket) -> None:
                         else _direct_type_map.get(_agent_intent.agent_type, _AT.COORDINATOR)
                     )
 
-                    _coordinator_ack = "On it. I'll coordinate that for you."
+                    _coordinator_ack = "On it — I'll take care of that."
                     _ack_by_type = {
                         "browser":    "On it. I'll research that and report back.",
                         "coding":     "I'll start building that now. I'll keep you updated.",
