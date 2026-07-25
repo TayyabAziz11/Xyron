@@ -13,7 +13,8 @@ from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s",
+    format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s",
+    datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
 
