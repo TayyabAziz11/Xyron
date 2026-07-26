@@ -45,8 +45,13 @@ def _open_in_real_chrome(url: str) -> None:
         logger.debug("[BROWSER_REAL_CHROME_OPEN_FAILED] url=%s error=%r", url, str(exc))
         logger.info("[BROWSER_LINUX_DRIVER_INTERNAL] url=%s reason=real_chrome_launch_failed", url)
 
-# Selectors tried in order when looking for cookie / consent banners.
-_COOKIE_SELECTORS: list[str] = [
+# Cookie / consent banner detection — split into plain-CSS selectors
+# (native document.querySelector, safe to batch into one page.evaluate())
+# and text-phrase matches (the old list used Playwright-only :has-text(),
+# which isn't valid in-page JS — re-implemented below as a plain text
+# comparison over every <button>). Order matches the original list, so
+# behavior/priority is unchanged — only the round-trip count changes.
+_COOKIE_CSS_SELECTORS: list[str] = [
     "[id*='cookie'] button",
     "[class*='cookie'] button",
     ".accept-cookies",
@@ -58,13 +63,60 @@ _COOKIE_SELECTORS: list[str] = [
     "button[id*='accept']",
     "button[class*='accept']",
     "[class*='consent'] button",
-    "button:has-text('Accept all')",
-    "button:has-text('Accept cookies')",
-    "button:has-text('I agree')",
-    "button:has-text('Got it')",
-    "button:has-text('OK')",
-    "button:has-text('Allow all')",
 ]
+_COOKIE_TEXT_PHRASES: list[str] = [
+    "Accept all", "Accept cookies", "I agree", "Got it", "OK", "Allow all",
+]
+# Kept for logging/back-compat with anything that still refers to the flat list.
+_COOKIE_SELECTORS: list[str] = _COOKIE_CSS_SELECTORS + [
+    f"button:has-text('{p}')" for p in _COOKIE_TEXT_PHRASES
+]
+
+# Runs entirely in-page — zero additional CDP round trips regardless of how
+# many selectors/phrases are checked. Clicks in-JS (bypasses Playwright's
+# actionability checks) since this is a best-effort dismiss, not a
+# user-critical interaction; a real click failure just leaves the banner
+# up, which the caller already tolerates today.
+_COOKIE_BATCH_JS = """
+([cssSelectors, textPhrases]) => {
+    function isVisible(el) {
+        const r = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden'
+            && r.width > 0 && r.height > 0;
+    }
+    for (const sel of cssSelectors) {
+        try {
+            const el = document.querySelector(sel);
+            if (el && isVisible(el)) { el.click(); return sel; }
+        } catch (e) { /* skip */ }
+    }
+    const buttons = Array.from(document.querySelectorAll('button'));
+    for (const phrase of textPhrases) {
+        const lower = phrase.toLowerCase();
+        for (const btn of buttons) {
+            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+            if ((text === lower || text.includes(lower)) && isVisible(btn)) {
+                btn.click();
+                return "button:has-text('" + phrase + "')";
+            }
+        }
+    }
+    return null;
+}
+"""
+
+# Per-domain cache: once we've confirmed a domain has no banner (or found
+# the selector that works), never pay for a rescan on that domain again
+# within the TTL. Google Flights doesn't start showing a consent banner
+# mid-session, so an hour is conservative, not aggressive.
+_COOKIE_CACHE_TTL_S = 3600.0
+_cookie_banner_cache: dict[str, dict] = {}
+
+
+def _domain_of(url: str) -> str:
+    from urllib.parse import urlparse
+    return urlparse(url).netloc or url
 
 _POPUP_SELECTORS: list[str] = [
     "[class*='modal'] [class*='close']",
@@ -223,50 +275,79 @@ class BrowserNavigator:
         """
         Attempt to dismiss a cookie / GDPR consent overlay.
         Returns True if a banner was found and dismissed.
+
+        Phase 5.2: was a 17-selector sequential scan (17 CDP round trips,
+        ~3.2s, every single search — measured live, see Phase 5.1 report).
+        Now: per-domain cache first (0 round trips once confirmed), then a
+        single page.evaluate() covering all 17 checks in-page (1 round
+        trip total instead of 17) when a scan is actually needed.
         """
-        _loop_t0 = time.time()
-        logger.info("[MICRO_PROFILE] op=cookie_banner_loop_start selector_count=%d", len(_COOKIE_SELECTORS))
-        for _idx, sel in enumerate(_COOKIE_SELECTORS, 1):
-            _sel_t0 = time.time()
-            try:
-                btn = await self.page.query_selector(sel)
-                _query_ms = (time.time() - _sel_t0) * 1000
-                if btn and await btn.is_visible():
-                    logger.info(
-                        "[MICRO_PROFILE] op=cookie_selector_check index=%d/%d selector=%r "
-                        "query_ms=%.1f result=match_found",
-                        _idx, len(_COOKIE_SELECTORS), sel, _query_ms,
-                    )
-                    _click_t0 = time.time()
-                    await btn.click(timeout=5_000)
-                    _click_ms = (time.time() - _click_t0) * 1000
-                    logger.info("[MICRO_PROFILE] op=cookie_click selector=%r click_ms=%.1f", sel, _click_ms)
-                    await asyncio.sleep(0.3)
-                    logger.info("[MICRO_PROFILE] op=cookie_settle_sleep duration_ms=300.0 kind=fixed_sleep")
-                    logger.info("[BROWSER_COOKIE_DISMISSED] selector=%r", sel)
-                    logger.info(
-                        "[MICRO_PROFILE] op=cookie_banner_loop_end outcome=dismissed "
-                        "selectors_checked=%d/%d total_ms=%.1f",
-                        _idx, len(_COOKIE_SELECTORS), (time.time() - _loop_t0) * 1000,
-                    )
-                    return True
+        domain = _domain_of(self.page.url)
+        now = time.time()
+        cached = _cookie_banner_cache.get(domain)
+
+        if cached is not None and (now - cached["ts"]) < _COOKIE_CACHE_TTL_S:
+            if cached["no_banner"]:
                 logger.info(
-                    "[MICRO_PROFILE] op=cookie_selector_check index=%d/%d selector=%r "
-                    "query_ms=%.1f result=no_match",
-                    _idx, len(_COOKIE_SELECTORS), sel, _query_ms,
+                    "[MICRO_PROFILE] op=cookie_banner_cache_hit domain=%s outcome=no_banner_confirmed "
+                    "age_s=%.0f scan_skipped=true",
+                    domain, now - cached["ts"],
                 )
-            except Exception as exc:
+                return False
+            if cached["selector"]:
+                _t0 = time.time()
+                try:
+                    btn = await self.page.query_selector(cached["selector"])
+                    if btn and await btn.is_visible():
+                        await btn.click(timeout=5_000)
+                        await asyncio.sleep(0.3)
+                        _ms = (time.time() - _t0) * 1000
+                        logger.info(
+                            "[MICRO_PROFILE] op=cookie_banner_cache_hit domain=%s "
+                            "outcome=cached_selector_worked selector=%r ms=%.1f",
+                            domain, cached["selector"], _ms,
+                        )
+                        logger.info("[BROWSER_COOKIE_DISMISSED] selector=%r", cached["selector"])
+                        _cookie_banner_cache[domain] = {
+                            "no_banner": False, "selector": cached["selector"], "ts": now,
+                        }
+                        return True
+                except Exception:
+                    pass
                 logger.info(
-                    "[MICRO_PROFILE] op=cookie_selector_check index=%d/%d selector=%r "
-                    "query_ms=%.1f result=exception error=%r",
-                    _idx, len(_COOKIE_SELECTORS), sel, (time.time() - _sel_t0) * 1000, str(exc),
+                    "[MICRO_PROFILE] op=cookie_banner_cache_miss domain=%s "
+                    "reason=cached_selector_no_longer_matches",
+                    domain,
                 )
-                continue
+                # fall through to a full rescan below
+
+        _scan_t0 = time.time()
+        try:
+            matched = await self.page.evaluate(
+                _COOKIE_BATCH_JS, [_COOKIE_CSS_SELECTORS, _COOKIE_TEXT_PHRASES],
+            )
+        except Exception as exc:
+            logger.info("[MICRO_PROFILE] op=cookie_banner_batched_scan domain=%s outcome=error error=%r",
+                        domain, str(exc))
+            matched = None
+        _scan_ms = (time.time() - _scan_t0) * 1000
+
+        if matched:
+            await asyncio.sleep(0.3)
+            logger.info(
+                "[MICRO_PROFILE] op=cookie_banner_batched_scan domain=%s outcome=matched "
+                "selector=%r scan_ms=%.1f",
+                domain, matched, _scan_ms,
+            )
+            logger.info("[BROWSER_COOKIE_DISMISSED] selector=%r", matched)
+            _cookie_banner_cache[domain] = {"no_banner": False, "selector": matched, "ts": now}
+            return True
+
         logger.info(
-            "[MICRO_PROFILE] op=cookie_banner_loop_end outcome=no_banner_found "
-            "selectors_checked=%d/%d total_ms=%.1f",
-            len(_COOKIE_SELECTORS), len(_COOKIE_SELECTORS), (time.time() - _loop_t0) * 1000,
+            "[MICRO_PROFILE] op=cookie_banner_batched_scan domain=%s outcome=no_banner_found scan_ms=%.1f",
+            domain, _scan_ms,
         )
+        _cookie_banner_cache[domain] = {"no_banner": True, "selector": None, "ts": now}
         return False
 
     async def handle_popup(self) -> bool:
