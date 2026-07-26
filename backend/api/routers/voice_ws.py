@@ -40,6 +40,7 @@ import base64
 import collections
 import json
 import logging
+import random
 import re
 import sys
 import time
@@ -51,6 +52,16 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 logger = logging.getLogger(__name__)
+
+# Phase 5.3: content-free filler spoken the instant speech is finalized —
+# requires no transcript, no classification. Kept deliberately generic so
+# it's honest regardless of what the command turns out to be.
+_IMMEDIATE_ACK_PHRASES = ["Got it.", "Sure.", "One moment.", "On it."]
+
+
+def _pick_immediate_ack() -> str:
+    return random.choice(_IMMEDIATE_ACK_PHRASES)
+
 
 # Lazy import — tracer available after backend package is on sys.path
 def _tracer():
@@ -664,6 +675,15 @@ async def ws_session(websocket: WebSocket) -> None:
     # Checked after each call to decide whether to send "done" or fall back to "listening".
     _tts_state: dict = {"audio_sent": False}
 
+    # Phase 5.3: holds the in-flight immediate-ack task (if any) so every
+    # other _tts_sequential call — the contextual ack, a tool response, an
+    # LLM reply, narration fallback — waits for it to finish sending before
+    # starting its own audio stream. Prevents two concurrent _tts_sequential
+    # calls from racing on _tts_state/_tts_playback_done_event, which is
+    # only ever safe for one caller at a time (see _narration_queue comment
+    # below for the same constraint in the narration path).
+    _immediate_ack_state: dict = {"task": None}
+
     # ── Live narration queue (travel-consultant "thinking aloud") ─────────────
     # A long-running background task (e.g. flight_search_agent.search_and_compare)
     # cannot call _tts_sequential directly — it mutates shared _tts_state /
@@ -717,8 +737,23 @@ async def ws_session(websocket: WebSocket) -> None:
 
     async def _tts_sequential(
         text: str, _voice_override: str | None = None, _speed_override: float | None = None,
+        _is_immediate_ack: bool = False,
     ) -> bool:
         """Synthesize `text` chunk-by-chunk and stream to client. Interruption disabled."""
+        # Phase 5.3: every call except the immediate-ack's own waits for that
+        # ack to finish sending first — it may still be in flight since it
+        # was queued at speech-end, before STT even started, deliberately
+        # concurrent with everything up to this point.
+        if not _is_immediate_ack:
+            _pending_ack = _immediate_ack_state["task"]
+            if _pending_ack is not None and not _pending_ack.done():
+                _wait_t0 = time.time()
+                try:
+                    await _pending_ack
+                except Exception:
+                    pass
+                logger.info("[MICRO_PROFILE] op=wait_for_immediate_ack wait_ms=%.1f",
+                            (time.time() - _wait_t0) * 1000)
         # ── Multilingual routing: delegate to XTTS if response language is non-English ──
         _resp_lang = _session_state.get("ml_resp_lang", "en")
         if _resp_lang != "en":
@@ -2972,7 +3007,13 @@ async def ws_session(websocket: WebSocket) -> None:
             )
 
             # Fix 2: Build command-aware ACK and send while tool runs in parallel
-            if decision.tool_name in _slow_tools:
+            # Phase 5.3: skip this tool-specific cached ack when the universal
+            # immediate ack ("Got it."/"Sure.") already fired this turn —
+            # otherwise the user hears two acks back to back ("Got it....
+            # Opening Calculator.") where one used to be enough. The tool's
+            # own completion message still gets spoken normally below via
+            # response_text once _ack_spoken stays False.
+            if decision.tool_name in _slow_tools and _immediate_ack_state["task"] is None:
                 try:
                     from api.services.tts_cache_service import tts_cache as _tcc
                     _ack_text = _build_ack_text(decision.tool_name, decision.tool_params)
@@ -3358,6 +3399,21 @@ async def ws_session(websocket: WebSocket) -> None:
                             current_turn_id += 1
                             logger.info("[MICRO_PROFILE] op=speech_end_finalized turn=%d ts=%.6f",
                                         current_turn_id, time.time())
+                            # Phase 5.3: fire a content-free filler the instant speech
+                            # ends — no transcript, no classification needed. Skipped
+                            # for flight-followup short commands ("only Emirates",
+                            # "cheapest") — that path already has its own fast,
+                            # tuned acks (conversation_layer's ACK_PHRASES) and is
+                            # deliberately snappy; stacking a second generic ack in
+                            # front of it would just add a redundant beat.
+                            if _min_frames != _SHORT_MIN_SPEECH_FRAMES:
+                                _imm_ack_text = _pick_immediate_ack()
+                                await _send(websocket, {"type": "response", "text": _imm_ack_text, "chunk": 1})
+                                _immediate_ack_state["task"] = asyncio.create_task(
+                                    _tts_sequential(_imm_ack_text, _is_immediate_ack=True)
+                                )
+                                logger.info("[MICRO_PROFILE] op=immediate_ack_queued turn=%d ts=%.6f",
+                                            current_turn_id, time.time())
                             asyncio.create_task(process_utterance(frames, current_turn_id))
                     elif t == "tts_done":
                         logger.info("[TTS_DONE_RECEIVED] is_speaking=%s", is_speaking)
