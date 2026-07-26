@@ -3356,6 +3356,8 @@ async def ws_session(websocket: WebSocket) -> None:
                             is_speaking     = True
                             interrupt_event.clear()
                             current_turn_id += 1
+                            logger.info("[MICRO_PROFILE] op=speech_end_finalized turn=%d ts=%.6f",
+                                        current_turn_id, time.time())
                             asyncio.create_task(process_utterance(frames, current_turn_id))
                     elif t == "tts_done":
                         logger.info("[TTS_DONE_RECEIVED] is_speaking=%s", is_speaking)
