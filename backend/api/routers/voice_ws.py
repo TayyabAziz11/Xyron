@@ -517,6 +517,8 @@ async def ws_session(websocket: WebSocket) -> None:
     # Mutable dict avoids nonlocal in nested closures.
     _session_state: dict = {
         "pending_confirmation":       None,
+        "pending_control_confirmation": None,  # set when a short utterance looked like a
+                                                # misheard control word (Phase 5.4B)
         "pending_store_candidates":   None,
         "pending_open_after_install": None,   # set after install_store_app_exec succeeds
         "ml_detected_lang":           _cfg_lang_hint or "en",  # pre-seed from config; else "en"
@@ -1750,6 +1752,72 @@ async def ws_session(websocket: WebSocket) -> None:
                     await _send(websocket, {"type": "listening"})
                 return
 
+        # ── Tier 0d-control: ambiguous control-word confirmation (Phase 5.4B) ─
+        # Fires when Tier 0g (further below, previous turn) detected a short
+        # utterance that looked like a misheard control word ("console" for
+        # "cancel") while an operation was active, and asked "Did you say
+        # cancel?" instead of guessing. Resolves that question here — never
+        # falls through to executing something unrelated on a misheard word.
+        _pending_ctrl = _session_state.get("pending_control_confirmation")
+        if _pending_ctrl:
+            _CTRL_YES_RE = re.compile(r'\b(yes|yeah|yep|yup|correct|right|that\'?s right)\b', re.IGNORECASE)
+            _CTRL_NO_RE = re.compile(r'\b(no|nope|not|wrong|never\s?mind)\b', re.IGNORECASE)
+            _ctrl_action = _pending_ctrl["action"]
+            _session_state["pending_control_confirmation"] = None
+            if _CTRL_YES_RE.search(transcript):
+                from api.agents.agent_runtime import agent_runtime as _art_ctrl
+                _active_ctrl = _art_ctrl.get_active()
+                if _ctrl_action == "cancel" and _active_ctrl is not None:
+                    await _art_ctrl.cancel(_active_ctrl.task_id)
+                    # Cancelling the runtime task does not clear
+                    # flight_session_state — they're separate pieces of
+                    # state. Leaving the session "active" here silently
+                    # suppressed every subsequent identical search via
+                    # BROWSER_DISPATCH_SUPPRESSED (found live, Phase 5.4B
+                    # controlled benchmark: only 5 of 10 identical searches
+                    # actually launched a new task after a cancel).
+                    if _flight_session_active():
+                        from api.agents.browser_agent import flight_session_state as _fss_ctrl2
+                        _fss_ctrl2.clear()
+                    _ctrl_resp = "Cancelled."
+                elif _ctrl_action in ("pause",) and _active_ctrl is not None:
+                    await _art_ctrl.pause(_active_ctrl.task_id)
+                    _ctrl_resp = "Paused."
+                elif _ctrl_action in ("continue", "resume") and _active_ctrl is not None:
+                    await _art_ctrl.resume(_active_ctrl.task_id)
+                    _ctrl_resp = "Resuming."
+                elif _ctrl_action == "cancel" and _flight_session_active():
+                    from api.agents.browser_agent import flight_session_state as _fss_ctrl
+                    _fss_ctrl.clear()
+                    _ctrl_resp = "Cancelled. The browser stays open, but I've cleared the active search."
+                else:
+                    _ctrl_resp = f"There's nothing active to {_ctrl_action} anymore."
+                logger.info("[AMBIGUOUS_CONTROL_CONFIRMED] action=%s", _ctrl_action)
+            elif _CTRL_NO_RE.search(transcript):
+                _ctrl_resp = "Okay, ignoring that."
+                logger.info("[AMBIGUOUS_CONTROL_REJECTED] action=%s", _ctrl_action)
+            else:
+                # Neither a clear yes nor no — treat this turn as a fresh
+                # command rather than re-prompting forever; safer to drop
+                # the stale clarification than to keep blocking normal use.
+                _ctrl_resp = None
+                logger.info("[AMBIGUOUS_CONTROL_UNCLEAR] action=%s transcript=%r", _ctrl_action, transcript[:60])
+            if _ctrl_resp is not None:
+                memory.add_assistant(_ctrl_resp, tool_name="ambiguous_control_resolved")
+                last_response_text = _ctrl_resp
+                last_activity_t = time.time()
+                await _send(websocket, {"type": "response", "text": _ctrl_resp, "chunk": 1})
+                _interrupted = await _tts_sequential(_ctrl_resp)
+                if not _interrupted and _tts_state["audio_sent"]:
+                    await _send(websocket, {"type": "done"})
+                    asyncio.create_task(_spawn_tts_watchdog("ambiguous_control_resolved"))
+                else:
+                    is_speaking = False
+                    await _send(websocket, {"type": "listening"})
+                return
+            # _ctrl_resp is None → fall through, let this transcript be
+            # processed as a normal new command.
+
         # ── Tier 0d2: Open-after-install handler ─────────────────────────────
         # Fires when install_store_app_exec just succeeded and user says yes/no/open it.
         _pending_oai = _session_state.get("pending_open_after_install")
@@ -2646,6 +2714,38 @@ async def ws_session(websocket: WebSocket) -> None:
                 logger.warning("[SLOW_STAGE] stage=intent_tier0g ms=%.0f budget=300", _tier0g_ms)
             logger.info("[AGENT_INTENT] is_agent=%s type=%s reason=%s",
                         _agent_intent.is_agent_command, _agent_intent.agent_type, _agent_intent.reason)
+
+            # ── Phase 5.4B: short-command safety ──────────────────────────────
+            # Nothing matched, but the transcript looks like a misheard
+            # control word ("console" for "cancel"). Only worth asking about
+            # when there's actually something to cancel/pause/resume —
+            # contextual validation against the active operation, not a
+            # blind guess from confidence/text alone. Never falls through to
+            # an unrelated action on a misheard short word.
+            if not _agent_intent.is_agent_command and _agent_intent.ambiguous_control:
+                from api.agents.agent_runtime import agent_runtime as _art_amb
+                _active_amb = _art_amb.get_active()
+                _flight_active_amb = _flight_session_active()
+                if _active_amb is not None or _flight_active_amb:
+                    _amb_word = _agent_intent.ambiguous_control
+                    logger.info(
+                        "[AMBIGUOUS_CONTROL_DETECTED] word=%s transcript=%r active_task=%s flight_active=%s",
+                        _amb_word, transcript[:60], _active_amb is not None, _flight_active_amb,
+                    )
+                    _session_state["pending_control_confirmation"] = {"action": _amb_word}
+                    _clarify_text = f"Did you say {_amb_word}?"
+                    await _send(websocket, {"type": "response", "text": _clarify_text, "chunk": 1})
+                    _interrupted = await _tts_sequential(_clarify_text)
+                    memory.add_assistant(_clarify_text, tool_name="ambiguous_control_clarify")
+                    last_response_text = _clarify_text
+                    last_activity_t = time.time()
+                    if not _interrupted and _tts_state["audio_sent"]:
+                        await _send(websocket, {"type": "done"})
+                        asyncio.create_task(_spawn_tts_watchdog("ambiguous_control"))
+                    else:
+                        is_speaking = False
+                        await _send(websocket, {"type": "listening"})
+                    return
 
             if _agent_intent.is_agent_command:
                 from api.agents.agent_runtime import agent_runtime as _art

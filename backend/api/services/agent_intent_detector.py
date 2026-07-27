@@ -71,6 +71,9 @@ class AgentIntentResult:
     confidence: float = 0.0
     reason: str = ""
     execution_mode: str = DIRECT_TOOL         # DIRECT_TOOL | DIRECT_AGENT | COORDINATED_WORKFLOW
+    ambiguous_control: Optional[str] = None   # set when no pattern matched but the
+                                               # transcript looks like a misheard control
+                                               # word (e.g. "console" -> "cancel")
 
 
 # ── Control commands — highest priority ──────────────────────────────────────
@@ -265,6 +268,53 @@ _NOT_AGENT = re.compile(
 )
 
 
+# ── Short-command safety (Phase 5.4B) ─────────────────────────────────────────
+# The exact regexes above (_CANCEL_RE etc.) only fire on a correct
+# transcript. A short control word misheard entirely — "cancel" -> STT
+# hears "console" — doesn't match any of them and previously fell straight
+# through to whatever the generic router did with "console" (nothing safe:
+# it's not a real command, so it either got treated as unrelated or reached
+# the LLM). This table + matcher exist to catch that specific failure mode
+# and flag it as *ambiguous* rather than silently wrong or silently ignored
+# — voice_ws.py decides what to do with the ambiguity (currently: ask
+# "Did you say cancel?" rather than guess), this module only detects it.
+_CONTROL_WORD_CONFUSABLES: dict[str, list[str]] = {
+    "cancel":   ["cancel", "cancels", "canceled", "console", "council", "consul", "cansel", "can sell"],
+    "stop":     ["stop", "stops", "stopped", "top", "shop"],
+    "pause":    ["pause", "paused", "pauses", "paws", "boss"],
+    "continue": ["continue", "continues", "continuing", "content new"],
+    "resume":   ["resume", "resumes", "resumed", "reassume"],
+    "yes":      ["yes", "yeah", "yep", "yup", "yas"],
+    "no":       ["no", "know", "nope", "noe"],
+    "back":     ["back", "bak", "black"],
+    "close":    ["close", "closes", "closed", "clothes", "clos"],
+}
+
+
+def _fuzzy_control_match(transcript: str) -> Optional[str]:
+    """Returns the canonical control word (e.g. "cancel") if *transcript*
+    is a known confusable or a close character-level match to one of the
+    short control vocabulary words — else None.
+
+    Deliberately restricted to very short utterances (<=3 words): a control
+    word buried in a longer sentence is a different, much lower-confidence
+    problem this heuristic isn't meant to solve, and would risk false
+    positives on ordinary conversation ("that's fine, close enough").
+    """
+    import difflib
+
+    t = transcript.strip().lower().rstrip(".!?").strip()
+    if not t or len(t.split()) > 3:
+        return None
+    for canonical, confusables in _CONTROL_WORD_CONFUSABLES.items():
+        if t in confusables:
+            return canonical
+        ratio = difflib.SequenceMatcher(None, t, canonical).ratio()
+        if ratio >= 0.6:
+            return canonical
+    return None
+
+
 # ── Main detector ─────────────────────────────────────────────────────────────
 
 class AgentIntentDetector:
@@ -280,6 +330,9 @@ class AgentIntentDetector:
             result.execution_mode = DIRECT_AGENT
         else:
             result.execution_mode = DIRECT_TOOL
+            # Only worth checking when nothing else matched — an exact
+            # control-word hit above is already unambiguous and handled.
+            result.ambiguous_control = _fuzzy_control_match(transcript)
         return result
 
     def _detect_raw(self, transcript: str) -> AgentIntentResult:
