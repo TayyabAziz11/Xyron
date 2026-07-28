@@ -31,6 +31,8 @@ import { readAssistantSettings } from '@/hooks/useAssistantSettings'
 const FRAME_SAMPLES = 1280   // 80ms @ 16kHz
 const SAMPLE_RATE   = 16_000
 
+let _sessionWsInstanceCounter = 0
+
 function _ts(): string { return new Date().toISOString() }
 function log(tag: string, msg: string): void {
   console.log(`[${tag}] ${_ts()} ${msg}`)
@@ -539,6 +541,8 @@ export function useVoiceWS() {
       log('SESSION_WS_CONNECTING', `url=${url}`)
       const ws  = new WebSocket(url)
       wsRef.current = ws
+      const _sessionInstanceId = `session-${++_sessionWsInstanceCounter}`
+      console.log(`[SESSION_WS_INSTANCE_CREATED] instance_id=${_sessionInstanceId}`)
 
       ws.onopen = async () => {
         log('SESSION_WS_OPEN', 'WebSocket /ws/session [connected]')

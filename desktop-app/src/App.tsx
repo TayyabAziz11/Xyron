@@ -3,6 +3,7 @@ import type { ReactNode, ErrorInfo } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { UIModeProvider } from '@/contexts/UIModeContext'
+import { VoiceRuntimeProvider } from '@/contexts/VoiceRuntimeContext'
 import { AppShell } from './components/AppShell'
 import { TitleBar } from './components/TitleBar'
 import { ProtectedRoute } from './auth/ProtectedRoute'
@@ -104,7 +105,12 @@ function KeyboardNav() {
 function AppRoutes() {
   const location = useLocation()
   return (
-    <>
+    // Mounted once for the whole authenticated session — path="/*" above
+    // means AppRoutes itself never remounts on internal navigation, only
+    // the inner <Routes> below does. Placing the voice runtime here (and
+    // not inside AppShell/inner Routes) is what keeps the wake/session
+    // sockets alive across /dashboard ↔ /commands ↔ any other route.
+    <VoiceRuntimeProvider>
       <KeyboardNav />
       <TitleBar />
       <UIModeProvider>
@@ -125,7 +131,7 @@ function AppRoutes() {
           </AnimatePresence>
         </AppShell>
       </UIModeProvider>
-    </>
+    </VoiceRuntimeProvider>
   )
 }
 
