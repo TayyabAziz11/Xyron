@@ -133,6 +133,32 @@ async def _send(ws: WebSocket, payload: dict) -> bool:
         return False
 
 
+async def _safe_close(ws: WebSocket, code: int = 1000, reason: str = "unspecified", tag: str = "WAKE_WS") -> None:
+    """Idempotent close — the only function allowed to call `ws.close()`.
+
+    Starlette's `WebSocket.close()` is just `send({"type": "websocket.close", ...})`
+    under the hood, and `send()` flips `application_state` to DISCONNECTED
+    the instant that message goes out — including when the *send itself*
+    fails (e.g. `_send()` swallowing an OSError from a client that already
+    vanished still leaves `application_state` DISCONNECTED). Any second
+    caller hitting `.close()` after that lands in `send()`'s terminal
+    `else` branch and raises "Cannot call \"send\" once a close message
+    has been sent." — an uncaught RuntimeError out of a fire-and-forget
+    task/handler. Checking `application_state` first and swallowing that
+    specific race makes closing safe to call from multiple watchers
+    (timeout watcher, health monitor, main handler, finally block) without
+    them coordinating who "owns" the close."""
+    logger.info("[%s_CLOSE_REQUESTED] reason=%s", tag, reason)
+    if ws.application_state not in (WebSocketState.CONNECTING, WebSocketState.CONNECTED):
+        logger.info("[%s_ALREADY_CLOSED] reason=%s", tag, reason)
+        return
+    try:
+        await ws.close(code=code)
+        logger.info("[%s_CLOSED] reason=%s", tag, reason)
+    except (WebSocketDisconnect, RuntimeError) as exc:
+        logger.info("[%s_ALREADY_CLOSED] reason=%s error=%r", tag, reason, str(exc)[:100])
+
+
 # ── Wake Word WebSocket ───────────────────────────────────────────────────────
 
 @router.websocket("/ws/wake")
@@ -143,7 +169,7 @@ async def ws_wake(websocket: WebSocket) -> None:
         from voice.wake_word_service import wake_word_service as _wws
     except Exception as exc:
         await _send(websocket, {"type": "error", "message": f"WakeWordService unavailable: {exc}"})
-        await websocket.close()
+        await _safe_close(websocket, reason="service_unavailable")
         return
 
     # Wait up to 5s for OWW models to finish loading
@@ -154,7 +180,7 @@ async def ws_wake(websocket: WebSocket) -> None:
 
     if not _wws.oww_ready:
         await _send(websocket, {"type": "error", "message": "Wake word models not loaded"})
-        await websocket.close()
+        await _safe_close(websocket, reason="models_not_loaded")
         return
 
     # Reset singleton state so a stuck session gate from a previous connection
@@ -169,6 +195,7 @@ async def ws_wake(websocket: WebSocket) -> None:
         "cooldown_s": 3.0,
     })
     logger.info("[WS/wake] connected — models: %s (session/tts gates reset)", _wws.model_names)
+    logger.info("[WakeWord] session_active=False")
 
     PING_EVERY = 8.0   # shorter interval → detect dead connections faster
 
@@ -241,6 +268,7 @@ async def ws_wake(websocket: WebSocket) -> None:
                         )
                         continue
 
+                    logger.info("[WakeWord] WAKE_ACCEPTED")
                     if not await _send(websocket, {
                         "type":       "wake",
                         "model":      model_name,
@@ -250,6 +278,7 @@ async def ws_wake(websocket: WebSocket) -> None:
                         break
                     logger.info("[WS/wake] WAKE model=%s conf=%.3f transcript=%r",
                                 model_name, confidence, transcript[:60])
+                    logger.info("[VOICE_STATE_CHANGE] from=IDLE_WAKE_LISTENING to=WAKE_DETECTED")
                 continue
 
             text = data.get("text")
@@ -447,7 +476,7 @@ async def ws_session(websocket: WebSocket) -> None:
         if not _rs.is_core_ready:
             logger.info("[SESSION_REJECTED_NOT_READY] state=%s", _rs.state.value)
             await _send(websocket, _rs.not_ready_payload())
-            await websocket.close(1013)
+            await _safe_close(websocket, code=1013, reason="not_ready", tag="SESSION_WS")
             return
     except Exception as _re:
         logger.debug("[READINESS_CHECK] skipped: %s", _re)
@@ -488,9 +517,11 @@ async def ws_session(websocket: WebSocket) -> None:
         pass
 
     # Block wake word for the duration of this session
+    logger.info("[VOICE_STATE_CHANGE] from=WAKE_DETECTED to=SESSION_ACTIVE")
     try:
         from voice.wake_word_service import wake_word_service as _wws
         _wws.set_session_active(True)
+        logger.info("[WakeWord] session_active=True")
     except Exception:
         pass
 
@@ -557,10 +588,7 @@ async def ws_session(websocket: WebSocket) -> None:
                 logger.info("[SESSION_DESTROY] reason=inactivity idle_s=%.1f", idle_s)
                 logger.info("[SESSION_DESTROY_REASON] inactivity timeout after %.1fs — no speech detected", idle_s)
                 logger.info("[SESSION_WS_DISCONNECT] code=1000 reason=inactivity")
-                try:
-                    await websocket.close(1000)
-                except Exception:
-                    pass
+                await _safe_close(websocket, code=1000, reason="inactivity", tag="SESSION_WS")
                 break
 
     asyncio.create_task(_timeout_watcher())
@@ -2714,6 +2742,8 @@ async def ws_session(websocket: WebSocket) -> None:
                 logger.warning("[SLOW_STAGE] stage=intent_tier0g ms=%.0f budget=300", _tier0g_ms)
             logger.info("[AGENT_INTENT] is_agent=%s type=%s reason=%s",
                         _agent_intent.is_agent_command, _agent_intent.agent_type, _agent_intent.reason)
+            if not (_agent_intent.is_agent_command and _agent_intent.agent_type == "browser"):
+                logger.info("[BROWSER_LAZY_INIT_SKIPPED] reason=no_browser_command turn=%d", my_turn)
 
             # ── Phase 5.4B: short-command safety ──────────────────────────────
             # Nothing matched, but the transcript looks like a misheard
@@ -3031,10 +3061,7 @@ async def ws_session(websocket: WebSocket) -> None:
             await _send(websocket, {"type": "response", "text": response_text, "chunk": 1})
             await _tts_sequential(response_text)
             await _send(websocket, {"type": "done"})
-            try:
-                await websocket.close(1000)
-            except Exception:
-                pass
+            await _safe_close(websocket, code=1000, reason="stop_command", tag="SESSION_WS")
             return
 
         # ── INTERRUPT — soft cancel, keep session alive ────────────────────────
@@ -3669,12 +3696,16 @@ async def ws_session(websocket: WebSocket) -> None:
             _session_age_s,
             str(websocket.client_state),
         )
+        logger.info("[VOICE_STATE_CHANGE] from=SESSION_ACTIVE to=SESSION_ENDING")
         try:
             from voice.wake_word_service import wake_word_service as _wws_cleanup
             _wws_cleanup.set_session_active(False)
             _wws_cleanup.reset_cooldown()
+            logger.info("[WAKE_LISTENING_RESUMED]")
         except Exception:
             pass
+        logger.info("[VOICE_SESSION_CLOSED]")
+        logger.info("[VOICE_STATE_CHANGE] from=SESSION_ENDING to=IDLE_WAKE_LISTENING")
         try:
             from api.routers.debug import update_session_state as _upd_end
             _upd_end(voice_connected=False, current_state="idle", session_start_ts=None)

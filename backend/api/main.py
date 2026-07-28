@@ -83,8 +83,11 @@ async def startup() -> None:
     # models were still cold (measured: ~1 minute first-STT, warmup finishing
     # after the user's first command). The gate now only opens once every
     # service in Part 1's critical list has actually been attempted:
-    # Whisper fast, Whisper accurate, Kokoro, intent routing, browser
-    # runtime, conversation engine.
+    # Whisper fast, Whisper accurate, Kokoro, intent routing,
+    # conversation engine. Browser/CDP is deliberately NOT in this list —
+    # Chrome must stay untouched until a real browser task is dispatched
+    # (see browser_agent.run() / _get_page_with_repair — the only lazy
+    # entry point). Do not reintroduce eager Chrome warmup here.
     _critical_models_done = _threading.Event()
 
     def _critical_model_warmup() -> None:
@@ -145,21 +148,6 @@ async def startup() -> None:
 
     _threading.Thread(target=_critical_model_warmup, daemon=True, name="critical-model-warmup").start()
 
-    async def _browser_warmup() -> None:
-        """Playwright's async objects are bound to the event loop that
-        created them — this MUST run as a task on the main loop (not a
-        background thread with its own loop), otherwise agent tasks running
-        later on this same loop would be unable to reuse the pre-warmed
-        page at all."""
-        try:
-            from .agents.browser_agent.browser_workspace import browser_workspace as _bw
-            await _bw.get_or_create_page()
-            _rs.mark_service("browser", True)
-            logger.info("[CRITICAL_BOOT_DONE] service=browser")
-        except Exception as exc:
-            _rs.mark_service("browser", False)
-            logger.warning("[CRITICAL_BOOT_FAIL] service=browser error=%s", exc)
-
     def _conversation_check() -> None:
         try:
             from .agents.personality.personality_engine import personality_engine  # noqa: F401
@@ -174,13 +162,7 @@ async def startup() -> None:
         import time as _t
         _t0 = _t.monotonic()
         _conversation_check()
-        # Browser/CDP warmup is NOT awaited here — a cold or hung Chrome
-        # launch has no bound of its own at this level (get_or_create_page's
-        # internal retry chain can run well past 45s), and voice/text
-        # sessions do not need the browser to be ready. It runs fully
-        # independently and reports into readiness_service via mark_service
-        # when (if) it finishes; CORE_READY no longer waits on it.
-        asyncio.create_task(_browser_warmup())
+        logger.info("[BROWSER_LAZY_INIT_SKIPPED] reason=backend_startup")
         # Bounded wait — Whisper/Kokoro/intent classifier only. 45s covers
         # a cold model load with margin; anything still running past that
         # is reported as a blocker but the gate opens anyway.
