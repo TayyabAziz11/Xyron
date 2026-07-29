@@ -40,6 +40,7 @@ import base64
 import collections
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -57,6 +58,13 @@ logger = logging.getLogger(__name__)
 # requires no transcript, no classification. Kept deliberately generic so
 # it's honest regardless of what the command turns out to be.
 _IMMEDIATE_ACK_PHRASES = ["Got it.", "Sure.", "One moment.", "On it."]
+
+# Disabled by default — the generic filler ("Sure."/"Got it." etc.) spoken
+# before STT/routing complete. Does not affect the wake greeting, final
+# response TTS, narration, or per-tool acks like "Opening Calculator."
+# (those are a separate mechanism — _build_ack_text — left untouched).
+# Re-enable with XYRON_IMMEDIATE_ACK_ENABLED=true.
+_IMMEDIATE_ACK_ENABLED = os.getenv("XYRON_IMMEDIATE_ACK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _pick_immediate_ack() -> str:
@@ -1331,7 +1339,10 @@ async def ws_session(websocket: WebSocket) -> None:
                     logger.info("[ACK_SENT_MS] ms=%.0f", (time.time() - _ack_t0) * 1000)
             except Exception as exc:
                 logger.debug("[ACK_SENT_FAILED] error=%r", str(exc)[:120])
-        asyncio.create_task(_send_immediate_ack())
+        if _IMMEDIATE_ACK_ENABLED:
+            asyncio.create_task(_send_immediate_ack())
+        else:
+            logger.info("[IMMEDIATE_ACK_SKIPPED] reason=disabled")
 
         # ── Perf budget tracking ──────────────────────────────────────────────
         try:
@@ -3533,7 +3544,9 @@ async def ws_session(websocket: WebSocket) -> None:
                             # tuned acks (conversation_layer's ACK_PHRASES) and is
                             # deliberately snappy; stacking a second generic ack in
                             # front of it would just add a redundant beat.
-                            if _min_frames != _SHORT_MIN_SPEECH_FRAMES:
+                            if not _IMMEDIATE_ACK_ENABLED:
+                                logger.info("[IMMEDIATE_ACK_SKIPPED] reason=disabled")
+                            elif _min_frames != _SHORT_MIN_SPEECH_FRAMES:
                                 _imm_ack_text = _pick_immediate_ack()
                                 await _send(websocket, {"type": "response", "text": _imm_ack_text, "chunk": 1})
                                 _immediate_ack_state["task"] = asyncio.create_task(
