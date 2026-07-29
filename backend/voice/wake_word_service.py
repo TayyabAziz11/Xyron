@@ -335,7 +335,8 @@ class WakeWordService:
         for name, conf in near_misses:
             thresh = self._thresholds.get(name, _DEFAULT_THRESHOLD)
             if conf >= thresh * 0.80:
-                logger.info("[WakeWord] WAKE_REJECTED_LOW_CONF model=%s conf=%.3f threshold=%.3f",
+                logger.info("[WakeWord] WAKE_REJECTED_LOW_CONF model=%s conf=%.3f threshold=%.3f "
+                            "reason=below_threshold",
                             name, conf, thresh)
 
         # Hard-negative mining: log near-misses above noise floor

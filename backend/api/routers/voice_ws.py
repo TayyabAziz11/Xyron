@@ -207,11 +207,22 @@ async def ws_wake(websocket: WebSocket) -> None:
 
     PING_EVERY = 8.0   # shorter interval → detect dead connections faster
 
-    # Rolling audio buffer: last 2.56s of PCM (32 × 1280 samples @ 16kHz).
-    # Used for Whisper second-stage verification when OWW fires.
-    _BUFFER_FRAMES  = 32   # full buffer kept for session audio
-    _WHISPER_FRAMES = 15   # last 15 × 80ms = 1.2s sent to Whisper (isolates wake phrase)
+    # Rolling audio buffer for Whisper second-stage verification when OWW fires.
+    #
+    # UX-refinement finding: verify_wake_phrase()'s own docstring says "pass the
+    # last ~2.5s of buffered audio", but this was previously slicing only 15
+    # frames (1.2s) — enough for a short trigger like "hey xyron" but not for
+    # longer phrases like "wake up xyron", which got truncated to "wake up"
+    # (confirmed in logs: WAKE_REJECTED_WHISPER transcript="wake up." — the
+    # word "xyron" was never in the clip because the window ended too early).
+    # Widened to use the full ~2.5s the function was always documented to want.
+    _BUFFER_FRAMES    = 36   # 2.88s — _WHISPER_FRAMES plus post-roll headroom
+    _WHISPER_FRAMES   = 32   # last 32 × 80ms = 2.56s sent to Whisper (was 15/1.2s)
+    _POST_ROLL_FRAMES = 3    # wait ~240ms after OWW triggers before slicing the
+                              # clip, so a trailing syllable still being spoken
+                              # at the trigger instant isn't cut off either
     audio_buf: collections.deque[np.ndarray] = collections.deque(maxlen=_BUFFER_FRAMES)
+    _pending_wake: Optional[dict] = None   # holds model/confidence during post-roll wait
 
     loop = asyncio.get_event_loop()
 
@@ -238,13 +249,32 @@ async def ws_wake(websocket: WebSocket) -> None:
                 pcm = np.frombuffer(raw, dtype=np.float32).copy()
                 audio_buf.append(pcm)   # always buffer — used for Whisper verify
 
-                triggered, model_name, confidence = _wws.detect_frame(pcm)
-                if triggered:
+                # ── Post-roll wait: OWW already triggered on a previous frame;
+                # keep buffering _POST_ROLL_FRAMES more frames before slicing,
+                # so a trailing syllable still being spoken at the trigger
+                # instant is captured rather than cut off.
+                if _pending_wake is not None:
+                    _pending_wake["frames_waited"] += 1
+                    if _pending_wake["frames_waited"] < _POST_ROLL_FRAMES:
+                        continue
+
+                    model_name = _pending_wake["model"]
+                    confidence = _pending_wake["confidence"]
+                    _pending_wake = None
+
                     # ── Second-stage Whisper verification ────────────────────
                     # OWW models produce false positives from background noise.
                     # Whisper confirms a wake keyword was actually spoken before
                     # we send the wake event to the frontend.
                     clip = np.concatenate(list(audio_buf)[-_WHISPER_FRAMES:])
+                    _clip_duration_s = len(clip) / 16000.0
+                    _clip_rms = float(np.sqrt(np.mean(clip ** 2)))
+                    logger.info(
+                        "[WAKE_DIAG] model=%s confidence=%.3f threshold=%.3f "
+                        "audio_duration_s=%.2f pre_roll_s=%.2f post_roll_frames=%d speech_rms=%.4f",
+                        model_name, confidence, _wws._thresholds.get(model_name, 0.5),
+                        _clip_duration_s, _clip_duration_s, _POST_ROLL_FRAMES, _clip_rms,
+                    )
                     try:
                         from voice.whisper_service import verify_wake_phrase, _model_ready
                         if not _model_ready.is_set():
@@ -271,8 +301,9 @@ async def ws_wake(websocket: WebSocket) -> None:
 
                     if not matched:
                         logger.info(
-                            "[WS/wake] WAKE_REJECTED_WHISPER model=%s conf=%.3f transcript=%r",
-                            model_name, confidence, transcript[:60],
+                            "[WS/wake] WAKE_REJECTED_WHISPER model=%s conf=%.3f transcript=%r "
+                            "reason=whisper_no_match audio_duration_s=%.2f",
+                            model_name, confidence, transcript[:60], _clip_duration_s,
                         )
                         continue
 
@@ -287,6 +318,11 @@ async def ws_wake(websocket: WebSocket) -> None:
                     logger.info("[WS/wake] WAKE model=%s conf=%.3f transcript=%r",
                                 model_name, confidence, transcript[:60])
                     logger.info("[VOICE_STATE_CHANGE] from=IDLE_WAKE_LISTENING to=WAKE_DETECTED")
+                    continue
+
+                triggered, model_name, confidence = _wws.detect_frame(pcm)
+                if triggered:
+                    _pending_wake = {"model": model_name, "confidence": confidence, "frames_waited": 0}
                 continue
 
             text = data.get("text")
@@ -436,23 +472,15 @@ async def _synthesize_chunk(text: str, voice: str, speed: float) -> Optional[byt
     """
     for attempt in range(2):
         try:
-            from api.routers.voice import _kokoro_to_wav
-            # The cache is built for a single voice (main.py's warmup) —
-            # only use it when the session's voice actually matches, same
-            # guard already used for the ACK-cache path elsewhere, otherwise
-            # a cache hit would silently play the wrong voice.
+            # tts_cache is keyed by (voice, text) — a cache built/populated
+            # under a different voice simply misses here and falls through
+            # to fresh Kokoro synthesis inside synthesize_or_cached(), so
+            # this can never return a different voice's audio.
             from api.services.tts_cache_service import tts_cache as _tcc_chunk
-            _cache_voice = getattr(_tcc_chunk, "_build_voice", "nova")
-            if _cache_voice == voice:
-                wav = await asyncio.wait_for(
-                    asyncio.to_thread(_tcc_chunk.synthesize_or_cached, text, voice, speed),
-                    timeout=25.0,
-                )
-            else:
-                wav = await asyncio.wait_for(
-                    asyncio.to_thread(_kokoro_to_wav, text, voice, speed),
-                    timeout=25.0,
-                )
+            wav = await asyncio.wait_for(
+                asyncio.to_thread(_tcc_chunk.synthesize_or_cached, text, voice, speed),
+                timeout=25.0,
+            )
             if wav:
                 return wav
             if attempt == 0:
@@ -509,6 +537,7 @@ async def ws_session(websocket: WebSocket) -> None:
 
     logger.info("[SESSION_CREATE] voice=%s speed=%.1f name=%r lang_hint=%s",
                 voice, speed, preferred_name, _cfg_lang_hint)
+    logger.info("[TTS_SESSION_VOICE] voice=%s speed=%.1f", voice, speed)
     logger.info("[SESSION_WS_CONNECT] remote=%s", getattr(websocket, 'client', 'unknown'))
 
     # Notify debug API that a voice session is now active
@@ -906,38 +935,83 @@ async def ws_session(websocket: WebSocket) -> None:
         "home":            "Settings",
     }
 
+    # Last ack variant spoken per tool — avoids reading back the identical
+    # line two commands in a row for the same tool (e.g. "Opening Settings."
+    # every single time "open settings" is said).
+    _last_ack_variant: dict[str, str] = {}
+
+    def _pick_ack_variant(tool_name: str, variants: list[str]) -> str:
+        last = _last_ack_variant.get(tool_name)
+        choices = [v for v in variants if v != last] or variants
+        text = random.choice(choices)
+        _last_ack_variant[tool_name] = text
+        return text
+
     def _build_ack_text(tool_name: str, tool_params: dict) -> str:
-        """Return a command-aware acknowledgement phrase for the given tool."""
+        """Return a command-aware acknowledgement phrase for the given tool —
+        one concise, natural-sounding variant, never the exact same wording
+        as the last time this tool fired."""
         if tool_name == "open_application":
             app = (tool_params.get("app") or tool_params.get("app_name") or
                    tool_params.get("name") or "").strip()
-            text = f"Opening {app.title()}." if app else "Opening it."
+            name = app.title() if app else "it"
+            text = _pick_ack_variant(tool_name, [
+                f"Opening {name}.", f"Opening {name} now.", f"Launching {name}.",
+            ])
         elif tool_name == "open_system_settings":
             page = (tool_params.get("page") or "").strip().lower()
             nice = _SETTINGS_PAGE_NAMES.get(page, page.replace("-", " ").replace("_", " ").title())
-            text = f"Opening {nice} Settings." if (nice and page != "home") else "Opening Settings."
+            if nice and page != "home":
+                text = _pick_ack_variant(tool_name, [
+                    f"Opening {nice} Settings.", f"Opening your {nice} settings.", f"Pulling up {nice} settings.",
+                ])
+            else:
+                text = _pick_ack_variant(tool_name, [
+                    "Opening Settings.", "Opening Settings now.", "Pulling up Settings.",
+                ])
         elif tool_name == "open_drive":
             drive = (tool_params.get("drive") or "").upper().replace("DRIVE", "").strip()
-            text = f"Opening {drive} Drive." if drive else "Opening the drive."
+            name = f"{drive} drive" if drive else "drive"
+            text = _pick_ack_variant(tool_name, [
+                f"Opening your {name}.", f"Opening the {name}.", f"Opening {name} now.",
+            ])
         elif tool_name in ("open_directory", "smart_open"):
             raw = (tool_params.get("query") or tool_params.get("path") or "").strip()
             name = Path(raw).name if ("/" in raw or "\\" in raw) else raw
-            text = f"Opening {name.title()}." if name else "Opening it."
+            name = name.title() if name else "it"
+            text = _pick_ack_variant(tool_name, [
+                f"Opening {name}.", f"Opening {name} now.", f"Pulling up {name}.",
+            ])
         elif tool_name == "search_youtube":
             q = (tool_params.get("query") or "").strip()
-            text = f"Playing {q[:35].title()}." if q else "Opening YouTube."
+            name = q[:35].title() if q else None
+            text = _pick_ack_variant(tool_name, [
+                f"Playing {name}." if name else "Opening YouTube.",
+                f"Playing {name} now." if name else "Pulling up YouTube.",
+            ])
         elif tool_name == "search_web":
-            text = "Searching the web."
+            text = _pick_ack_variant(tool_name, [
+                "Searching the web.", "Let me search that.", "Searching now.",
+            ])
         elif tool_name == "open_url":
-            text = "Opening it."
+            text = _pick_ack_variant(tool_name, [
+                "Opening it.", "Opening that now.", "Pulling it up.",
+            ])
         elif tool_name == "play_media_file":
             q = (tool_params.get("query") or "").strip()
-            text = f"Playing {q[:35]}." if q else "Playing it."
+            name = q[:35] if q else "it"
+            text = _pick_ack_variant(tool_name, [
+                f"Playing {name}.", f"Playing {name} now.",
+            ])
         elif tool_name == "install_store_app":
             app = (tool_params.get("app_name") or "").strip()
-            text = f"Searching for {app.title()} in the Store." if app else "Searching the Store."
+            name = app.title() if app else None
+            text = _pick_ack_variant(tool_name, [
+                f"Searching for {name} in the Store." if name else "Searching the Store.",
+                f"Looking up {name} in the Store." if name else "Checking the Store.",
+            ])
         else:
-            text = "On it."
+            text = _pick_ack_variant(tool_name, ["On it.", "Right away.", "Working on it now."])
         logger.info("[COMMAND_ACK_SELECTED] tool=%s params=%s text=%r", tool_name, tool_params, text)
         return text
 
@@ -3182,15 +3256,11 @@ async def ws_session(websocket: WebSocket) -> None:
                         except Exception as _xa:
                             logger.warning("[ACK_ML_TTS_FAIL] lang=%s err=%s — no ACK audio", _ack_ml_lang, _xa)
                     else:
-                        # English ACK: Voice-match check, then Kokoro cache
-                        _cache_voice = getattr(_tcc, "_build_voice", "nova")
-                        _voice_match = (_cache_voice == voice)
-                        if _voice_match:
-                            logger.info("[TTS_CACHE_VOICE_MATCH] cache_voice=%s session_voice=%s — using cache", _cache_voice, voice)
-                            _ack_wav = _tcc.get_by_text(_ack_text)
-                        else:
-                            logger.info("[TTS_CACHE_DISABLED_MISMATCH] cache_voice=%s session_voice=%s — bypassing cache", _cache_voice, voice)
-                            _ack_wav = None
+                        # English ACK: cache is keyed by (voice, text) — a
+                        # hit is only ever returned for this exact session
+                        # voice; any other voice's cached copy is a clean miss
+                        # (see [TTS_CACHE_VOICE]/[TTS_VOICE_MATCH] inside get_by_text).
+                        _ack_wav = _tcc.get_by_text(_ack_text, voice)
                         if not _ack_wav:
                             _ack_synth_t0 = time.time()
                             _ack_wav = await asyncio.to_thread(
@@ -3426,17 +3496,11 @@ async def ws_session(websocket: WebSocket) -> None:
     )
     logger.info("[GREETING_STARTED] name=%r text=%r", _greet_name, _greeting_text)
     is_speaking = True
-    # Try TTS cache first (pre-synthesized during warmup)
-    _g_wav: Optional[bytes] = None
-    try:
-        from api.services.tts_cache_service import tts_cache as _tc
-        _g_wav = _tc.get_by_text(_greeting_text)
-        if _g_wav:
-            logger.info("[TTS_CACHE_HIT] greeting")
-    except Exception:
-        pass
-    if not _g_wav:
-        _g_wav = await _synthesize_chunk(_greeting_text, "onyx", 1.0)
+    # _synthesize_chunk already checks tts_cache (keyed by voice+text) before
+    # synthesizing fresh, so this both plays and caches in the session's own
+    # voice — greeting was previously hardcoded to "onyx" regardless of the
+    # session's configured voice; fixed to use the actual session voice.
+    _g_wav = await _synthesize_chunk(_greeting_text, voice, speed)
     if _g_wav:
         await _send(websocket, {
             "type":  "audio",
