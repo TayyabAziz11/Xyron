@@ -126,11 +126,14 @@ class TestVerifyBeforeSpeaking(unittest.TestCase):
     def test_access_denied_returns_error(self, mock_verify):
         """When verify_accessible returns access_denied, success=False and spoken is honest"""
         from api.services.fs_index import FSIndex
+        from api.services.file_resolver import ResolveResult
         mock_verify.return_value = (False, "access_denied")
 
         fake_path = Path("/mnt/e/Restricted/Python")
+        fake_result = ResolveResult(decision="open", path=fake_path, confidence=0.9,
+                                     tier=9, tier_name="filename_index")
         with patch.object(FSIndex, "is_ready", new_callable=PropertyMock, return_value=True), \
-             patch("api.services.fs_index.fs_index.search_fuzzy", return_value=[fake_path]):
+             patch("api.services.file_resolver.resolve", return_value=fake_result):
             result = self._exec(self._make_params("Python", drive="E", open_type="folder"))
 
         self.assertFalse(result.success)
@@ -142,19 +145,25 @@ class TestVerifyBeforeSpeaking(unittest.TestCase):
     @patch("api.tools.system_tools._verify_accessible")
     @patch("api.tools.system_tools.subprocess.Popen")
     def test_success_speaks_after_verification(self, mock_popen, mock_verify):
-        """When accessible, Popen is called and spoken says 'Opened'"""
+        """When accessible, Popen is called and spoken confirms the open
+        (Phase 3.5 Part 11 reworded this to "Found it — opening X" for a
+        more natural response; behavior — success + a single Popen call —
+        is what this test actually verifies)."""
         from api.services.fs_index import FSIndex
+        from api.services.file_resolver import ResolveResult
         mock_verify.return_value = (True, "ok")
         mock_popen.return_value = MagicMock()
 
         fake_path = Path("/mnt/e/Projects/Python")
+        fake_result = ResolveResult(decision="open", path=fake_path, confidence=0.9,
+                                     tier=9, tier_name="filename_index")
         with patch.object(FSIndex, "is_ready", new_callable=PropertyMock, return_value=True), \
-             patch("api.services.fs_index.fs_index.search_fuzzy", return_value=[fake_path]), \
+             patch("api.services.file_resolver.resolve", return_value=fake_result), \
              patch("api.tools.system_tools._find_cmdexe", return_value="/mnt/c/Windows/System32/cmd.exe"):
             result = self._exec(self._make_params("Python", drive="E", open_type="folder"))
 
         self.assertTrue(result.success)
-        self.assertIn("Opened", result.spoken)
+        self.assertIn("opening", result.spoken.lower())
         mock_popen.assert_called_once()
 
     def test_drive_unavailable(self):
@@ -210,14 +219,19 @@ class TestStructuredErrors(unittest.TestCase):
     def test_multiple_matches_error_type(self):
         """Multiple-match result must have error_type=multiple_matches"""
         from api.services.fs_index import FSIndex
+        from api.services.file_resolver import ResolveResult, Candidate
         from api.tools.system_tools import _exec_smart_open
         fake_paths = [
             Path("/mnt/e/Projects/Python"),
             Path("/mnt/e/Courses/Python"),
             Path("/mnt/e/Apps/Python"),
         ]
+        fake_result = ResolveResult(
+            decision="choices", confidence=0.3, tier=9, tier_name="filename_index",
+            candidates=[Candidate(path=p, score=0.6, tier=9) for p in fake_paths],
+        )
         with patch.object(FSIndex, "is_ready", new_callable=PropertyMock, return_value=True), \
-             patch("api.services.fs_index.fs_index.search_fuzzy", return_value=fake_paths), \
+             patch("api.services.file_resolver.resolve", return_value=fake_result), \
              patch("api.tools.system_tools._find_cmdexe", return_value="/mnt/c/Windows/System32/cmd.exe"):
             result = _exec_smart_open({"query": "Python", "type": "folder"}, {})
         self.assertFalse(result.success)

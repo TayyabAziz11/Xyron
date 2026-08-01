@@ -1176,6 +1176,17 @@ async def ws_session(websocket: WebSocket) -> None:
                 ))
             except Exception:
                 pass
+            # ── World State update — activity timeline + goal tracker ────────────
+            try:
+                from api.services.world_state import world_state as _wstate
+                _rdata_ws = result.data or {}
+                asyncio.create_task(asyncio.to_thread(
+                    _wstate.record_action,
+                    (result.text or tool_name)[:120], tool_name,
+                    _rdata_ws.get("path") or _rdata_ws.get("action_path"), True, "voice_ws",
+                ))
+            except Exception:
+                pass
 
         # ── Open-after-install offer — store pending state so Tier 0d2 can act ─
         if result.success and (result.data or {}).get("open_offer"):
@@ -2160,6 +2171,14 @@ async def ws_session(websocket: WebSocket) -> None:
                 _screen_snap = await asyncio.to_thread(_sca.get_fresh)
                 _lat["screen_context"] = (time.time() - _screen_t0) * 1000
                 _screen_resp = _screen_snap.describe()
+                # Track what was just described so a later turn ("review it",
+                # "open the README") can resolve the reference (Part 10) —
+                # reuses ContextStack, not a separate GitHub memory system.
+                try:
+                    from api.services.context_stack import context_stack as _cs_screen
+                    _cs_screen.update_from_screen(_screen_snap)
+                except Exception:
+                    pass
                 logger.info("[SCREEN_QUERY_RESPONSE] response=%r", _screen_resp)
                 memory.add_assistant(_screen_resp, tool_name="screen_context_query")
                 last_response_text = _screen_resp
@@ -2194,6 +2213,36 @@ async def ws_session(websocket: WebSocket) -> None:
                 return
         except Exception as _sq_exc:
             logger.debug("[SCREEN_QUERY] skipped: %s", _sq_exc)
+
+        # ── Tier 0x2: Repository follow-ups (Part 10) ─────────────────────────
+        # "review it", "open the README", "show issues", "check the latest
+        # commit", "what does this file do" — after a screen query already
+        # identified a GitHub repository. Uses the ContextStack entity the
+        # block above just pushed; no separate GitHub memory system.
+        try:
+            from api.services.screen_context_agent import match_repository_followup, handle_repository_followup
+            _repo_action = match_repository_followup(transcript)
+            if _repo_action:
+                _repo_resp = await handle_repository_followup(_repo_action)
+                logger.info("[REPO_FOLLOWUP_RESPONSE] action=%s response=%r", _repo_action, _repo_resp)
+                memory.add_assistant(_repo_resp, tool_name="repository_followup")
+                last_response_text = _repo_resp
+                last_activity_t    = time.time()
+                await _send(websocket, {"type": "response", "text": _repo_resp, "chunk": 1})
+                _interrupted = await _tts_with_fallback(_repo_resp)
+                if not _interrupted:
+                    if _tts_state["audio_sent"]:
+                        await _send(websocket, {"type": "done"})
+                        asyncio.create_task(_spawn_tts_watchdog("repository_followup"))
+                    else:
+                        is_speaking = False
+                        await _send(websocket, {"type": "listening"})
+                else:
+                    is_speaking = False
+                    await _send(websocket, {"type": "listening"})
+                return
+        except Exception as _rf_exc:
+            logger.debug("[REPO_FOLLOWUP] skipped: %s", _rf_exc)
 
         # ── Tier 0: Local clock — instant, offline, no LLM ───────────────────
         try:

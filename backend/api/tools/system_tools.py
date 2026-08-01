@@ -713,6 +713,35 @@ def _exec_open_application(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolR
     if not app_name:
         return ToolResult(success=False, text="App name required.", spoken="Which application should I open?")
 
+    # ── Phase 3.5 invariant (Part 4): folder/file-shaped requests must never
+    # reach open_application. "open perfume folder" used to land here (via a
+    # too-broad upstream regex/pattern match), fall through to the unknown-app
+    # cmd.exe fallback below, spawn a CMD window titled "perfume folder", and
+    # have verifier_v2 treat that window's title as proof the "app" launched.
+    # Object Resolver's explicit-noun check is decisive here — a "folder"/
+    # "file"/"directory"/"document" noun in the request always overrides how
+    # closely the name happens to fuzzy-match an installed app name. This is
+    # a backstop that catches the mistake regardless of which upstream router
+    # (regex tier, semantic tier, or an LLM tier) produced it.
+    try:
+        from api.services import object_resolver as _objres
+        _obj_res = _objres.resolve(app_name)
+        if _objres.forbids_open_application(_obj_res.object_type):
+            logger.warning(
+                "[OBJECT_TOOL_INVARIANT_BLOCKED] requested_app_name=%r resolved_type=%s "
+                "resolved_name=%r confidence=%.2f evidence=%s",
+                app_name, _obj_res.object_type, _obj_res.name, _obj_res.confidence, _obj_res.evidence,
+            )
+            _redirect_type = "folder" if _obj_res.object_type in (
+                "folder", "project", "workspace", "repository",
+            ) else "file"
+            return _exec_smart_open(
+                {"query": _obj_res.name or app_name, "type": _redirect_type}, ctx,
+            )
+    except Exception:
+        logger.debug("[OBJECT_RESOLVER] open_application invariant check failed — proceeding without it",
+                     exc_info=True)
+
     # For URI-based apps (ms-settings:, http://) skip app_finder — it finds the wrong Linux/WSL app.
     _norm = _normalise_app(app_name)
     _plat = "wsl" if _ON_WSL else ("win32" if _ON_WINDOWS else "linux")
@@ -1123,7 +1152,7 @@ def _exec_open_drive(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     ok, msg = _open_in_explorer(win_path)
     if ok:
         _store_last_action(ctx, "open_drive", params, win_path)
-    return ToolResult(success=ok, text=msg, spoken=f"Opening {letter} drive." if ok else msg,
+    return ToolResult(success=ok, text=msg, spoken=f"Your {letter} drive is open." if ok else msg,
                       action_path=win_path if ok else None,
                       data={"drive": f"{letter}:", "path": win_path})
 
@@ -3762,6 +3791,23 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             name = Path(query.replace("\\", "/")).name
             spoken = f"Opened {name}."
+
+            # Phase 1.5 learning hook — this direct-path open is the resolution
+            # of either a medium-confidence "did you mean X?" confirmation
+            # (see file_resolver's "confirm" decision, tagged with
+            # _source_query) or an ordinal disambiguation pick (handled in
+            # context_resolver._resolve_ordinal). Record it so the identical
+            # request resolves instantly via tier 0 next time.
+            try:
+                from api.services.fs_index import fs_index as _fsidx_direct
+                fs_index_source_query = params.get("_source_query")
+                _fsidx_direct.mark_opened(fs_path)
+                if fs_index_source_query:
+                    from api.services.file_resolver import record_confirmed_choice
+                    record_confirmed_choice(fs_index_source_query, str(fs_path))
+            except Exception:
+                logger.debug("[FILE_RESOLVER] direct-path learning hook failed", exc_info=True)
+
             return ToolResult(success=True, text=spoken, spoken=spoken,
                               action_path=query, data={"path": query, "source": "direct_path"})
 
@@ -3790,30 +3836,80 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
 
     _drive_suffix = f" in {drive} drive" if drive else ""
 
-    # ── Fast path: check the file-system index first (<5ms) ──────────────────
+    # ── Phase 1.5: context-aware priority cascade ─────────────────────────────
+    # Tries project/workspace → current folder → recent → frequent →
+    # conversation → active-app → semantic → filename index, in that order,
+    # before ever falling back to the slow disk crawl below. See
+    # api/services/file_resolver.py for the full tier/confidence design.
     try:
         from api.services.fs_index import fs_index
         if fs_index.is_ready:
-            _type_filter = "folder" if open_type == "folder" else (
-                "file" if open_type in ("file", "video", "image") else None
-            )
-            _hits = fs_index.search_fuzzy(
-                query, type_filter=_type_filter, drive=drive or None, limit=10
-            )
-            _JUNK_PARTS = {"appdata", "cache", "temp", "temporary internet files",
-                           "node_modules", "programdata", "$recycle.bin", ".tmp"}
-            _hits = [h for h in _hits if not any(p.lower() in _JUNK_PARTS for p in h.parts)]
-            _hits = _hits[:5]
+            from api.services.file_resolver import resolve as _resolve_ctx
 
-            if len(_hits) > 2:
-                # Multiple strong candidates — ask user to disambiguate
-                _show = _hits[:4]
-                _win_paths = [_wsl_to_win_path(str(h)) for h in _show]
-                _numbered  = "; ".join(f"{i+1}. {h.name}" for i, h in enumerate(_show))
+            _res = _resolve_ctx(query, open_type=open_type, drive=drive)
+
+            if _res.decision == "open":
+                _hit = _res.path
+                _ok, _err = _verify_accessible(_hit)
+                if _ok:
+                    _win_path = _wsl_to_win_path(str(_hit))
+                    subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    spoken = f"Found it — opening {_hit.name}{_drive_suffix}."
+                    logger.info("[FILE_RESOLVER_OPEN] query=%r path=%s tier=%s confidence=%.3f",
+                                query, _win_path, _res.tier_name, _res.confidence)
+                    fs_index.mark_opened(_hit, context=_res.snapshot)
+                    try:
+                        from api.services.world_state import world_state as _ws_publish
+                        _field = "current_document" if _hit.suffix.lower() in {
+                            ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md"} else "current_file"
+                        _ws_publish.publish(_field, str(_hit), source="smart_open")
+                        _ws_publish.record_action(f"Opened {_hit.name}", tool="smart_open",
+                                                   entity=str(_hit), source=_res.tier_name)
+                    except Exception:
+                        logger.debug("[WORLD_STATE] publish failed for smart_open", exc_info=True)
+                    _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_path}, spoken)
+                    return ToolResult(success=True, text=spoken, spoken=spoken,
+                                      action_path=_win_path,
+                                      data={"path": _win_path, "source": _res.tier_name})
+                if _err == "access_denied":
+                    _win_path = _wsl_to_win_path(str(_hit))
+                    return ToolResult(
+                        success=False,
+                        text=f"Access denied: {_win_path}",
+                        spoken=f"I found {_hit.name}, but Windows denied access.",
+                        data={"path": _win_path, "error_type": "access_denied"},
+                    )
+                # not_found (stale index entry) — fall through to the disk scan.
+                logger.debug("[FILE_RESOLVER] top candidate invalid (%s), falling through", _err)
+
+            elif _res.decision == "confirm":
+                _hit = _res.path
+                _win_path = _wsl_to_win_path(str(_hit))
+                _prompt = f"Did you mean {_hit.name}{_drive_suffix}? Say yes or no."
+                logger.info("[FILE_RESOLVER_CONFIRM] query=%r path=%s tier=%s confidence=%.3f",
+                            query, _win_path, _res.tier_name, _res.confidence)
+                return ToolResult(
+                    success=False, text=_prompt, spoken=_prompt,
+                    error="confirm_required",
+                    data={
+                        "tool": "smart_open",
+                        "params": {**params, "query": _win_path, "_source_query": query},
+                        "prompt": _prompt,
+                        "error_type": "confirm_open",
+                    },
+                )
+
+            elif _res.decision == "choices" and _res.candidates:
+                _show = _res.candidates[:4]
+                _win_paths = [_wsl_to_win_path(str(c.path)) for c in _show]
+                _numbered = "; ".join(f"{i+1}. {c.path.name}" for i, c in enumerate(_show))
                 spoken = (
-                    f"I found {len(_hits)} items named '{query}'{_drive_suffix}: "
+                    f"I found a few things named '{query}'{_drive_suffix}: "
                     f"{_numbered}. Which one should I open?"
                 )
+                logger.info("[FILE_RESOLVER_CHOICES] query=%r count=%d top_tier=%s",
+                            query, len(_show), _res.tier_name)
                 return ToolResult(
                     success=False,
                     text=f"Multiple matches for '{query}': {_win_paths}",
@@ -3822,42 +3918,11 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
                           "query": query, "numbered": _numbered},
                 )
 
-            VIDEO_EXTS_IDX = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
-            IMAGE_EXTS_IDX = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
-            for _hit in _hits:
-                if open_type == "video" and _hit.suffix.lower() not in VIDEO_EXTS_IDX:
-                    continue
-                if open_type == "image" and _hit.suffix.lower() not in IMAGE_EXTS_IDX:
-                    continue
-
-                # ── Verify before speaking ───────────────────────────────────
-                _ok, _err = _verify_accessible(_hit)
-                if not _ok:
-                    _win_path = _wsl_to_win_path(str(_hit))
-                    if _err == "access_denied":
-                        return ToolResult(
-                            success=False,
-                            text=f"Access denied: {_win_path}",
-                            spoken=f"I found the {_hit.name} folder, but Windows denied access.",
-                            data={"path": _win_path, "error_type": "access_denied"},
-                        )
-                    continue  # not_found → try next hit (index may be stale)
-
-                _win_path = _wsl_to_win_path(str(_hit))
-                subprocess.Popen([cmd_exe, "/c", "start", "", _win_path],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                spoken = f"Opened {_hit.name}{_drive_suffix}."
-                logger.info("[FS_INDEX_HIT] query=%r path=%s", query, _win_path)
-                _store_last_action(ctx, "smart_open", {**params, "_found_path": _win_path}, spoken)
-                return ToolResult(success=True, text=spoken, spoken=spoken,
-                                  action_path=_win_path,
-                                  data={"path": _win_path, "source": "index"})
-
-            # All index hits were stale or inaccessible — fall through to disk scan
-            logger.debug("[FS_INDEX_MISS] query=%r drive=%s all hits invalid", query, drive or "any")
+            # decision == "none" → fall through to the slow disk crawl below.
+            logger.debug("[FILE_RESOLVER] no candidate anywhere for query=%r — falling to disk scan", query)
 
     except Exception as _idx_exc:
-        logger.debug("fs_index fast-path skipped: %s", _idx_exc)
+        logger.debug("file_resolver skipped: %s", _idx_exc, exc_info=True)
 
     # ── Slow path: incremental find ───────────────────────────────────────────
 
@@ -3945,11 +4010,15 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
 
     if not found_path:
         _type_word = open_type if open_type != "any" else "item"
+        if drive:
+            _spoken = (f"I couldn't find a {_type_word} named '{query}' in the {drive} drive. "
+                       f"Should I search the rest of your computer?")
+        else:
+            _spoken = f"I couldn't find any {_type_word} named '{query}' on your system."
         return ToolResult(
             success=False,
             text=f"Nothing found matching '{query}'{_drive_suffix}.",
-            spoken=(f"I couldn't find any {_type_word} named '{query}'"
-                    + (_drive_suffix + "." if drive else " on your system.")),
+            spoken=_spoken,
             data={"error_type": "not_found", "query": query, "drive": drive or None},
         )
 
@@ -3968,7 +4037,7 @@ def _exec_smart_open(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     try:
         subprocess.Popen([cmd_exe, "/c", "start", "", win_target],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        spoken = f"Opened {found_path.name}{_drive_suffix}."
+        spoken = f"Found it — opening {found_path.name}{_drive_suffix}."
         _store_last_action(ctx, "smart_open", {**params, "_found_path": win_target}, spoken)
         return ToolResult(success=True, text=f"Opened: {win_target}", spoken=spoken,
                           action_path=win_target,
