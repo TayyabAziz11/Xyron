@@ -504,6 +504,8 @@ async def _synthesize_chunk(text: str, voice: str, speed: float) -> Optional[byt
 
 @router.websocket("/ws/session")
 async def ws_session(websocket: WebSocket) -> None:
+    import uuid as _uuid_sess
+    session_instance_id = _uuid_sess.uuid4().hex[:12]
     await websocket.accept()
 
     # ── Phase 3: Readiness gate — reject session if boot not complete ─────────
@@ -535,10 +537,20 @@ async def ws_session(websocket: WebSocket) -> None:
     except (asyncio.TimeoutError, WebSocketDisconnect, json.JSONDecodeError):
         pass
 
-    logger.info("[SESSION_CREATE] voice=%s speed=%.1f name=%r lang_hint=%s",
-                voice, speed, preferred_name, _cfg_lang_hint)
+    logger.info("[SESSION_CREATE] session_instance_id=%s voice=%s speed=%.1f name=%r lang_hint=%s",
+                session_instance_id, voice, speed, preferred_name, _cfg_lang_hint)
     logger.info("[TTS_SESSION_VOICE] voice=%s speed=%.1f", voice, speed)
-    logger.info("[SESSION_WS_CONNECT] remote=%s", getattr(websocket, 'client', 'unknown'))
+    logger.info("[SESSION_WS_CONNECT] session_instance_id=%s remote=%s",
+                session_instance_id, getattr(websocket, 'client', 'unknown'))
+
+    # GPU priority: defer non-critical background GPU work (semantic index /
+    # classifier loads) for the lifetime of this session — cleared in the
+    # main loop's finally block below, guaranteed on every exit path.
+    try:
+        from api.services.gpu_coordinator import voice_priority_begin as _gpu_voice_begin
+        _gpu_voice_begin(reason=f"session:{session_instance_id}")
+    except Exception:
+        pass
 
     # Notify debug API that a voice session is now active
     try:
@@ -686,6 +698,49 @@ async def ws_session(websocket: WebSocket) -> None:
                 )
 
     asyncio.create_task(_lag_monitor())
+
+    # ── Task 6: Stuck-speaking watchdog ───────────────────────────────────────
+    # Recovery net for exactly the failure mode behind the keepalive-timeout
+    # incident: speaking=True with no audio ever sent and no progress. The
+    # greeting path above already guards itself with a strict timeout and a
+    # try/finally, but this is defense-in-depth for any other TTS call site
+    # in this session that gets stuck. Gated on "no audio sent at all" (not
+    # on elapsed time alone) so it never interrupts a legitimately long
+    # response that IS actively streaming audio.
+    _STUCK_THRESHOLD_S = 12.0
+
+    async def _stuck_speaking_watchdog() -> None:
+        nonlocal is_speaking
+        stuck_since: Optional[float] = None
+        while websocket.client_state == WebSocketState.CONNECTED:
+            await asyncio.sleep(2.0)
+            if is_speaking and not _tts_state.get("audio_sent", False):
+                if stuck_since is None:
+                    stuck_since = time.time()
+                    continue
+                stuck_for = time.time() - stuck_since
+                if stuck_for > _STUCK_THRESHOLD_S:
+                    logger.warning(
+                        "[TTS_STUCK_DETECTED] stuck_for_s=%.1f session_instance_id=%s "
+                        "audio_queue_depth=%d",
+                        stuck_for, session_instance_id, len(pcm_buffer),
+                    )
+                    # Cannot forcibly kill a running Kokoro thread from here —
+                    # Python has no safe preemption for that — so this
+                    # "cancels" in the sense Task 6 means: the SESSION stops
+                    # waiting on it and recovers; a late-finishing synth
+                    # simply warms the cache and is otherwise discarded.
+                    logger.info("[TTS_TASK_CANCELLED] reason=stuck_watchdog session_instance_id=%s",
+                                session_instance_id)
+                    is_speaking = False
+                    stuck_since = None
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        await _send(websocket, {"type": "listening"})
+                    logger.info("[VOICE_STATE_RECOVERED] from=speaking to=listening")
+            else:
+                stuck_since = None
+
+    _stuck_watchdog_task = asyncio.create_task(_stuck_speaking_watchdog())
 
     # ── Multilingual TTS helper — XTTS-v2 for non-English responses ─────────
 
@@ -1044,10 +1099,28 @@ async def ws_session(websocket: WebSocket) -> None:
         # "Listening" the whole time — traceable in logs even without a
         # wired frontend consumer.
         logger.info("[PROGRESS_EVENT_CREATED] tool=%s label=%r", tool_name, f"Opening {tool_name.replace('_', ' ')}")
+        try:
+            from api.services.activity_events import emit_activity as _emit_act, title_for as _act_title
+            _act_stage, _act_title_started = _act_title(tool_name, tool_params, "started")
+            await _emit_act(websocket, _send, trace_id=_t_id, stage=_act_stage, status="started",
+                            title=_act_title_started, tool=tool_name)
+        except Exception:
+            pass
         _tool_t0 = time.time()
         result = await asyncio.to_thread(_registry.execute, tool_name, tool_params, _ctx)
         _tool_ms = (time.time() - _tool_t0) * 1000
         logger.info("[PERF_TOOL] tool=%s ms=%.0f success=%s", tool_name, _tool_ms, result.success)
+        try:
+            from api.services.activity_events import emit_activity as _emit_act2, title_for as _act_title2
+            _act_stage2, _act_title_done = _act_title2(
+                tool_name, tool_params, "completed" if result.success else "failed", result.data,
+            )
+            await _emit_act2(websocket, _send, trace_id=_t_id,
+                             stage="completed" if result.success else "failed",
+                             status="completed" if result.success else "failed",
+                             title=_act_title_done, tool=tool_name)
+        except Exception:
+            pass
         if result.success:
             logger.info("[TRACE %s] [TOOL_SUCCESS] tool=%s ms=%.0f",
                         _t_id, tool_name, _tool_ms)
@@ -3536,56 +3609,108 @@ async def ws_session(websocket: WebSocket) -> None:
             logger.info("[VOICE_LISTENING_READY] state=listening reason=interrupted")
 
     # ── Opening greeting ──────────────────────────────────────────────────────
+    # Root cause of the "code=1011 reason=keepalive ping timeout" incident:
+    # the old greeting sequence awaited _synthesize_chunk's own 2-attempt,
+    # up-to-25s-each retry design (~50s worst case) fully sequentially,
+    # before this coroutine ever reached its next websocket.receive() — so
+    # nothing on this connection could be sent or read for up to 50s.
+    # Combined with concurrent GPU/CPU contention (a background thread
+    # loading SentenceTransformer can hold the GIL long enough to starve the
+    # event loop — see gpu_coordinator.py) this reliably exceeded uvicorn's
+    # own protocol-level WebSocket ping/pong window (that literal message is
+    # uvicorn/websockets' own default close reason, not application text).
+    #
+    # Fix: the greeting is optional UX, never a dependency. One short
+    # attempt, a strict small timeout, and a try/finally that unconditionally
+    # clears speaking state and starts listening no matter what happens.
+    # State sequence: SESSION_ACTIVE -> GREETING_PENDING ->
+    # {GREETING_PLAYING | GREETING_SKIPPED | GREETING_FAILED} -> LISTENING.
+    import os as _os_greet
+    _greeting_enabled = _os_greet.getenv("XYRON_GREETING_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    _greeting_style   = _os_greet.getenv("XYRON_GREETING_STYLE", "short").strip().lower()
+    _greeting_timeout = float(_os_greet.getenv("XYRON_GREETING_TIMEOUT_S", "4.0"))
+
     import datetime as _dt
     _hour = _dt.datetime.now().hour
     _tod  = "morning" if _hour < 12 else "afternoon" if _hour < 18 else "evening"
     _greet_name = preferred_name or "boss"
-    _greeting_text = (
-        f"Good {_tod}, {_greet_name}. I'm Xyron, ready and at your service. Just give the word."
-    )
-    logger.info("[GREETING_STARTED] name=%r text=%r", _greet_name, _greeting_text)
-    is_speaking = True
-    # _synthesize_chunk already checks tts_cache (keyed by voice+text) before
-    # synthesizing fresh, so this both plays and caches in the session's own
-    # voice — greeting was previously hardcoded to "onyx" regardless of the
-    # session's configured voice; fixed to use the actual session voice.
-    _g_wav = await _synthesize_chunk(_greeting_text, voice, speed)
-    if _g_wav:
-        await _send(websocket, {
-            "type":  "audio",
-            "data":  base64.b64encode(_g_wav).decode(),
-            "chunk": 1,
-            "total": 1,
-            "final": True,
-            "text":  _greeting_text,
-        })
-        logger.info("[GREETING_SENT] bytes=%d", len(_g_wav))
-        _deadline = time.time() + 15.0
-        while websocket.client_state == WebSocketState.CONNECTED and time.time() < _deadline:
+    if _greeting_style == "long":
+        _greeting_text = f"Good {_tod}, {_greet_name}. I'm Xyron, ready and at your service. Just give the word."
+    elif _greet_name and _greet_name != "boss":
+        _greeting_text = f"Good {_tod}, {_greet_name}."
+    else:
+        _greeting_text = "I'm listening."
+
+    logger.info("[VOICE_STATE_CHANGE] from=SESSION_ACTIVE to=GREETING_PENDING")
+    _greeting_state = "GREETING_SKIPPED"
+    try:
+        if not _greeting_enabled:
+            logger.info("[GREETING_SKIPPED] reason=disabled_by_config")
+        else:
+            is_speaking = True
+            logger.info("[GREETING_SYNTH_START] text=%r timeout_s=%.1f", _greeting_text, _greeting_timeout)
+            _g_wav = None
             try:
-                _d = await asyncio.wait_for(websocket.receive(), timeout=2.0)
-                if _d.get("type") == "websocket.disconnect":
-                    break
-                _txt = _d.get("text")
-                if _txt:
+                from api.services.tts_cache_service import tts_cache as _tcc_greet
+                # A single bounded attempt — asyncio.wait_for abandons (stops
+                # waiting on) the to_thread future on timeout; it cannot force
+                # the underlying OS thread to stop mid-synthesis, but that
+                # thread finishing later only warms the cache — it can no
+                # longer block this session. Deliberately no retry: Task 3
+                # forbids a second blocking attempt inside the active session.
+                _g_wav = await asyncio.wait_for(
+                    asyncio.to_thread(_tcc_greet.synthesize_or_cached, _greeting_text, voice, speed),
+                    timeout=_greeting_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[GREETING_SYNTH_TIMEOUT] timeout_s=%.1f", _greeting_timeout)
+            except Exception as _g_exc:
+                logger.warning("[GREETING_SYNTH_FAILED] error=%s", _g_exc)
+
+            if _g_wav and websocket.client_state == WebSocketState.CONNECTED:
+                await _send(websocket, {
+                    "type":  "audio",
+                    "data":  base64.b64encode(_g_wav).decode(),
+                    "chunk": 1,
+                    "total": 1,
+                    "final": True,
+                    "text":  _greeting_text,
+                })
+                logger.info("[GREETING_AUDIO_SENT] bytes=%d", len(_g_wav))
+                _greeting_state = "GREETING_PLAYING"
+                # Short, bounded wait for the frontend's tts_done ack — purely
+                # cosmetic (lets playback finish before the UI flips to
+                # "listening"); never allowed to approach uvicorn's own
+                # keepalive window regardless of what the frontend does.
+                _deadline = time.time() + min(6.0, _greeting_timeout + 4.0)
+                while websocket.client_state == WebSocketState.CONNECTED and time.time() < _deadline:
                     try:
-                        _m = json.loads(_txt)
-                        if _m.get("type") == "tts_done":
-                            logger.info("[GREETING_DONE]")
+                        _d = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+                        if _d.get("type") == "websocket.disconnect":
                             break
+                        _txt = _d.get("text")
+                        if _txt:
+                            try:
+                                if json.loads(_txt).get("type") == "tts_done":
+                                    logger.info("[GREETING_DONE]")
+                                    break
+                            except Exception:
+                                pass
                     except asyncio.TimeoutError:
                         continue
-                    except Exception:
-                        pass
-            except asyncio.TimeoutError:
-                continue
-            except WebSocketDisconnect:
-                break
-    else:
-        logger.warning("[GREETING] synthesis failed — proceeding to listen")
-    is_speaking = False
-    last_activity_t = time.time()  # reset idle timer after greeting completes
-    await _send(websocket, {"type": "listening"})
+                    except WebSocketDisconnect:
+                        break
+            else:
+                _greeting_state = "GREETING_FAILED"
+                logger.info("[GREETING_SKIPPED] reason=synth_unavailable")
+    finally:
+        is_speaking = False
+        logger.info("[GREETING_STATE_CLEARED] state=%s", _greeting_state)
+        last_activity_t = time.time()  # reset idle timer after greeting completes
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await _send(websocket, {"type": "listening"})
+        logger.info("[VOICE_STATE_CHANGE] from=GREETING to=LISTENING")
+        logger.info("[SESSION_LISTENING_READY] session_instance_id=%s", session_instance_id)
 
     # ── Phase 6: PCM watchdog — if no mic frames arrive within 15s, warn frontend ──
     async def _pcm_watchdog() -> None:
@@ -3610,15 +3735,36 @@ async def ws_session(websocket: WebSocket) -> None:
     asyncio.create_task(_pcm_watchdog())
 
     # ── Main receive loop ─────────────────────────────────────────────────────
+    # Task 5 note: the application-level {"type":"ping"} sent below is a
+    # best-effort heartbeat the frontend currently no-ops on (see
+    # useVoiceWS.ts `case 'ping': break`) — it is NOT the mechanism behind
+    # "code=1011 reason=keepalive ping timeout". That message is uvicorn's
+    # own protocol-level WebSocket ping/pong (the `websockets` library's
+    # default close reason), handled below the ASGI application layer and
+    # not directly instrumentable from here. The real fix for that is
+    # keeping this process's event loop responsive — see gpu_coordinator.py
+    # and the greeting rewrite above — so uvicorn's own keepalive coroutine
+    # is never starved of the GIL long enough to miss its window. These
+    # markers cover the app-level heartbeat for observability.
+    _last_keepalive_recv_t = time.time()
     try:
         while websocket.client_state == WebSocketState.CONNECTED:
             try:
                 data = await asyncio.wait_for(
                     websocket.receive(), timeout=SESSION_TIMEOUT + 5.0
                 )
+                _now_ka = time.time()
+                _lag_ka = _now_ka - _last_keepalive_recv_t
+                _last_keepalive_recv_t = _now_ka
+                logger.debug("[SESSION_KEEPALIVE_RECEIVED] lag_s=%.1f", _lag_ka)
+                if _lag_ka > SESSION_TIMEOUT:
+                    logger.warning("[SESSION_KEEPALIVE_LAG] lag_s=%.1f threshold_s=%.1f", _lag_ka, SESSION_TIMEOUT)
             except asyncio.TimeoutError:
+                logger.info("[SESSION_KEEPALIVE_TIMEOUT_CAUSE] no_message_received_for_s=%.1f is_speaking=%s",
+                           SESSION_TIMEOUT + 5.0, is_speaking)
                 if not await _send(websocket, {"type": "ping"}):
                     break
+                logger.debug("[SESSION_KEEPALIVE_SENT]")
                 continue
             except WebSocketDisconnect:
                 break
@@ -3800,10 +3946,15 @@ async def ws_session(websocket: WebSocket) -> None:
             _narration_task.cancel()
         except Exception:
             pass
+        try:
+            _stuck_watchdog_task.cancel()
+        except Exception:
+            pass
         import time as _t_diag
         _session_age_s = round(_t_diag.time() - (last_activity_t or 0), 1)
         logger.info(
             "[SESSION_DESTROY_DIAGNOSTIC] "
+            "session_instance_id=%s "
             "session_active=False "
             "voice_connected=%s "
             "mic_active=%s "
@@ -3813,6 +3964,7 @@ async def ws_session(websocket: WebSocket) -> None:
             "pcm_buffer_depth=%d "
             "idle_age_s=%.1f "
             "ws_state=%s",
+            session_instance_id,
             websocket.client_state.name if hasattr(websocket.client_state, "name") else str(websocket.client_state),
             _audio_chunks_received > 0,
             _audio_chunks_received,
@@ -3823,6 +3975,13 @@ async def ws_session(websocket: WebSocket) -> None:
             str(websocket.client_state),
         )
         logger.info("[VOICE_STATE_CHANGE] from=SESSION_ACTIVE to=SESSION_ENDING")
+        # Release GPU priority — background semantic/classifier loads that
+        # deferred during this session (gpu_coordinator.py) may now proceed.
+        try:
+            from api.services.gpu_coordinator import voice_priority_end as _gpu_voice_end
+            _gpu_voice_end(reason=f"session:{session_instance_id}")
+        except Exception:
+            pass
         try:
             from voice.wake_word_service import wake_word_service as _wws_cleanup
             _wws_cleanup.set_session_active(False)
@@ -3830,7 +3989,7 @@ async def ws_session(websocket: WebSocket) -> None:
             logger.info("[WAKE_LISTENING_RESUMED]")
         except Exception:
             pass
-        logger.info("[VOICE_SESSION_CLOSED]")
+        logger.info("[VOICE_SESSION_CLOSED] session_instance_id=%s", session_instance_id)
         logger.info("[VOICE_STATE_CHANGE] from=SESSION_ENDING to=IDLE_WAKE_LISTENING")
         try:
             from api.routers.debug import update_session_state as _upd_end

@@ -38,6 +38,23 @@ function log(tag: string, msg: string): void {
   console.log(`[${tag}] ${_ts()} ${msg}`)
 }
 
+// Canonical activity-event schema (Phase 3.6, Task 9/10) — semantic stages
+// the backend emits from resolved tool/action, never internal jargon
+// (no "intent router", "tool call", "tier", "object resolver", etc.).
+export interface ActivityEvent {
+  type:      'activity'
+  trace_id:  string
+  stage:     'opening_app' | 'searching_web' | 'opening_folder' | 'reading_screen' |
+             'analyzing_page' | 'comparing_options' | 'running_tool' | 'waiting_approval' |
+             'generating_response' | 'completed' | 'failed'
+  status:    'started' | 'progress' | 'completed' | 'failed'
+  title:     string
+  detail?:   string | null
+  progress?: number | null
+  tool?:     string | null
+  timestamp: number
+}
+
 function genId(): string {
   return typeof crypto !== 'undefined' && crypto.randomUUID
     ? crypto.randomUUID()
@@ -72,6 +89,12 @@ export function useVoiceWS() {
   const [messages,      setMessages]      = useState<ConvMessage[]>([])
   const [error,         setError]         = useState<string | null>(null)
   const [followUp,      setFollowUp]      = useState<string | null>(null)
+  const [activity,      setActivity]      = useState<ActivityEvent | null>(null)
+
+  // Correlates activity events to the CURRENT session only — a late event
+  // arriving after a reconnect (a new session_instance) must not resurrect
+  // a stale "Opening Chrome…" from a session that's already gone (Task 10).
+  const sessionEpochRef = useRef(0)
 
   const stateRef  = useRef<SessionState>('idle')
   const aliveRef  = useRef(false)
@@ -349,6 +372,15 @@ export function useVoiceWS() {
         if (stateRef.current !== 'speaking') {
           transition('listening')
         }
+        // Activity display naturally clears as we return to Listening…
+        setActivity(null)
+        break
+      }
+
+      case 'activity': {
+        const evt = msg as unknown as ActivityEvent
+        log('ACTIVITY_EVENT', `stage=${evt.stage} status=${evt.status} title="${evt.title}"`)
+        setActivity(evt)
         break
       }
 
@@ -456,6 +488,8 @@ export function useVoiceWS() {
     aliveRef.current             = false
     sessionConnectingRef.current = false
     stabilizingRef.current       = false
+    sessionEpochRef.current     += 1
+    setActivity(null)
 
     stopMic()
     stopPlayback()
@@ -492,6 +526,8 @@ export function useVoiceWS() {
     }
 
     sessionConnectingRef.current = true
+    sessionEpochRef.current     += 1
+    setActivity(null)
     log('START_SESSION_BEGIN', 'entering startSession()')
 
     try {
@@ -594,6 +630,8 @@ export function useVoiceWS() {
       ws.onclose = (e) => {
         log('SESSION_WS_CLOSE', `code=${e.code} reason="${e.reason}" wasClean=${e.wasClean}`)
         sessionConnectingRef.current = false   // ensure mutex released on close
+        sessionEpochRef.current     += 1
+        setActivity(null)
         if (!aliveRef.current) return          // already cleaned up by stopSession()
         aliveRef.current = false
         stopMic()
@@ -646,5 +684,6 @@ export function useVoiceWS() {
     followUp,
     dismissFollowUp: () => setFollowUp(null),
     offlineMode:     false as boolean,
+    activity,
   }
 }

@@ -962,6 +962,29 @@ class IntentRouter:
         if _os_lc.getenv("LOCAL_ONLY_MODE", "").lower() in ("1", "true", "yes"):
             logger.info("[IntentRouter] LOCAL_ONLY_MODE=true — classifier load skipped")
             return
+
+        # Wait for critical voice-path warmup (Kokoro + Whisper) to finish
+        # before loading this on CUDA. Confirmed root cause of the
+        # keepalive-timeout incident: this constructor's tensor/tokenizer
+        # deserialization runs on a plain thread and holds the GIL for
+        # extended stretches, starving the asyncio event loop that also
+        # has to service uvicorn's own WebSocket ping/pong — that starvation
+        # is what produced "code=1011 reason=keepalive ping timeout" during
+        # the wake/greeting window. This thread already runs in the
+        # background (started at IntentRouter.__init__, i.e. import time),
+        # so waiting here costs nothing on any path that matters.
+        try:
+            from api.services.readiness_service import readiness_service as _rs_wait
+            logger.info("[GPU_BACKGROUND_DEFERRED] component=sentence_transformer_classifier waiting_for=core_ready")
+            _rs_wait.wait_core_ready(timeout=60.0)
+        except Exception:
+            pass
+        try:
+            from api.services.gpu_coordinator import wait_for_voice_idle as _wait_voice_idle
+            _wait_voice_idle("sentence_transformer_classifier", timeout=30.0)
+        except Exception:
+            pass
+
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
             import numpy as np
