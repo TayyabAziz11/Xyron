@@ -1,243 +1,167 @@
-# Xyron — Voice-Driven AI Assistant
+# Xyron
 
-> Talk naturally. It does the work.
+**A voice-driven, agentic AI operator for Windows.** Speak a command, and a coordinator dispatches it across specialized agents — browser automation, coding, filesystem, system administration — that plan, act, verify, and narrate the result back to you.
 
----
-
-## What is Xyron?
-
-Imagine having a super-smart assistant that lives on your computer and listens to your voice. You say something like **"open my IT Course folder"** or **"set volume to 50 and play that video"** — and it just does it. No clicking. No searching. Just talk.
-
-That's Xyron.
-
-It's a **voice-first AI assistant for your Windows PC** (running through WSL2). You speak a command, it figures out what you mean, runs the right action, and talks back to you with the result.
-
-Here's what it can do out of the box:
-
-- Open files, folders, apps, and websites by name
-- Control your volume and screen brightness
-- Search the web and answer questions
-- Read your Gmail inbox
-- Take screenshots
-- Remember what you asked before (so you can say "play **that** video" and it knows what you mean)
-- Remind you about upcoming calendar events
-- Run compound commands like **"open Chrome and then set volume to 30"**
-- Detect wake words like **"hey Xyron"** so you don't have to press anything
+[![License](https://img.shields.io/badge/license-see--LICENSE-blue.svg)](./LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](backend/pyproject.toml)
+[![Next.js](https://img.shields.io/badge/next.js-15-black.svg)](web/package.json)
+[![Tauri](https://img.shields.io/badge/desktop-tauri%202-24C8DB.svg)](desktop-app/src-tauri/tauri.conf.json)
 
 ---
 
-## How It's Built (The Three Pieces)
+## Overview
+
+Xyron is not a chatbot with tool access bolted on. It's built around a **perceive → plan → act → verify** loop: a world-state service continuously tracks what's on screen, which windows and browser tabs are open, and recent activity; a coordinator agent breaks incoming requests into a task graph and delegates to domain agents; every risky action passes through a human-in-the-loop approval gate before it executes.
+
+The system runs as three independently deployable layers that talk only over HTTP:
 
 ```
-Xyron/
-  backend/       ← The brain (Python + FastAPI)
-  web/           ← The dashboard you see in your browser (Next.js)
-  desktop-app/   ← The Electron tray app on Windows/WSL2
+desktop-app (Tauri + React)  ─┐
+web (Next.js dashboard)      ─┼──▶  backend (FastAPI)  ──▶  external APIs / OS
 ```
 
-| Piece | What it does | Tech |
+## Core Capabilities
+
+- **Voice pipeline** — local Whisper STT, wake-word detection, streaming TTS (OpenAI + local pyttsx3 fallback), multilingual routing and response localization
+- **Multi-agent coordination** — a `CoordinatorAgent` builds a task graph and delegates across a browser agent, coding agent (product planning → frontend/backend engineering → QA → visual review → git), automation agent (disk/downloads/duplicates/startup cleanup), and a personality layer (tone, humor guard, emotional planning)
+- **Perception & world state** — CDP-based browser observation, desktop window/selection tracking, and periodic vision analysis feed a single `WorldState` that agents query instead of guessing
+- **Operator mode** — direct desktop control (mouse/keyboard/window) with an observe → think → act → verify loop, currently covering VS Code, Chrome, Explorer, and YouTube skills
+- **Filesystem intelligence** — an indexed, watched, incrementally-updated filesystem search (`fs_index` + `fs_watcher`) with a non-blocking worker queue so heavy scans never stall the voice runtime
+- **Memory** — short-term rolling context plus long-term fact extraction, and an episodic SQLite log of every turn used for proactive suggestions
+- **MCP integrations** — JSON-RPC servers for WhatsApp (Playwright-driven) and Odoo, plus a first-party MCP server exposing Xyron's own system tools to external MCP clients
+- **Approval gate (HITL)** — any action classified as risky writes a plan to `Pending_Approval/` and halts; nothing executes until a human moves it to `Approved/`
+
+## Architecture
+
+| Layer | Responsibility | Stack |
 |---|---|---|
-| **Backend** | Processes your voice, routes commands, calls tools | Python 3.10+, FastAPI |
-| **Web Dashboard** | Shows history, stats, approvals, command center | Next.js, TypeScript, Tailwind |
-| **Desktop App** | Puts Xyron in your system tray (always accessible) | Electron |
+| **Backend** | Voice pipeline, intent routing, agent orchestration, perception, tool execution | Python 3.10+, FastAPI, 34 routers under `/api/v1` |
+| **Web Dashboard** | Command center, activity timeline, approvals queue, stats, integrations | Next.js 15, React 19, TypeScript, Tailwind |
+| **Desktop App** | System-tray presence, global wake-word listening, native automation bridge | Tauri 2 (Rust shell) + React renderer |
 
-The backend does the heavy lifting. The web and desktop apps are the faces you interact with.
+Intent routing is three-layered: fast keyword matching, semantic classification via `gpt-4o-mini` function calling, and a sentence-transformer embedding router — falling back gracefully as confidence drops.
 
----
+For deep-dives, see [`Docs/architecture/`](Docs/architecture/):
 
-## Before You Start — What You Need
+| Doc | Covers |
+|---|---|
+| [SYSTEM_OVERVIEW.md](Docs/architecture/SYSTEM_OVERVIEW.md) | High-level system map |
+| [VOICE_PIPELINE.md](Docs/architecture/VOICE_PIPELINE.md) | STT → routing → TTS |
+| [PERCEPTION_ENGINE.md](Docs/architecture/PERCEPTION_ENGINE.md) | Browser/desktop/vision observation |
+| [WORLD_STATE.md](Docs/architecture/WORLD_STATE.md) | Shared state model agents query |
+| [PLANNING_ENGINE.md](Docs/architecture/PLANNING_ENGINE.md) | Task graph + delegation planning |
+| [TOOL_ORCHESTRATOR.md](Docs/architecture/TOOL_ORCHESTRATOR.md) | Tool registry + execution |
+| [MEMORY_SYSTEM.md](Docs/architecture/MEMORY_SYSTEM.md) | Short-term + episodic memory |
+| [FILESYSTEM.md](Docs/architecture/FILESYSTEM.md) | Indexed fs search + watcher |
+| [DATABASE.md](Docs/architecture/DATABASE.md) | SQLite schemas |
+| [PROJECT_STRUCTURE.md](Docs/architecture/PROJECT_STRUCTURE.md) | Directory-by-directory map |
+| [TECHNICAL_DEBT.md](Docs/architecture/TECHNICAL_DEBT.md) | Known gaps and cleanup targets |
 
-Make sure you have these installed:
+## Getting Started
 
-| Tool | Why | Check if installed |
-|---|---|---|
-| **Python 3.10+** | Runs the backend | `python3 --version` |
-| **Node.js 18+** | Runs the web dashboard | `node --version` |
-| **npm** | Installs web packages | `npm --version` |
-| **Git** | Downloads the code | `git --version` |
-| **WSL2** (Windows only) | Runs Linux on Windows | You're in WSL2 if this path works: `/mnt/c/` |
+### Prerequisites
 
-You'll also need a free **OpenAI API key** from [platform.openai.com](https://platform.openai.com) — this powers the voice understanding and AI responses.
+| Tool | Why |
+|---|---|
+| Python 3.10+ | Backend runtime |
+| Node.js 18+ / npm | Web dashboard + desktop app |
+| Rust toolchain | Building the Tauri desktop shell |
+| WSL2 (Windows) | Backend and voice pipeline target WSL2; `PULSE_SERVER` wiring assumes it |
+| `espeak-ng` | Local TTS fallback (`sudo apt-get install espeak-ng`) |
+| OpenAI API key | Powers STT correction, intent classification, response generation, TTS |
 
----
-
-## Setup: Step by Step
-
-### Step 1 — Clone the Repository
-
-Open a terminal and run:
+### 1. Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Xyron.git
+git clone https://github.com/TayyabAziz11/Xyron.git
 cd Xyron
 ```
 
-> Replace `YOUR_USERNAME` with the actual GitHub username where the repo lives.
-
----
-
-### Step 2 — Set Up the Backend (The Brain)
+### 2. Backend
 
 ```bash
 cd backend
-```
-
-Install the Python dependencies:
-
-```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-> This installs everything the backend needs — the voice pipeline, AI models, tool handlers, etc. It might take a few minutes on the first run because it downloads some AI models.
-
-Now create your environment file (this tells the backend your API key and settings):
-
-```bash
-cp .env.example .env
-```
-
-Open the `.env` file and fill in your real values:
-
-```env
-OPENAI_API_KEY=sk-proj-YOUR_KEY_HERE
-API_PORT=8000
-CORS_ORIGINS=http://localhost:3000,http://localhost:3001
-```
-
-> **Important:** Never share your `.env` file or commit it to GitHub. It contains your private API key.
-
-Start the backend server:
-
-```bash
+cp .env.example .env        # then fill in OPENAI_API_KEY at minimum
 python3 -m uvicorn api.main:app --reload --port 8000
 ```
 
-You should see something like:
+Config is read from `backend/.env` by absolute path — your working directory doesn't matter.
 
-```
-INFO:     Uvicorn running on http://0.0.0.0:8000
-INFO:     Application startup complete.
-```
-
-Leave this terminal open — the backend needs to keep running.
-
----
-
-### Step 3 — Set Up the Web Dashboard
-
-Open a **new terminal tab/window** and run:
+### 3. Web Dashboard
 
 ```bash
-cd Xyron/web
+cd web
 npm install
-npm run dev
+npm run dev        # http://localhost:3001
 ```
 
-The web dashboard starts at **http://localhost:3001**
-
----
-
-### Step 4 — (Optional) Set Up the Desktop App
-
-The Electron tray app lets you use Xyron without opening a browser.
+### 4. Desktop App (optional)
 
 ```bash
-cd Xyron/desktop-app
+cd desktop-app
 npm install
-npm run dev:wsl       # use this if you're on WSL2
-# OR
-npm run dev           # use this on native Linux/Mac
+npm run dev:wsl     # WSL2 — wires PULSE_SERVER for audio
+# or
+npm run dev         # native Linux/Mac
 ```
 
----
+## Running Tests
 
-## All the URLs
+```bash
+cd backend
+source .venv/bin/activate
+pytest tests/                  # full suite (50+ files)
+pytest tests/test_worker_queue.py   # single file
+```
 
-Once both the backend and web are running:
+```bash
+cd web && npm run type-check
+cd desktop-app && npm run type-check
+```
 
-| What | URL |
-|---|---|
-| Homepage | http://localhost:3001 |
-| Command Center (voice) | http://localhost:3001/app/command-center |
-| Dashboard | http://localhost:3001/app/dashboard |
-| Conversation History | http://localhost:3001/app/history |
-| Usage Stats | http://localhost:3001/app/stats |
-| Approvals Queue | http://localhost:3001/app/approvals |
-| Activity Log | http://localhost:3001/app/activity |
-| Integrations | http://localhost:3001/app/integrations |
-| Settings | http://localhost:3001/app/settings |
-| Backend API | http://localhost:8000 |
-| API Docs (auto-generated) | http://localhost:8000/docs |
-
----
-
-## How to Use It
-
-1. Go to **http://localhost:3001/app/command-center**
-2. Click the microphone button (or say **"hey Xyron"** if wake word is on)
-3. Speak your command
-4. Xyron thinks, acts, and responds
-
-**Example commands to try:**
-- `"Open Chrome"`
-- `"What's my battery level?"`
-- `"Set volume to 40"`
-- `"Open my downloads folder"`
-- `"Take a screenshot"`
-- `"Open Chrome and set volume to 50"` ← runs two things at once
-
----
-
-## Project Structure (For the Curious)
+## Repository Layout
 
 ```
 Xyron/
   backend/
     api/
-      main.py              ← FastAPI app entry point
-      routers/             ← API endpoints (voice, history, memory, etc.)
-      services/            ← Core logic (intent routing, episodic memory, etc.)
-      tools/               ← Things Xyron can actually DO (open files, etc.)
-    voice/                 ← Voice recording and text-to-speech
-    requirements.txt       ← Python dependencies
-    .env.example           ← Template for your secrets
+      agents/          ← coordinator, browser/coding/automation agents, personality layer
+      routers/         ← 34 FastAPI routers mounted under /api/v1
+      services/        ← intent routing, perception, memory, fs index/search/watch
+      tools/           ← registry of things agents can actually do
+    operator_mode/      ← direct desktop control (observe-think-act-verify)
+    mcp_servers/         ← WhatsApp / Odoo / Xyron MCP servers (JSON-RPC over stdio)
+    voice/               ← STT, TTS, multilingual voice services
+    cognition/            ← emotion engine, reflection
+    src/ai_operator/       ← business-automation agent skills (silver/gold/platinum tiers)
+    tests/                  ← pytest suite
 
   web/
-    src/
-      app/                 ← Next.js pages
-      components/          ← Reusable UI pieces
-      hooks/               ← Data-fetching logic
-      lib/                 ← Shared utilities
+    src/app/app/             ← command-center, dashboard, activity, approvals, history, stats
 
   desktop-app/
-    src/                   ← Electron main + renderer process
+    src-tauri/                 ← Rust/Tauri shell, native bridge
+    src/                        ← React renderer
 
-  shared/                  ← Types shared between frontend and backend
-  docs/                    ← Integration setup guides
+  shared/                        ← types/hooks shared across web + desktop
+  Docs/architecture/               ← system design docs
 ```
 
----
+## Contributing
 
-## Common Issues
+This repo protects `main` — all work happens on feature branches:
 
-**Backend won't start?**
-- Make sure you're in the `backend/` folder
-- Check that your `.env` file exists and has a valid `OPENAI_API_KEY`
-- Try: `python3 --version` — needs to be 3.10 or higher
+```bash
+git checkout main && git pull origin main
+git checkout -b feat/your-feature
+# ...
+git push origin feat/your-feature
+gh pr create --base main --head feat/your-feature
+```
 
-**Microphone not working in browser?**
-- Use **Chrome or Edge** (Firefox has limited mic support)
-- Make sure you clicked "Allow" when the browser asked for mic permission
-
-**Voice commands not understood?**
-- Speak clearly and don't start talking until the mic indicator turns red/active
-- Try simpler commands first to test the connection
-
-**`npm install` fails?**
-- Run `node --version` — needs to be 18 or higher
-- Try: `npm install --legacy-peer-deps`
-
----
+See [`CLAUDE.md`](./CLAUDE.md) for the full development guide (config reference, intent-routing internals, key files).
 
 ## License
 
