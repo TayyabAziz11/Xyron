@@ -30,8 +30,47 @@ _XYRON_VARIANTS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "His iron" / "the iron" are only treated as a Xyron mishearing at the very
+# start of an utterance AND only when immediately followed by a comma — the
+# live-observed pattern is always "His iron, <command>" (Whisper hearing the
+# wake-word pause as a comma). Requiring the comma is what keeps this from
+# false-positiving on genuine mentions of an actual iron, e.g. "the iron is
+# hot, be careful" (no comma right after "iron") or "his iron content is low".
+_XYRON_LEADING_VARIANTS_RE = re.compile(
+    r"^(?:his|the)\s+iron\s*,\s*",
+    re.IGNORECASE,
+)
+
 import logging as _logging
 _norm_log = _logging.getLogger(__name__)
+
+# "Watch on my screen/skin" is a recurring tiny.en mishearing of "what's on
+# my screen" (live-observed 3x across two sessions: "screen" x2, "skin" x1)
+# — it silently misses the dedicated screen-query fast path's regex entirely
+# and falls through to the slow generic LLM route instead. Requiring "watch"
+# to be followed IMMEDIATELY by "on my/the <noun>" (no object in between)
+# keeps this from clobbering a real command like "watch this movie on my
+# screen", which always has an object between "watch" and "on". "skin" has
+# no legitimate meaning here (this assistant has no reason to ever discuss
+# skin) so it's always corrected to "screen"; "display"/"monitor" are real
+# synonyms a user might actually say, so those are preserved as-is.
+_SCREEN_QUERY_MISHEARING_RE = re.compile(
+    r"\bwatch\s+on\s+(?:my\s+|the\s+)?(screen|display|monitor|skin)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_screen_query_mishearing(text: str) -> str:
+    """Fix STT mishearing 'watch on my screen/skin' → 'what's on my screen'."""
+    def _replace(m: re.Match) -> str:
+        raw  = m.group(0)
+        noun = m.group(1)
+        if noun.lower() == "skin":
+            noun = "screen"
+        fixed = f"what's on my {noun}"
+        _norm_log.info("[SCREEN_QUERY_MISHEARING_FIX] raw=%r normalized=%r", raw, fixed)
+        return fixed
+    return _SCREEN_QUERY_MISHEARING_RE.sub(_replace, text)
 
 
 def _normalize_xyron_variants(text: str) -> str:
@@ -40,6 +79,11 @@ def _normalize_xyron_variants(text: str) -> str:
         raw = m.group(0)
         _norm_log.info("[NAME_NORMALIZE] raw=%r normalized='xyron'", raw)
         return "xyron"
+    def _replace_leading(m: re.Match) -> str:
+        raw = m.group(0)
+        _norm_log.info("[NAME_NORMALIZE] raw=%r normalized='xyron, '", raw)
+        return "xyron, "
+    text = _XYRON_LEADING_VARIANTS_RE.sub(_replace_leading, text)
     return _XYRON_VARIANTS_RE.sub(_replace, text)
 
 
@@ -152,6 +196,9 @@ def normalize(text: str) -> str:
 
     # 0. Fix STT phonetic mishearings of "Xyron" before wake-word strip
     text = _normalize_xyron_variants(text)
+
+    # 0.5. Fix "watch on my screen" mishearing of "what's on my screen"
+    text = _normalize_screen_query_mishearing(text)
 
     # 1. Strip wake word
     text = _WAKE_WORD_RE.sub("", text).strip()

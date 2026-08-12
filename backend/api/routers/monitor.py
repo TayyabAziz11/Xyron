@@ -58,6 +58,16 @@ async def monitor_ws(websocket: WebSocket):
                 await websocket.send_json({"type": "ping"})
                 continue
 
+            depth = q.qsize()
+            if depth > 0:
+                # Non-zero depth means the producer is outpacing this
+                # consumer (slow frontend/network) — visible, not fatal;
+                # _safe_put_metrics on the producer side already prevents
+                # this from ever raising QueueFull.
+                logger.debug("[QUEUE_DEPTH] queue=metrics depth=%d", depth)
+                if depth >= 5:
+                    logger.info("[EVENT_BACKPRESSURE] queue=metrics depth=%d client=%s", depth, client)
+
             await websocket.send_json(msg)
 
     except WebSocketDisconnect:

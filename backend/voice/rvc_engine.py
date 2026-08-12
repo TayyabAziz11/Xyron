@@ -93,16 +93,26 @@ MOOD_TO_PRESET: dict[str, str] = {
 }
 
 # ── Lightweight transform params — pitch (semitones) + spectral EQ ────────────
-
+# Live-measured "voice sounds heavy" complaint: librosa.effects.pitch_shift
+# uses a phase-vocoder built for music, not speech — it smears formants at
+# ANY nonzero shift, reading as muffled/heavy rather than a natural tone
+# change. "calm" is the default mood and fires on nearly every single reply
+# (not an occasional accent), and its old pitch=-0.4 + warmth=+0.10 both
+# pushed the same direction (lower + bassier = heavier), compounding into a
+# persistent muffling on every turn instead of a rare mood cue. Pitch is now
+# zeroed on the everyday presets (neutral/calm/protective) so the constant
+# case stays artifact-free, and trimmed (not removed) on the presets that
+# only fire for genuinely distinct emotional moments, where a little
+# character is the point and the artifact is heard rarely enough to be fine.
 _LIGHT_PRESETS: dict[str, dict] = {
     "neutral":       {"pitch": 0.0,   "brightness": 0.00, "warmth": 0.00},
-    "hyped":         {"pitch": 1.2,   "brightness": 0.12, "warmth": 0.00},
-    "relieved":      {"pitch": 0.5,   "brightness": 0.05, "warmth": 0.08},
-    "dominant":      {"pitch": -1.5,  "brightness": -0.08, "warmth": 0.18},
-    "protective":    {"pitch": -0.5,  "brightness": -0.05, "warmth": 0.12},
-    "calm":          {"pitch": -0.4,  "brightness": -0.10, "warmth": 0.10},
-    "late_night":    {"pitch": -1.0,  "brightness": -0.15, "warmth": 0.20},
-    "audience_mode": {"pitch": -1.0,  "brightness": 0.08,  "warmth": 0.08},
+    "hyped":         {"pitch": 0.8,   "brightness": 0.10, "warmth": 0.00},
+    "relieved":      {"pitch": 0.3,   "brightness": 0.04, "warmth": 0.05},
+    "dominant":      {"pitch": -0.8,  "brightness": -0.05, "warmth": 0.10},
+    "protective":    {"pitch": 0.0,   "brightness": -0.03, "warmth": 0.06},
+    "calm":          {"pitch": 0.0,   "brightness": -0.04, "warmth": 0.04},
+    "late_night":    {"pitch": -0.5,  "brightness": -0.08, "warmth": 0.12},
+    "audience_mode": {"pitch": -0.5,  "brightness": 0.05,  "warmth": 0.05},
 }
 
 

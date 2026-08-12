@@ -31,6 +31,7 @@ token.json
 
 # Node / Next.js
 node_modules/
+/node_modules
 .next/
 out/
 .vercel/
@@ -62,9 +63,15 @@ ralph_loop.log
 **/ralph_loop.log
 backend/system_log.md
 
-# Runtime data (vector DB, brain state — rebuilt automatically)
+# Runtime data (vector DB, brain state, fs index — rebuilt automatically)
 backend/data/chroma/
 backend/data/brain/
+backend/data/fs/*.db
+backend/data/fs/*.db-shm
+backend/data/fs/*.db-wal
+backend/tests/backend/data/fs/*.db
+backend/tests/backend/data/fs/*.db-shm
+backend/tests/backend/data/fs/*.db-wal
 
 # Audio test recordings (generated locally, not needed for dev)
 backend/data/rvc_tests/

@@ -35,8 +35,17 @@ def _is_wsl() -> bool:
 _ON_WSL = _is_wsl()
 
 
-def _take_screenshot() -> Optional[str]:
-    """Capture screen via PowerShell. Returns base64-encoded PNG or None."""
+def capture_screen_b64(monitor_index: Optional[int] = None) -> Optional[str]:
+    """
+    Capture a single monitor via PowerShell (System.Drawing.CopyFromScreen).
+    Returns base64-encoded PNG or None.
+
+    monitor_index=None captures the primary monitor (this service's original
+    behavior — preserved for get_context()/ambient description callers).
+    Perception Engine's VisionPerception passes an explicit index (from
+    multi_monitor_manager) to capture only the monitor the user is actually
+    looking at, per the Phase 2 "capture only the necessary monitor" rule.
+    """
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             out_path = f.name
@@ -46,9 +55,14 @@ def _take_screenshot() -> Optional[str]:
                 ["wslpath", "-w", out_path],
                 capture_output=True, text=True, timeout=3,
             ).stdout.strip()
+            bounds_expr = (
+                f"[System.Windows.Forms.Screen]::AllScreens[{monitor_index}].Bounds"
+                if monitor_index is not None
+                else "[System.Windows.Forms.Screen]::PrimaryScreen.Bounds"
+            )
             script = (
                 "Add-Type -AssemblyName System.Windows.Forms; "
-                f"$bmp = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                f"$bmp = {bounds_expr}; "
                 f"$bitmap = New-Object System.Drawing.Bitmap($bmp.Width, $bmp.Height); "
                 f"$g = [System.Drawing.Graphics]::FromImage($bitmap); "
                 f"$g.CopyFromScreen($bmp.Location, [System.Drawing.Point]::Empty, $bmp.Size); "
@@ -62,7 +76,7 @@ def _take_screenshot() -> Optional[str]:
             import mss
             import mss.tools
             with mss.mss() as sct:
-                monitor = sct.monitors[1]
+                monitor = sct.monitors[(monitor_index or 0) + 1]
                 img = sct.grab(monitor)
                 mss.tools.to_png(img.rgb, img.size, output=out_path)
 
@@ -72,6 +86,11 @@ def _take_screenshot() -> Optional[str]:
     except Exception as exc:
         logger.debug("Screenshot failed: %s", exc)
         return None
+
+
+def _take_screenshot() -> Optional[str]:
+    """Legacy name — kept for any external caller, now delegates to capture_screen_b64()."""
+    return capture_screen_b64()
 
 
 def _describe_screenshot(b64: str, openai_key: str) -> str:
@@ -137,6 +156,13 @@ class ScreenContextService:
 
     def _loop(self) -> None:
         while self._running:
+            try:
+                from api.services.background_scheduler import scheduler as _sched
+                if not _sched.should_run("screen_context"):
+                    time.sleep(_CAPTURE_INTERVAL)
+                    continue
+            except Exception:
+                pass
             try:
                 self._capture_once()
             except Exception as exc:

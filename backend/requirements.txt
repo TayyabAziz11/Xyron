@@ -29,6 +29,13 @@ google-auth-oauthlib>=1.0.0
 google-auth-httplib2>=0.1.0
 google-api-python-client>=2.80.0
 
+# requests — used by src/ai_operator/ (business-automation agents), dev/,
+# and scripts/. Already declared in pyproject.toml's [project.dependencies]
+# but missing here — requirements.txt is what a fresh install actually
+# uses, so a clean checkout was missing a real runtime dependency of code
+# main.py imports at startup (found in the 2026 platform-stabilization audit).
+requests>=2.28.0
+
 # Feature #9 — Browser control (run: playwright install chromium)
 playwright>=1.44.0
 
@@ -65,3 +72,11 @@ edge-tts>=7.0.0
 chromadb>=1.5.0
 ollama>=0.6.0
 rapidfuzz>=3.0.0
+
+# Phase 1 — System Intelligence: semantic filesystem index
+faiss-cpu>=1.8.0          # vector index for fs semantic search (GPU FAISS optional, CPU is plenty for local fs scale)
+watchdog>=4.0.0           # real-time filesystem change detection (PollingObserver — WSL2 DrvFs has no inotify)
+pymupdf>=1.24.0           # PDF text extraction (imported as `fitz`)
+python-docx>=1.1.0        # DOCX text extraction
+openpyxl>=3.1.0           # XLSX text extraction
+python-pptx>=0.6.23       # PPTX text extraction

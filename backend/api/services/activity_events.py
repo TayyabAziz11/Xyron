@@ -51,7 +51,10 @@ STAGES = frozenset({
 
 def _display_name(tool_name: str, params: dict, result_data: Optional[dict] = None) -> str:
     result_data = result_data or {}
-    for key in ("app_name", "query", "name", "page"):
+    # "drive" wasn't checked here — every open_drive call fell through to the
+    # "it" fallback, showing "Opening it drive" / "it drive is open" instead
+    # of "Opening C drive" (live-verified: TOOL_START params={'drive': 'C'}).
+    for key in ("app_name", "query", "name", "page", "drive"):
         val = params.get(key)
         if val:
             return str(val).strip().title()[:40]

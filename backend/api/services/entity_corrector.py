@@ -340,14 +340,21 @@ def rescore(
             new_cand           = copy.copy(cand)
             new_cand.text      = corrected
             new_cand.confidence = min(1.0, cand.confidence + best_score * 0.15)
+            new_cand.entity_match_score = best_score
             updated.append(new_cand)
         elif best_score >= _MATCH_THRESHOLD:
             # Boost confidence even if text unchanged (confirms the entity is real)
             import copy
             new_cand            = copy.copy(cand)
             new_cand.confidence = min(1.0, cand.confidence + best_score * 0.08)
+            new_cand.entity_match_score = best_score
             updated.append(new_cand)
         else:
+            # No entity match found — record the real (low) score instead of
+            # leaving candidate_scorer to fall back on STT confidence as a
+            # stand-in for entity quality (that was the "ent=1.00 for
+            # unmatched garbage" confidence-corruption bug).
+            cand.entity_match_score = best_score
             updated.append(cand)
 
     # Re-sort by updated confidence

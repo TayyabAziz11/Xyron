@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import shutil
 
@@ -62,6 +62,43 @@ def _find_cmdexe() -> str | None:
             _CMDEXE_PATH = candidate
             return _CMDEXE_PATH
     return None
+
+
+def open_url_native(url: str) -> bool:
+    """
+    Open a URL in the user's real default Windows browser via `cmd.exe /c
+    start` (same mechanism open_system_settings/open_drive already use for
+    ms-settings: URIs and drive paths — the one proven path that actually
+    launches something visible to the user in this app).
+
+    Root-cause fix: search_youtube/search_web/open_url previously only
+    returned `action_url` for the FRONTEND to open via `window.open()` —
+    but the live desktop app's actual WebSocket hook (useVoiceWS.ts) never
+    implements that handler at all (only a separate, unused legacy hook
+    does), so those commands silently did nothing visible. Every other
+    working "opens something" tool in this app launches natively server-
+    side; this makes URL-opening tools consistent with that, not a new
+    mechanism. Windows' own `start` command reuses/activates the existing
+    default browser process for a new tab rather than spawning a second
+    browser, which is also the closest native equivalent to "same browser,
+    new tab" without a browser-extension bridge into the user's real tabs.
+
+    Returns True if a launch was attempted (fire-and-forget — not proof the
+    page loaded, only that the OS accepted the launch request).
+    """
+    try:
+        if _ON_WSL:
+            cmd_exe = _find_cmdexe() or "cmd.exe"
+            subprocess.Popen([cmd_exe, "/c", "start", "", url],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        elif _ON_WINDOWS:
+            subprocess.Popen(["start", "", url], shell=True,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    except Exception:
+        logger.warning("[OPEN_URL_NATIVE] failed for url=%r", url, exc_info=True)
+    return False
 
 
 def _windows_home() -> str:
@@ -314,6 +351,52 @@ def _normalise_app(name: str) -> str:
     return _APP_ALIASES.get(n, re.sub(r'[\s\-_]', '', n))
 
 
+def resolve_web_app_url(app_name: str) -> Optional[str]:
+    """
+    Return the URL open_application would launch for *app_name* if it's one
+    of the browser-shortcut entries in _APP_MAP (youtube, gmail, github,
+    etc.), or None otherwise. Reuses the SAME table _exec_open_application
+    already looks up internally — active_context.py calls this to record
+    current_url so a later web-interaction follow-up ("click the first
+    video") knows what page to transfer into the automation browser,
+    without duplicating this URL table anywhere else.
+    """
+    norm = _normalise_app(app_name)
+    plat = "wsl" if _ON_WSL else ("win32" if _ON_WINDOWS else "linux")
+    cmd = (_APP_MAP.get(norm) or {}).get(plat, "")
+    if cmd.startswith("http://") or cmd.startswith("https://"):
+        return cmd
+    return None
+
+
+def is_garbled_app_name(name: str) -> bool:
+    """
+    True if *name* looks like leaked sentence/command fragments rather than
+    a real, single app identifier — e.g. "youtube. open" or "youtube, not
+    youtube open" from an STT artifact that intent_router's greedy
+    `open\\s+(.+)` regex swallowed whole. Real app names are short,
+    proper-noun-shaped strings with no internal sentence punctuation.
+
+    Mirrors app_finder.py's existing "sentence_like" fuzzy-match skip
+    (_search_index's len>3-words-or-command-verb check), applied one layer
+    earlier and more conservatively (any internal punctuation, not just
+    >3 words) — before the blind cmd.exe/start fallback launch in
+    _launch_app below, and before context_stack.py pushes the name as a
+    future fuzzy-match candidate. Without this, an unrecognized garbled
+    name previously fell through to `cmd.exe /c start "" "<garbage>"`,
+    which Windows resolves as a literal web search for that text —
+    live-measured as "open youtube" silently becoming a browser search
+    instead of opening YouTube, while still reporting tool success.
+    """
+    if not name:
+        return True
+    if len(name.split()) > 3:
+        return True
+    if any(ch in name for ch in ".,;"):
+        return True
+    return False
+
+
 # Window title / WScript.AppActivate search strings for common apps
 _APP_FOCUS_TITLE: Dict[str, str] = {
     "settings":     "Settings",
@@ -370,6 +453,16 @@ def _launch_app(app_name: str) -> tuple[bool, str]:
     entry    = _APP_MAP.get(key)
 
     if not entry:
+        # Root-cause fix: refuse to blind-launch a garbled name via
+        # cmd.exe/start — see is_garbled_app_name's docstring for the live
+        # incident this closes ("open youtube" -> garbled STT -> silent
+        # web search instead of opening YouTube, while still reporting
+        # success). A clean, unrecognized app name still gets the normal
+        # cmd.exe/start attempt below — this only blocks names that
+        # already look like leaked sentence fragments.
+        if is_garbled_app_name(app_name):
+            logger.warning("[LAUNCH_APP_REFUSED] reason=garbled_name app_name=%r", app_name)
+            return False, "I didn't catch a clear app name — could you say that again?"
         # Unknown app — try via cmd.exe start (handles .exe, shortcuts, UWP, protocols)
         try:
             exe = app_name.strip()
@@ -395,6 +488,40 @@ def _launch_app(app_name: str) -> tuple[bool, str]:
     cmd = entry.get(platform, "")
     if not cmd:
         return False, f"'{app_name}' is not available on this platform."
+
+    # Browser-shortcut entries (youtube, gmail, github, chatgpt, google) used
+    # to open via a plain OS `start <url>` into the user's own DEFAULT
+    # browser/profile — completely disconnected from browser_workspace, the
+    # dedicated CDP-controlled Chrome (its own C:\XyronBrowserProfile) that
+    # search_youtube/play_youtube_video/browser_* tools all share. Live bug:
+    # "open youtube" landed in the user's normal Chrome, then "play this
+    # song" opened a SECOND, separate Chrome window/profile via
+    # browser_workspace — two disconnected browsers, not "a new tab" but a
+    # genuinely different browser instance. Fixed by routing these entries
+    # through browser_workspace FIRST, so the very first "open youtube"
+    # already lands in the one persistent tab every later voice follow-up
+    # reuses. Falls back to the native open below if browser control isn't
+    # reachable, so the command still succeeds either way.
+    _web_url = cmd if (cmd.startswith("http://") or cmd.startswith("https://")) else ""
+    if _web_url:
+        try:
+            from api.tools.browser_tools import _get_page
+            from api.services.main_loop import run_coro_from_thread
+
+            page = _get_page()
+
+            async def _goto():
+                await page.goto(_web_url, wait_until="domcontentloaded", timeout=15000)
+
+            run_coro_from_thread(_goto(), timeout=20.0)
+            logger.info("Launched: %s → %s (browser_workspace)", app_name, _web_url)
+            _bring_to_front(key)
+            return True, f"Launched {app_name}"
+        except Exception as _bw_exc:
+            logger.warning(
+                "[BROWSER_WORKSPACE_OPEN_FAILED] app=%r url=%s error=%s — falling back to native open",
+                app_name, _web_url, _bw_exc,
+            )
 
     try:
         _is_uri = cmd.startswith("ms-settings:") or cmd.startswith("http://") or cmd.startswith("https://")

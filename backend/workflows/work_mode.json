@@ -21,9 +21,9 @@
     "open my work apps",
     "prepare my work setup"
   ],
-  "completion_message": "Work mode activated — VS Code and GitHub are open. Let's get it done.",
+  "completion_message": "VS Code and GitHub are open — looks like we're on {project}. What are we building today?",
   "steps": [
     { "action": "open_app", "app_name": "vscode", "delay": 1.5 },
-    { "action": "browser.goto", "url": "https://github.com/TayyabAziz11", "delay": 1.0 }
+    { "action": "desktop.open_url", "url": "https://github.com/TayyabAziz11", "delay": 1.0 }
   ]
 }

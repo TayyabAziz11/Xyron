@@ -604,19 +604,33 @@ export default function CommandCenterPage() {
                       onClick={session.isActive ? session.stopSession : session.startSession}
                     />
 
-                    {/* Status text */}
+                    {/* Status text — Part 7 UX polish: while a tool is running, show
+                        what it's actually doing (from the backend's activity_events
+                        stream) instead of a generic "PROCESSING…"; falls back to
+                        "THINKING…" only while genuinely reasoning with no tool yet. */}
                     <div className="flex flex-col items-center gap-2 mt-2">
-                      <AnimatePresence mode="wait">
-                        <motion.p key={session.state}
-                          initial={{ opacity:0, y:4 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0 }}
-                          className="font-mono text-sm font-black tracking-[0.25em]"
-                          style={{
-                            color: isListening ? '#00ff88' : isSpeakingS ? '#a78bfa' : isProcessing ? '#00ffff' : '#ff2020',
-                            animation: 'glowPulse 2s ease-in-out infinite',
-                          }}>
-                          {isListening ? "I'M LISTENING" : isSpeakingS ? 'XYRON SPEAKING' : isProcessing ? 'PROCESSING…' : session.isActive ? 'SAY "HEY XYRON"' : 'TAP TO ACTIVATE'}
-                        </motion.p>
-                      </AnimatePresence>
+                      {(() => {
+                        const activityTitle = isProcessing ? session.activity?.title : undefined
+                        const statusLabel = isListening ? "I'M LISTENING"
+                          : isSpeakingS ? 'XYRON SPEAKING'
+                          : activityTitle ? activityTitle.toUpperCase()
+                          : isProcessing ? 'THINKING…'
+                          : session.isActive ? 'SAY "HEY XYRON"'
+                          : 'TAP TO ACTIVATE'
+                        return (
+                          <AnimatePresence mode="wait">
+                            <motion.p key={statusLabel}
+                              initial={{ opacity:0, y:4 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0 }}
+                              className="font-mono text-sm font-black tracking-[0.25em]"
+                              style={{
+                                color: isListening ? '#00ff88' : isSpeakingS ? '#a78bfa' : isProcessing ? '#00ffff' : '#ff2020',
+                                animation: 'glowPulse 2s ease-in-out infinite',
+                              }}>
+                              {statusLabel}
+                            </motion.p>
+                          </AnimatePresence>
+                        )
+                      })()}
                       <p className="font-mono text-[10px] text-text-muted">
                         {isListening ? 'Speak your command clearly' : session.isActive ? 'Wake word listening active' : 'Click orb or say wake word'}
                       </p>

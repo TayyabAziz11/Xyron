@@ -51,6 +51,40 @@ _VSCODE_RE      = re.compile(
 )
 _EXPLORER_RE    = re.compile(r'^(.+?)\s*$')   # title IS the folder name in Explorer
 
+# Trailing " - <something>" / " | <something>" boilerplate — Windows and
+# browser titles routinely tack their own app/site name onto the end
+# ("readme.txt - Notepad", "Some Item - Google Chrome"). Once we're already
+# saying "in <app>" separately, repeating it verbatim reads redundant.
+_TITLE_TRAILING_SEGMENT_RE = re.compile(r"\s*[-|—]\s*([^-|—]{1,50})$")
+
+
+def _clean_spoken_title(title: str, app_name: str = "", max_len: int = 70) -> str:
+    """Turn a raw window/tab title into something worth reading aloud.
+
+    Two problems with reading a raw title verbatim (Part 9 follow-up — the
+    generic fallback branches were still doing this even after GitHub/
+    YouTube/etc. got dedicated composers): (1) it usually repeats the app
+    or site name a second time right after we've already said "in <app>",
+    and (2) real-world titles run long ("TayyabAziz11/Xyron: Voice-driven
+    AI OS operator - Whisper STT, Brain V2, operator mode, Electron +
+    FastAPI" is 87 characters) — reading the whole thing aloud is exactly
+    the "just reads what's on screen" experience this function exists to
+    avoid. Strip a trailing segment that's just the app/site name repeated,
+    then cap length at a clean word boundary.
+    """
+    t = (title or "").strip()
+    if not t:
+        return t
+    m = _TITLE_TRAILING_SEGMENT_RE.search(t)
+    if m:
+        tail = m.group(1).strip()
+        if app_name and (tail.lower() in app_name.lower() or app_name.lower() in tail.lower()):
+            t = t[:m.start()].strip()
+    if len(t) > max_len:
+        head = t[:max_len].rsplit(" ", 1)[0]
+        t = (head or t[:max_len]).strip() + "…"
+    return t
+
 # Process names for well-known apps (lowercase, .exe stripped)
 _PROC_TO_APP: dict[str, str] = {
     "chrome":           "Google Chrome",
@@ -79,10 +113,6 @@ _PROC_TO_APP: dict[str, str] = {
     "cmd":              "Command Prompt",
     "pwsh":             "PowerShell",
 }
-
-# CDP port to try for browser URL (optional, requires chrome --remote-debugging-port=9222)
-_CDP_PORT = 9222
-
 
 @dataclass
 class ScreenSnapshot:
@@ -114,6 +144,13 @@ class ScreenSnapshot:
     page_type:     str            = ""
     repository:    Optional[dict] = None
 
+    # Product / shopping page perception — populated from World State's
+    # browser_perception schema.org extraction (name/brand/price/currency/
+    # rating/review_count/availability/seller). Only trusted when
+    # page_type == "shopping" (see describe()) since world_state doesn't
+    # clear current_product on navigation away from a product page.
+    product:       Optional[dict] = None
+
     captured_at:   float = field(default_factory=time.time)
 
     # ── Describe ──────────────────────────────────────────────────────────────
@@ -140,6 +177,19 @@ class ScreenSnapshot:
                      self.active_app, self.repository.get("name"), desc[:120])
             return desc
 
+        if self.is_browser and self.page_type == "shopping":
+            desc = _describe_shopping(self)
+            _dl.info("[SCREEN_CONTEXT_DESCRIPTION] app=%r page_type=shopping desc=%r",
+                     self.active_app, desc[:120])
+            return desc
+
+        if self.is_browser and self.page_type and self.page_type != "unknown":
+            desc = _describe_by_page_type(self.page_type, self.browser_title, self.browser_url)
+            if desc:
+                _dl.info("[SCREEN_CONTEXT_DESCRIPTION] app=%r page_type=%s desc=%r",
+                         self.active_app, self.page_type, desc[:120])
+                return desc
+
         if self.is_store:
             if self.store_page:
                 return f"You're viewing {self.store_page} on the Microsoft Store."
@@ -157,7 +207,13 @@ class ScreenSnapshot:
 
         if self.is_browser:
             if self.browser_title:
-                return f"You're currently viewing {self.browser_title!r} in {self.active_app}."
+                clean = _clean_spoken_title(self.browser_title, self.active_app)
+                site = _site_label(self.browser_url, "")
+                desc = (f"You're looking at {clean} on {site}." if site
+                        else f"You're looking at {clean} in {self.active_app}.")
+                _dl.info("[SCREEN_CONTEXT_DESCRIPTION] app=%r title=%r desc=%r",
+                         self.active_app, self.browser_title[:60], desc[:120])
+                return desc
             return f"{self.active_app} is open."
 
         if self.is_explorer:
@@ -167,7 +223,8 @@ class ScreenSnapshot:
             return "File Explorer is open."
 
         if self.window_title and self.window_title != self.active_app:
-            desc = f"You have {self.active_app} open — {self.window_title}."
+            clean = _clean_spoken_title(self.window_title, self.active_app)
+            desc = f"You're using {self.active_app}, on {clean}."
             _dl.info("[SCREEN_CONTEXT_DESCRIPTION] app=%r title=%r desc=%r",
                      self.active_app, self.window_title[:60], desc[:80])
             return desc
@@ -180,6 +237,8 @@ class ScreenSnapshot:
         """Single-phrase answer for 'what app is open?' """
         if self.is_browser and self.repository:
             return f"GitHub, on the {self.repository['name']} repository"
+        if self.is_browser and self.page_type == "shopping" and self.product:
+            return f"{self.active_app}, viewing {self.product.get('name') or 'a product'}"
         if self.is_store:
             return f"Microsoft Store" + (f", showing {self.store_page}" if self.store_page else "")
         if self.is_vscode:
@@ -227,6 +286,109 @@ def _describe_repository(repo: dict) -> str:
         detail += f" It's described as: {desc}."
 
     return (base + detail).strip()
+
+
+# ── Product / page-type description composers ─────────────────────────────
+# Same "structured data, never a raw window-title echo" approach as
+# _describe_repository above, extended to the other page types Perception
+# Engine's browser_perception.classify_page_type() already classifies but
+# describe() used to ignore entirely.
+
+_YOUTUBE_TITLE_SUFFIX_RE = re.compile(r'\s*-\s*YouTube\s*$', re.IGNORECASE)
+_GOOGLE_SEARCH_TITLE_SUFFIX_RE = re.compile(r'\s*-\s*Google\s+Search\s*$', re.IGNORECASE)
+
+_PAGE_TYPE_PHRASES: dict[str, str] = {
+    "chatgpt": "You have ChatGPT open.",
+    # Deliberately no page content/title read out for email or banking —
+    # privacy-sensitive page types, unlike the others here.
+    "email":   "You're in your email inbox.",
+    "banking": "You're on a banking site.",
+}
+
+
+def _extract_search_query(url: str, title: str) -> str:
+    """Prefer the real ?q= query param (exact); fall back to stripping the
+    ' - Google Search' suffix off the window title."""
+    if url:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(url).query).get("q")
+            if q and q[0]:
+                return q[0]
+        except Exception:
+            pass
+    m = _GOOGLE_SEARCH_TITLE_SUFFIX_RE.search(title or "")
+    return title[:m.start()].strip() if m else ""
+
+
+def _site_label(url: str, fallback: str) -> str:
+    """Bare hostname (no scheme/www) for a fallback sentence when no richer
+    structured data is available — never leak the full URL/path into TTS."""
+    if url:
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc.lower()
+            if host:
+                return host[4:] if host.startswith("www.") else host
+        except Exception:
+            pass
+    return fallback
+
+
+def _describe_product(product: dict) -> str:
+    """Compose a natural sentence from a browser_perception schema.org
+    Product extraction. Always ends with the compare/cheaper offer so a
+    later bare 'yes' has something concrete to confirm (see
+    context_stack.update_from_screen's 'offer' metadata)."""
+    name = product.get("name") or "this product"
+    bits = []
+    if product.get("brand"):
+        bits.append(str(product["brand"]))
+    price = product.get("price")
+    currency = (product.get("currency") or "").strip()
+    if price:
+        bits.append(f"{currency} {price}".strip())
+    sentence = f"You're looking at {name}"
+    if bits:
+        sentence += " — " + ", ".join(bits)
+    rating = product.get("rating")
+    if rating:
+        sentence += f", rated {rating}"
+        review_count = product.get("review_count")
+        if review_count:
+            sentence += f" ({review_count} reviews)"
+    sentence += ". Want me to compare it or find something cheaper?"
+    return sentence
+
+
+def _describe_shopping(snap: "ScreenSnapshot") -> str:
+    """product is only trusted when page_type == 'shopping' (see caller) —
+    world_state doesn't clear current_product on navigating away from a
+    product page, so this guards against describing a stale product."""
+    if snap.product:
+        return _describe_product(snap.product)
+    site = _site_label(snap.browser_url, snap.active_app)
+    return (f"You appear to be shopping for something on {site}."
+            if site else "You appear to be on a shopping site.")
+
+
+def _describe_by_page_type(page_type: str, title: str, url: str) -> str:
+    """Returns "" for page types with no dedicated phrasing yet — caller
+    falls back to the generic browser branch in that case."""
+    if page_type == "youtube":
+        video = _YOUTUBE_TITLE_SUFFIX_RE.sub("", title or "").strip()
+        return f"You're watching {video!r} on YouTube." if video else "You have YouTube open."
+    if page_type == "google_search":
+        query = _extract_search_query(url, title)
+        return f"You're searching for {query!r}." if query else "You're on a search results page."
+    if page_type == "documentation":
+        return f"You're reading documentation: {title!r}." if title else "You have a documentation page open."
+    if page_type == "news":
+        return f"You're reading an article: {title!r}." if title else "You have a news article open."
+    if page_type == "developer_tools":
+        return (f"You're viewing a local development page: {title!r}." if title
+                else "You're viewing a local development server.")
+    return _PAGE_TYPE_PHRASES.get(page_type, "")
 
 
 class ScreenContextAgent:
@@ -332,12 +494,38 @@ class ScreenContextAgent:
         if snap.is_browser and not snap.browser_url:
             snap.browser_url = self._get_browser_url_cdp()
 
-        # Step 5 (Part 8/9): prefer Perception Engine's structured browser/
-        # GitHub extraction over this module's own bare window-title parsing
-        # — it already has the real URL via CDP/Playwright (no title-regex
-        # guessing) and, for GitHub, owner/name/branch/current_path/
-        # page_type. This is what stops "what's on my screen" from just
-        # echoing the window title as the entire answer.
+        # Step 4b: classify the URL we just got directly — classify_github_page
+        # and classify_page_type are pure URL/title parsing (no Playwright, no
+        # page.evaluate needed), so this works for ANY tab CDP can see, not
+        # only ones Xyron's own agent opened. Previously the only source of
+        # page_type/repository was world_state's browser_perception, which is
+        # gated behind Xyron's own agent-managed browser connection — so a tab
+        # you opened yourself always fell through to the bare title echo even
+        # once the URL was reachable. This is the fallback that actually uses
+        # it: real repo owner/branch/path for GitHub with zero extra I/O, and
+        # at least a page_type guess (shopping/docs/video/search/etc.) for
+        # everything else, before world_state gets a chance to enrich further.
+        if snap.is_browser and snap.browser_url:
+            try:
+                from api.services.perception.browser_perception import (
+                    classify_github_page as _classify_gh,
+                    classify_page_type as _classify_pt,
+                )
+                repo = _classify_gh(snap.browser_url)
+                if repo:
+                    snap.repository = repo
+                    snap.page_type = "repository"
+                else:
+                    pt = _classify_pt(snap.browser_url, snap.browser_title)
+                    if pt and pt != "unknown":
+                        snap.page_type = pt
+            except Exception as exc:
+                logger.debug("[SCREEN_AGENT] local URL classification failed: %s", exc)
+
+        # Step 5 (Part 8/9): let Perception Engine's world_state data (richer —
+        # has Playwright schema.org product extraction, etc.) override/augment
+        # the local classification above when Xyron's own agent-managed
+        # browser is the one connected.
         if snap.is_browser:
             self._enrich_from_world_state(snap)
 
@@ -362,6 +550,9 @@ class ScreenContextAgent:
             repo = ctx.get("current_repository")
             if repo:
                 snap.repository = repo
+            product = ctx.get("current_product")
+            if product:
+                snap.product = product
         except Exception as exc:
             logger.debug("[SCREEN_AGENT] world_state enrichment failed: %s", exc)
 
@@ -448,24 +639,34 @@ class ScreenContextAgent:
     def _get_browser_url_cdp(self) -> str:
         """
         Try to get the active tab URL from Chrome DevTools Protocol.
-        Requires Chrome to be running with --remote-debugging-port=9222.
-        Silently returns "" if unavailable (<50ms timeout).
+
+        This backend runs inside WSL2; Chrome runs on the Windows host. A
+        plain 127.0.0.1:9222 lookup was silently failing on every call —
+        127.0.0.1 from inside WSL2 is WSL2's own loopback, never Windows'.
+        cdp_config.py exists specifically to resolve the real WSL2->Windows
+        bridge address (gateway IP + forwarded bridge port, since Chrome's
+        own port and the bridge port can't share a number — see that
+        module's docstring); browser_workspace.py already uses it correctly
+        for agent-driven browsing, this just needed to do the same instead
+        of a stale hardcoded 127.0.0.1:9222 that could never have worked
+        cross-VM. This is why every screen-query answer degraded to a bare
+        window-title echo instead of the real URL-based description.
         """
         try:
+            from api.services.cdp_config import get_config as _get_cdp_config
             import urllib.request
             import json as _json
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{_CDP_PORT}/json", timeout=0.3
-            ) as resp:
+            _endpoint = _get_cdp_config().endpoint
+            with urllib.request.urlopen(f"{_endpoint}/json", timeout=1.0) as resp:
                 tabs = _json.loads(resp.read())
                 for tab in tabs:
                     if tab.get("type") == "page":
                         url = tab.get("url", "")
                         if url and not url.startswith("chrome://"):
-                            logger.debug("[SCREEN_AGENT_CDP] url=%r", url[:80])
+                            logger.debug("[SCREEN_AGENT_CDP] url=%r via=%s", url[:80], _endpoint)
                             return url
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[SCREEN_AGENT_CDP] unavailable: %s", exc)
         return ""
 
 
@@ -564,3 +765,166 @@ async def handle_repository_followup(action: str) -> str:
     label = {"readme": "the README", "issues": "the issues page", "commits": "the latest commits"}[action]
     navigated = await _navigate_existing_tab(target_url)
     return f"Opened {label}." if navigated else f"I'll open {label} — {target_url}"
+
+
+# ── Product follow-ups ────────────────────────────────────────────────────────
+# Mirrors the repository follow-ups above exactly: reuses the "product"
+# entity ContextStack already tracks from a prior screen query
+# (update_from_screen), and — for "cheaper"/"compare" — actually searches
+# and reads real prices back via BrowserReader rather than just opening a
+# tab and saying nothing about what's on it. Runs through the normal async
+# tool-call path (like handle_repository_followup), not the <200ms fast
+# tier, since a live search + a few page loads genuinely takes a few
+# seconds.
+
+_PRODUCT_FOLLOWUP_ACTIONS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'\bcompare\s+(?:it|this|prices?)\b', re.I), "compare"),
+    (re.compile(r'\bfind\s+(?:me\s+)?(?:something\s+)?cheaper\b', re.I), "cheaper"),
+    (re.compile(r'\b(?:is\s+there|find\s+me?)\s+a?\s*cheaper\s+(?:one|option|alternative)\b', re.I), "cheaper"),
+    (re.compile(r'\bis\s+this\s+the\s+best\s+price\b', re.I), "cheaper"),
+    (re.compile(r'\bcheaper\s+(?:option|alternative|price)\b', re.I), "cheaper"),
+]
+
+# How many search-result candidates to try opening before giving up, and how
+# many priced candidates are "enough" to stop early — keeps a live search
+# to a handful of seconds rather than working through every result.
+_PRODUCT_SEARCH_MAX_CANDIDATES = 4
+_PRODUCT_SEARCH_ENOUGH_PRICES  = 2
+_PRODUCT_SEARCH_NAV_TIMEOUT_MS = 8_000
+
+
+def match_product_followup(text: str) -> Optional[str]:
+    """Return the follow-up action ('compare'/'cheaper') this utterance
+    requests, or None."""
+    for pattern, action in _PRODUCT_FOLLOWUP_ACTIONS:
+        if pattern.search(text):
+            return action
+    return None
+
+
+async def _search_prices(product_name: str) -> list[dict]:
+    """Open a NEW tab (never navigates the user's current product tab away
+    — unlike repository follow-ups, which intentionally redirect the same
+    tab) via browser_workspace's approval choke point, search for the
+    product, and read real prices off the top results. The user's own
+    follow-up command ("find me something cheaper") is the approval this
+    gate exists for. Returns [] (never raises) if the browser isn't
+    connected or nothing priced was found."""
+    try:
+        from api.agents.browser_agent.browser_workspace import browser_workspace
+        if not browser_workspace.is_healthy:
+            return []
+
+        import urllib.parse
+        search_url = f"https://www.google.com/search?q={urllib.parse.quote(product_name + ' price')}"
+        page = await browser_workspace.new_tab_if_approved(
+            search_url, approved=True, reason="product_price_comparison",
+        )
+        if page is None:
+            return []
+
+        try:
+            from api.agents.browser_agent.browser_reader import BrowserReader
+            reader = BrowserReader()
+            results = await reader.extract_search_results(page)
+
+            candidates: list[dict] = []
+            for r in results[:_PRODUCT_SEARCH_MAX_CANDIDATES]:
+                url = r.get("url", "")
+                if not url.startswith("http"):
+                    continue
+                try:
+                    await page.goto(url, wait_until="domcontentloaded",
+                                     timeout=_PRODUCT_SEARCH_NAV_TIMEOUT_MS)
+                    price = await reader.extract_price(page)
+                    if price:
+                        candidates.append({
+                            "title": (r.get("title") or url)[:60],
+                            "price": price,
+                        })
+                except Exception:
+                    continue
+                if len(candidates) >= _PRODUCT_SEARCH_ENOUGH_PRICES:
+                    break
+            return candidates
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("[PRODUCT_FOLLOWUP_SEARCH] failed: %s", exc)
+        return []
+
+
+async def handle_product_followup(action: str) -> str:
+    """
+    Execute a product follow-up using the product entity ContextStack
+    already tracked from the last screen query — a real search with real
+    extracted prices, never a fabricated "sure, I'll look into it".
+    """
+    try:
+        from api.services.context_stack import context_stack
+        entity = context_stack.get_last("product")
+    except Exception:
+        entity = None
+
+    if entity is None:
+        return "I don't have a product in context — open one first."
+
+    product = entity.metadata or {}
+    name = product.get("name") or entity.display or ""
+    if not name:
+        return "I don't have enough information about that product to look into it."
+
+    candidates = await _search_prices(name)
+    if not candidates:
+        return f"I searched but couldn't find pricing for {name} elsewhere — you may want to check yourself."
+
+    lines = [f"{c['title']} for {c['price']}" for c in candidates]
+    spoken = "Here's what I found: " + "; ".join(lines) + "."
+
+    current_price = product.get("price")
+    if current_price:
+        currency = (product.get("currency") or "").strip()
+        price_str = f"{currency} {current_price}".strip()
+        spoken += f" You're currently looking at it for {price_str}."
+
+    return spoken
+
+
+# ── Bare "yes" confirming a screen-agent offer ────────────────────────────────
+# Generalizes CONTINUE_INSTALL_WORDS-style bare confirmation (already used
+# for Microsoft Store installs in follow_up_resolver.py) to whatever the
+# last screen query actually offered — "want me to compare it or find
+# something cheaper?" / GitHub's implicit "I can open the README..." — so a
+# plain "yes"/"sure" resolves correctly instead of only working for store
+# installs.
+
+_SCREEN_OFFER_MAX_AGE_S = 60.0
+
+
+async def handle_screen_offer_confirmation() -> Optional[str]:
+    """Returns a spoken response if the most recent ContextStack entity is
+    a fresh screen-agent product/repository with a pending offer, else None
+    (caller falls through to normal routing — a bare "yes" with nothing
+    pending should never be swallowed here)."""
+    try:
+        from api.services.context_stack import context_stack
+        entity = context_stack.peek()
+    except Exception:
+        return None
+
+    if not entity or entity.source != "screen_agent":
+        return None
+    offer = (entity.metadata or {}).get("offer")
+    if not offer:
+        return None
+    if time.time() - entity.pushed_at > _SCREEN_OFFER_MAX_AGE_S:
+        return None
+
+    if entity.type == "product":
+        return await handle_product_followup(offer[0])
+    if entity.type == "repository":
+        return await handle_repository_followup(offer[0])
+    return None

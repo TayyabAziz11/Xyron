@@ -889,3 +889,261 @@
 - **2026-04-05T12:39:09.465665+00:00**: Ralph Loop - Started (dry_run=False, max_iter=10)
 - **2026-04-05T12:39:09.546043+00:00**: Ralph Loop - Halted at iteration 1: Approval required (1 pending)
 - **2026-04-05T12:39:09.559507+00:00**: Ralph Loop - Ended: 0 decisions, 0 plans, Approval required (1 pending)
+
+**[2026-07-01T15:31:33.987852+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-01T15:31:35.635037+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T15:31:35.696515+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-01T15:31:35.884374+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T15:31:35.948281+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-01T15:31:36.123928+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-01T15:31:36.168619+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-01T15:31:36.497873+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T15:31:45.780151+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T15:36:03.942057+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-01T15:36:05.517838+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T15:36:05.577158+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-01T15:36:05.730408+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T15:36:05.795118+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-01T15:36:05.937250+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-01T15:36:05.980477+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-01T15:36:06.283613+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T15:36:14.236431+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T16:03:20.212135+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-01T16:03:22.818733+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T16:03:22.882849+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-01T16:03:23.134507+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T16:03:23.200644+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-01T16:03:23.530211+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-01T16:03:23.566160+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-01T16:03:24.023798+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T16:03:30.064945+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T16:05:11.487869+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-01T16:05:12.921131+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T16:05:12.979232+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-01T16:05:13.182937+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-01T16:05:13.244375+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-01T16:05:13.455260+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-01T16:05:13.496380+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-01T16:05:13.876093+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-01T16:05:22.346792+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-03T07:58:20.243032+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-03T07:58:23.947483+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-03T07:58:24.183940+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-03T07:58:24.596261+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-03T07:58:24.768232+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-03T07:58:25.091947+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-03T07:58:25.207280+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-03T07:58:26.015124+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-03T07:58:42.501288+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-03T10:31:47.490692+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-03T10:31:49.725050+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-03T10:31:49.813289+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-03T10:31:49.968893+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-03T10:31:50.040899+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-03T10:31:50.202520+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-03T10:31:50.244628+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-03T10:31:50.796275+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-03T10:31:55.934650+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-29T15:28:20.029073+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-29T15:34:34.395564+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-29T15:36:49.616138+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-29T16:13:51.451456+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-30T03:54:09.768438+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-30T15:22:09.308553+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-31T10:25:31.478821+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-31T10:48:26.575546+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-31T13:15:18.167050+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-31T14:07:04.560003+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-07-31T14:07:05.814268+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-31T14:07:05.886724+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-07-31T14:07:06.017829+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-07-31T14:07:06.075800+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-07-31T14:07:06.201547+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-07-31T14:07:06.243810+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-07-31T14:07:06.565064+00:00]** Remediation task created: Approved plan not found
+
+**[2026-07-31T14:07:09.910975+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-01T10:03:58.167388+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-01T10:03:59.559315+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-01T10:03:59.642217+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-01T10:03:59.786364+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-01T10:03:59.860133+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-01T10:03:59.994720+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-01T10:04:00.042701+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-01T10:04:00.358064+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-01T10:04:03.886642+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T09:50:14.545653+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-02T09:50:16.556764+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T09:50:16.666671+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-02T09:50:16.873900+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T09:50:17.008019+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-02T09:50:17.348093+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-02T09:50:17.429097+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-02T09:50:17.868186+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T09:50:23.149817+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T10:08:57.719566+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-02T10:08:59.308833+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T10:08:59.400042+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-02T10:08:59.545111+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T10:08:59.616913+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-02T10:08:59.763065+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-02T10:08:59.819069+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-02T10:09:00.213738+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T10:09:04.611651+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T14:23:37.028315+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-02T14:23:38.571214+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T14:23:38.665980+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-02T14:23:38.839665+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T14:23:38.922499+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-02T14:23:39.093673+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-02T14:23:39.152913+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-02T14:23:39.489423+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T14:23:45.499435+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T14:29:07.104847+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-02T14:29:08.510471+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T14:29:08.580479+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-02T14:29:08.722208+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-02T14:29:08.800641+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-02T14:29:08.949923+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-02T14:29:08.995287+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-02T14:29:09.303092+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-02T14:29:13.233873+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-03T03:44:03.818457+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-03T03:44:08.214622+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-03T03:44:08.432739+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-03T03:44:08.941793+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-03T03:44:09.198096+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-03T03:44:09.524545+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-03T03:44:09.624706+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-03T03:44:10.375824+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-03T03:44:17.557922+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-04T06:55:35.674054+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-04T06:55:36.821429+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-04T06:55:36.898006+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-04T06:55:37.019379+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-04T06:55:37.069264+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-04T06:55:37.192260+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-04T06:55:37.224742+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-04T06:55:37.479509+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-04T06:55:40.885981+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-04T14:42:10.669850+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-04T14:42:11.972524+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-04T14:42:12.049884+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-04T14:42:12.180388+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-04T14:42:12.237890+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-04T14:42:12.360173+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-04T14:42:12.398411+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-04T14:42:12.688385+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-04T14:42:16.437574+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-04T14:54:45.732199+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-04T14:54:49.465295+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-04T14:54:49.533515+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-04T14:54:49.667655+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-04T14:54:49.726110+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-04T14:54:49.859212+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-04T14:54:49.896531+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-04T14:54:50.175567+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-04T14:54:53.633928+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-05T04:50:51.346177+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-05T04:50:56.990035+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-05T04:50:57.377527+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-05T04:50:57.861837+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-05T04:50:58.172451+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-05T04:50:58.603702+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-05T04:50:58.774935+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-05T04:50:59.847354+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-05T04:51:08.244310+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-05T14:34:43.901991+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-05T14:34:48.639877+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-05T14:34:48.856109+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-05T14:34:49.196116+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-05T14:34:49.371440+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-05T14:34:49.712721+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-05T14:34:49.837165+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-05T14:34:50.671640+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-05T14:34:58.826122+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-07T04:13:16.712873+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-07T04:13:19.849519+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-07T04:13:20.044655+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-07T04:13:20.373774+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-07T04:13:20.530620+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-07T04:13:20.795896+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-07T04:13:20.882016+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-07T04:13:21.537617+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-07T04:13:29.990373+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-07T10:27:05.478588+00:00]** MCP Registry Refresh: 4 reachable, 0 unreachable, 4 snapshots saved
+- **2026-08-07T10:27:07.558359+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-07T10:27:07.649373+00:00**: Ralph Loop - Ended: 4 decisions, 0 plans, Max iterations reached
+- **2026-08-07T10:27:07.844609+00:00**: Ralph Loop - Started (dry_run=True, max_iter=2)
+- **2026-08-07T10:27:07.933244+00:00**: Ralph Loop - Ended: 10 decisions, 0 plans, Max iterations reached
+- **2026-08-07T10:27:08.119858+00:00**: Ralph Loop - Started (dry_run=True, max_iter=1)
+- **2026-08-07T10:27:08.174055+00:00**: Ralph Loop - Ended: 5 decisions, 0 plans, Max iterations reached
+
+**[2026-08-07T10:27:08.542223+00:00]** Remediation task created: Approved plan not found
+
+**[2026-08-07T10:27:13.466412+00:00]** Remediation task created: Approved plan not found

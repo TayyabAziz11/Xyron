@@ -49,6 +49,37 @@ WIN_FAST_INTERVAL = 2.0  # re-query Windows every 2 s
 _PS = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
 
 
+def _safe_put_metrics(q: "asyncio.Queue", msg: dict) -> None:
+    """Non-critical metrics are a "latest snapshot" stream — if a slow
+    consumer hasn't drained the queue, evict the stale entry and put the
+    fresh one instead of ever raising an unhandled QueueFull from inside
+    a call_soon_threadsafe callback (the exact bug: put_nowait() used to
+    be called directly there with no exception handling reachable at the
+    point it actually runs, since call_soon_threadsafe schedules — it
+    doesn't execute synchronously — so a bare try/except around the
+    scheduling call could never catch it)."""
+    try:
+        q.put_nowait(msg)
+        logger.debug("[EVENT_EMIT] queue=metrics depth=%d", q.qsize())
+        return
+    except asyncio.QueueFull:
+        pass
+
+    try:
+        q.get_nowait()  # evict the oldest/stale snapshot — only the latest matters
+        logger.debug("[EVENT_COALESCED] queue=metrics reason=full_evicted_oldest")
+    except asyncio.QueueEmpty:
+        pass
+
+    try:
+        q.put_nowait(msg)
+        logger.info("[QUEUEFULL_PREVENTED] queue=metrics action=evicted_oldest_and_retried")
+    except asyncio.QueueFull:
+        # Consumer is completely stalled — drop this one snapshot rather
+        # than raise. A fresher one will supersede it within ~1s anyway.
+        logger.warning("[EVENT_DROPPED_NONCRITICAL] queue=metrics reason=still_full_after_evict")
+
+
 def _ps(cmd: str, timeout: float = 8.0) -> Optional[str]:
     """Run a PowerShell command; return stdout stripped, or None on error."""
     try:
@@ -578,7 +609,7 @@ class SystemMonitorService:
             msg = {"type": "metrics", "data": snap}
             for q in subs:
                 try:
-                    self._loop.call_soon_threadsafe(q.put_nowait, msg)
+                    self._loop.call_soon_threadsafe(_safe_put_metrics, q, msg)
                 except Exception:
                     pass
 

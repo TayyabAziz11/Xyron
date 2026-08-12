@@ -79,16 +79,25 @@ class OpenAIClient:
     _instance: Optional["OpenAIClient"] = None
     _create_lock = threading.Lock()
 
+    # Maps OpenAI model names → best available local Ollama model
+    _OLLAMA_MODEL_MAP: dict[str, str] = {
+        "gpt-4o":      "mistral:7b",
+        "gpt-4o-mini": "mistral:7b",
+    }
+    _OLLAMA_BASE_URL = "http://localhost:11434/v1"
+
     def __new__(cls) -> "OpenAIClient":
         with cls._create_lock:
             if cls._instance is None:
                 inst = super().__new__(cls)
-                inst._ready   = False
-                inst._client  = None
-                inst._tracker = _HourlyTracker()
-                inst._max_4o  = _DEFAULT_MAX_GPT4O_PER_HOUR
-                inst._max_mini = _DEFAULT_MAX_MINI_PER_HOUR
-                inst._init_lock = threading.Lock()
+                inst._ready            = False
+                inst._client           = None
+                inst._ollama_client    = None  # OpenAI-compat client pointing at Ollama
+                inst._quota_exhausted  = False  # set True on first insufficient_quota → skip retries
+                inst._tracker          = _HourlyTracker()
+                inst._max_4o           = _DEFAULT_MAX_GPT4O_PER_HOUR
+                inst._max_mini         = _DEFAULT_MAX_MINI_PER_HOUR
+                inst._init_lock        = threading.Lock()
                 cls._instance = inst
         return cls._instance
 
@@ -116,10 +125,29 @@ class OpenAIClient:
                                 self._max_4o, self._max_mini)
                 else:
                     logger.warning("[OpenAIClient] No valid API key — offline mode active")
+
+                # Always try to set up a local Ollama client as fallback
+                self._ollama_client = self._init_ollama()
+
             except Exception as exc:
                 logger.warning("[OpenAIClient] Init error: %s", exc)
             finally:
                 self._ready = True
+
+    def _init_ollama(self):
+        """Return an OpenAI-compatible client pointing at local Ollama, or None."""
+        import os
+        base_url = os.getenv("OLLAMA_API_URL", self._OLLAMA_BASE_URL)
+        try:
+            import urllib.request as _ur
+            _ur.urlopen(f"{base_url}/models", timeout=2)  # connectivity check
+            from openai import OpenAI
+            client = OpenAI(base_url=base_url, api_key="ollama")
+            logger.info("[OpenAIClient] Ollama fallback ready at %s", base_url)
+            return client
+        except Exception as exc:
+            logger.debug("[OpenAIClient] Ollama not available: %s", exc)
+            return None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -150,8 +178,9 @@ class OpenAIClient:
         """
         self._ensure_init()
 
-        if not self._client:
-            return None  # offline → caller uses fallback
+        if not self._client or self._quota_exhausted:
+            # No OpenAI key, or quota already confirmed exhausted → go straight to Ollama
+            return self._ollama_fallback(messages, model, max_tokens, temperature)
 
         # ── Rate limit check ──────────────────────────────────────────────────
         if model == "gpt-4o":
@@ -185,8 +214,38 @@ class OpenAIClient:
             return (resp.choices[0].message.content or "").strip()
 
         except Exception as exc:
-            logger.warning("[OpenAIClient] %s request failed: %s", model, exc)
-            return None  # caller uses offline path
+            err_str = str(exc)
+            if "insufficient_quota" in err_str or "429" in err_str:
+                self._quota_exhausted = True
+                logger.warning("[OpenAIClient] quota exhausted — switching permanently to Ollama")
+            else:
+                logger.warning("[OpenAIClient] %s request failed: %s", model, exc)
+            return self._ollama_fallback(messages, model, max_tokens, temperature)
+
+    def _ollama_fallback(
+        self,
+        messages: list[dict],
+        openai_model: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> Optional[str]:
+        """Try local Ollama when OpenAI fails. Returns None if Ollama also unavailable."""
+        if not self._ollama_client:
+            return None
+        local_model = self._OLLAMA_MODEL_MAP.get(openai_model, "mistral:7b")
+        try:
+            resp = self._ollama_client.chat.completions.create(
+                model=local_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            logger.info("[OpenAIClient] Ollama:%s answered (%d chars)", local_model, len(text))
+            return text or None
+        except Exception as exc:
+            logger.warning("[OpenAIClient] Ollama:%s also failed: %s", local_model, exc)
+            return None
 
     def is_available(self) -> bool:
         return self.available
