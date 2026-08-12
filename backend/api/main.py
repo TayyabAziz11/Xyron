@@ -35,6 +35,8 @@ from .routers import auth as auth_router
 from .routers import monitor as monitor_router
 from .routers import agents as agents_router
 from .routers import browser as browser_router
+from .routers import fs_search as fs_search_router
+from .routers import world_state as world_state_router
 
 logger = logging.getLogger(__name__)
 
@@ -176,10 +178,41 @@ async def startup() -> None:
         try:
             from .services.tts_cache_service import tts_cache as _tcc_sure
             _tcc_sure.synthesize_or_cached("Sure.", "nova", 1.0)
+            # Problem 1 fix: also pre-cache the greeting's Layer-3 fallback
+            # ("I'm listening.") for both voices actually exercised by this
+            # app (nova = default, onyx = the other configured session
+            # voice), so the greeting has a guaranteed-available fallback
+            # to fall back to if the personalized greeting's live synth
+            # times out under real-world load — instead of silently skipping.
+            for _fb_voice in ("nova", "onyx"):
+                _tcc_sure.synthesize_or_cached("I'm listening.", _fb_voice, 1.0)
         except Exception:
             pass
 
         _threading.Thread(target=_secondary_boot, daemon=True, name="secondary-boot").start()
+
+    def _await_voice_idle(_l: "logging.Logger") -> None:
+        """
+        Problem 4 fix: this loop used to run unconditionally, so a fresh
+        backend start racing a live wake/manual-start session kept
+        synthesizing dozens of `nova` ACK/conversation-layer phrases on the
+        same Kokoro GPU path the live session needed for its greeting and
+        ack — measured as ACK_SYNTH_MS in the 9-18s range for a live `onyx`
+        session while this loop ground through 40+ phrases untouched by
+        voice_activity. Block before every phrase while a voice session is
+        active; resume once it goes idle.
+        """
+        from api.services.voice_activity import is_active as _va_is_active
+        from api.routers.debug import is_voice_session_connected as _va_session_connected
+
+        def _should_pause() -> bool:
+            return _va_is_active() or _va_session_connected()
+
+        if _should_pause():
+            _l.info("[TTS_CACHE_WARMUP_PAUSED] reason=voice_session")
+            while _should_pause():
+                _threading.Event().wait(0.5)
+            _l.info("[TTS_CACHE_WARMUP_RESUMED]")
 
     def _secondary_boot() -> None:
         """Everything NOT required for the first command — Ollama,
@@ -214,6 +247,23 @@ async def startup() -> None:
             _rs.mark_service("ollama", False)
 
         try:
+            import numpy as _np_rvc, time as _rvct
+            from voice.rvc_engine import rvc_engine as _rvc_w
+            if _rvc_w.is_available():
+                _rvc_t0 = _rvct.monotonic()
+                from voice.rvc_engine import _float_to_wav as _f2wav
+                _dummy_wav = _f2wav(_np_rvc.zeros(4800, dtype=_np_rvc.float32), 24000)
+                _rvc_w.convert(_dummy_wav, preset="calm", emotion_state="CALM")
+                _rvc_w._last_latency_ms = 0.0  # don't let the warmup call itself trip the latency guard
+                _rvc_ms = (_rvct.monotonic() - _rvc_t0) * 1000
+                _l.info("[Warmup] RVC (tier=%s) JIT-warmed in %.0fms — first live utterance won't pay this cost",
+                         _rvc_w.get_tier(), _rvc_ms)
+            else:
+                _l.info("[Warmup] RVC not enabled/available — skipping warmup")
+        except Exception as exc:
+            _l.warning("[Warmup] RVC: %s", exc)
+
+        try:
             from voice.wake_word_service import wake_word_service as _wws
             import time as _wt; _wt.sleep(1)
             _l.info("[Warmup] WakeWordService ready — oww=%s", _wws._oww_ready)
@@ -235,7 +285,9 @@ async def startup() -> None:
                 "Opening F Drive.",
             ]
             _synth_ok = 0
+            _l.info("[TTS_CACHE_BUILD_VOICE] voice=nova")
             for _phrase in _ACK_PHRASES:
+                _await_voice_idle(_l)
                 try:
                     _wav = _tcc.synthesize_or_cached(_phrase, "nova", 1.0)
                     if _wav:
@@ -244,6 +296,33 @@ async def startup() -> None:
                     pass
             _l.info("[Warmup] TTS ACK cache pre-built: %d/%d phrases ready",
                     _synth_ok, len(_ACK_PHRASES))
+
+            # Completion phrases now always speak (per user feedback: silence
+            # on success read as broken) — pre-warm the past-tense versions
+            # too, mirroring _ACK_PHRASES above, so the always-on completion
+            # response is also an instant cache hit instead of a fresh
+            # Kokoro synthesis on every single command.
+            _COMPLETION_PHRASES = [
+                "Done.", "All set.", "Settings is open.", "There's Settings.",
+                "Chrome opened.", "VS Code opened.", "Notepad opened.",
+                "Calculator is open.", "Explorer opened.",
+                "File Explorer opened.", "Spotify opened.", "Discord opened.",
+                "Microsoft Edge opened.", "Firefox opened.", "Terminal opened.",
+                "Task Manager opened.", "Microsoft Store opened.",
+                "E drive is open.", "C drive is open.", "D drive is open.",
+                "F drive is open.",
+            ]
+            _comp_synth_ok = 0
+            for _phrase in _COMPLETION_PHRASES:
+                _await_voice_idle(_l)
+                try:
+                    _wav = _tcc.synthesize_or_cached(_phrase, "nova", 1.0)
+                    if _wav:
+                        _comp_synth_ok += 1
+                except Exception:
+                    pass
+            _l.info("[Warmup] TTS completion cache pre-built: %d/%d phrases ready",
+                    _comp_synth_ok, len(_COMPLETION_PHRASES))
         except Exception as exc:
             _l.warning("[Warmup] TTS ACK cache: %s", exc)
 
@@ -269,6 +348,7 @@ async def startup() -> None:
             ]
             _cl_synth_ok = 0
             for _phrase in _CL_STATIC_PHRASES:
+                _await_voice_idle(_l)
                 try:
                     _wav = _tcc.synthesize_or_cached(_phrase, "nova", 1.0)
                     if _wav:
@@ -342,6 +422,15 @@ async def startup() -> None:
     except Exception as _exc4:
         logger.warning("[CORE_TOOLS] warmup skipped: %s", _exc4)
 
+    # Capture the main event loop so worker-thread tool executors (browser_tools.py)
+    # can safely bridge into browser_workspace's Playwright objects, which are
+    # bound to this specific loop — see main_loop.py's docstring.
+    try:
+        from .services.main_loop import set_main_loop as _set_main_loop
+        _set_main_loop(asyncio.get_event_loop())
+    except Exception as _exc_ml:
+        logger.warning("[MAIN_LOOP] capture skipped: %s", _exc_ml)
+
     # System monitor — start background sampler
     try:
         from .services.system_monitor_service import system_monitor as _sysmon
@@ -357,6 +446,31 @@ async def startup() -> None:
         logger.info("[FS_INDEX] background scan started (ready=%s)", _fsidx.is_ready)
     except Exception as _exc6:
         logger.warning("[FS_INDEX] startup skipped: %s", _exc6)
+
+    # Phase 1 — System Intelligence: real-time filesystem watcher (semantic roots only)
+    try:
+        from .services.fs_watcher import fs_watcher as _fswatch
+        from .services.background_scheduler import scheduler as _sched7, JobPriority as _JP7
+        _sched7.register("fs_watcher_content", _JP7.BACKGROUND_IDLE_ONLY)
+        _fswatch.start()
+        logger.info("[FS_WATCHER] real-time indexing started")
+    except Exception as _exc7:
+        logger.warning("[FS_WATCHER] startup skipped: %s", _exc7)
+
+    # Phase 2 — Perception Engine: supersedes the standalone World State
+    # background-refresh thread from Phase 1.6. world_state.refresh_sensors()
+    # (window/workspace/Explorer) is still called every tick — just as one
+    # step inside the unified perception loop now, alongside the new
+    # browser/desktop/selection observation, instead of a second independent
+    # thread doing an overlapping poll. Must be an asyncio task (not a plain
+    # background thread) because Browser Perception awaits Playwright Page
+    # methods bound to this event loop — see event_dispatcher.py.
+    try:
+        from .services.perception import perception_engine as _perception_boot
+        _perception_boot.start()
+        logger.info("[PERCEPTION_ENGINE] observation loop started")
+    except Exception as _exc8:
+        logger.warning("[PERCEPTION_ENGINE] startup skipped: %s", _exc8)
 
     # Note: the "Sure." TTS pre-cache, readiness gate (set_core_ready), STT
     # warm-up (Whisper fast + accurate), and conversation-engine checks
@@ -409,3 +523,5 @@ app.include_router(auth_router.router, prefix="/api/v1")
 app.include_router(monitor_router.router, prefix="/api/v1")
 app.include_router(agents_router.router)
 app.include_router(browser_router.router)
+app.include_router(fs_search_router.router)
+app.include_router(world_state_router.router)

@@ -191,10 +191,19 @@ async def build_app_index() -> None:
 
 # ── find_app ──────────────────────────────────────────────────────────────────
 
+# Verbs that mean a query is a command sentence, not an app name — if one of
+# these leaked through intent routing (e.g. "install instagram from the
+# store"), it must never be fuzzy-matched against installed apps.
+_COMMAND_VERB_WORDS = frozenset({
+    "install", "download", "get", "setup", "add", "grab", "fetch", "uninstall",
+})
+
+
 def _search_index(query: str) -> tuple[dict[str, str] | None, str]:
     """
     Search _APP_INDEX.  Returns (entry, match_type) or (None, '').
-    Priority: hardcoded → exact → starts_with → contains → fuzzy (cutoff 0.6).
+    Priority: hardcoded → exact → starts_with → contains → fuzzy (cutoff 0.72,
+    guarded against garbage/compound phrases — see below).
     """
     q = query.lower().strip()
 
@@ -216,10 +225,36 @@ def _search_index(query: str) -> tuple[dict[str, str] | None, str]:
         if q in key:
             return entry, "contains"
 
-    # 4. Fuzzy
-    matches = difflib.get_close_matches(q, list(_APP_INDEX.keys()), n=1, cutoff=0.6)
+    # 4. Fuzzy — defense in depth. A garbage/compound phrase (e.g. a full
+    # command sentence like "microsoft store and install instagram" that
+    # leaked through intent routing) must never silently resolve to an
+    # unrelated installed app (this previously launched "Microsoft Visual
+    # Studio Installer" for that exact phrase). Real app names are short and
+    # don't contain command verbs, so skip fuzzy entirely for anything that
+    # looks like a sentence, and require token overlap on anything left.
+    q_words = q.split()
+    if len(q_words) > 3 or any(w in _COMMAND_VERB_WORDS for w in q_words):
+        logger.info("[APP_FINDER_FUZZY_SKIPPED] query=%r reason=sentence_like", query)
+        return None, ""
+
+    matches = difflib.get_close_matches(q, list(_APP_INDEX.keys()), n=1, cutoff=0.72)
     if matches:
-        return _APP_INDEX[matches[0]], "fuzzy"
+        matched_key = matches[0]
+        # Token-overlap guard only applies to multi-word queries (e.g. "vs
+        # code" matching "visual studio code" should share a real word). For
+        # single-word queries this would break legitimate typo correction
+        # ("crome" -> "chrome") since the whole point of fuzzy matching there
+        # is that no token is identical — the ratio/cutoff above is the guard.
+        if len(q_words) > 1:
+            q_tokens = {w for w in q_words if len(w) >= 4}
+            m_tokens = {w for w in matched_key.split() if len(w) >= 4}
+            if q_tokens and not (q_tokens & m_tokens):
+                logger.info(
+                    "[APP_FINDER_FUZZY_REJECTED] query=%r candidate=%r reason=no_token_overlap",
+                    query, matched_key,
+                )
+                return None, ""
+        return _APP_INDEX[matched_key], "fuzzy"
 
     return None, ""
 

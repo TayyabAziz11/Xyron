@@ -170,6 +170,37 @@ class AgentRuntime:
         if context is None:
             context = {}
 
+        # Phase 3 — Planning Engine consumes only the World State Reasoning
+        # Context API, never individual perception modules (per the brief).
+        # Enriching here — the single shared entry point for both direct
+        # single-domain dispatch and every coordinator sub-agent launch —
+        # means agent_planner.py and DelegationPlanner both get it for free
+        # without either needing to know world_state.py exists. Curated to
+        # the fields actually useful for goal resolution ("review this
+        # product", "summarize what changed") rather than the full
+        # snapshot (recent_actions/monitors/etc. would just be prompt
+        # noise for a planner). Placed first in the merged dict so it
+        # survives agent_planner.py's context_str truncation.
+        try:
+            from api.services.world_state import world_state
+            ws_ctx = world_state.get_context()
+            context = {
+                "world_state": {
+                    "current_product": ws_ctx.get("current_product"),
+                    "current_document": ws_ctx.get("current_document"),
+                    "current_file": ws_ctx.get("current_file"),
+                    "current_url": ws_ctx.get("current_url"),
+                    "current_browser": ws_ctx.get("current_browser"),
+                    "current_selection": ws_ctx.get("current_selection"),
+                    "current_project": ws_ctx.get("current_project"),
+                    "current_explorer_folder": ws_ctx.get("current_explorer_folder"),
+                    "current_goal": ws_ctx.get("current_goal"),
+                },
+                **context,
+            }
+        except Exception:
+            logger.debug("[RUNTIME] world state enrichment skipped", exc_info=True)
+
         task_id = str(uuid.uuid4())[:8]  # short ID for readability in logs
         task = AgentTask(
             task_id=task_id,

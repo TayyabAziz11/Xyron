@@ -193,6 +193,19 @@ def _resolve_ordinal(text: str) -> str | None:
             chosen = matches[idx]
             memory_service.clear_disambiguation()
             logger.info("[CTX_ORDINAL] idx=%d → %r", idx, chosen)
+            # Phase 1.5 learning hook — the user just confirmed which of
+            # several candidates they meant for this query text; remember
+            # it so the same request resolves instantly next time (tier 0).
+            # `chosen` is a Windows-style path (matches are stored that way
+            # for speech/display) — normalize to the WSL path fs_index uses.
+            try:
+                from .file_resolver import record_confirmed_choice
+                from .explorer_context import _win_to_wsl_path
+                src_query = dis.get("query", "")
+                if src_query:
+                    record_confirmed_choice(src_query, str(_win_to_wsl_path(chosen)))
+            except Exception:
+                logger.debug("[CTX_ORDINAL] learning hook failed", exc_info=True)
             return chosen
     except Exception:
         pass

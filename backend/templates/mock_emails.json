@@ -1,0 +1,25 @@
+{
+  "emails": [
+    {
+      "id": "mock001a2b3c4d5e6f7g",
+      "from": "alice@example.com",
+      "subject": "Project Update - Q1 Hackathon",
+      "snippet": "Hi team, I wanted to share an update on our Q1 hackathon progress. We've completed the Bronze tier implementation...",
+      "received_at": "2026-02-11T10:30:00Z"
+    },
+    {
+      "id": "mock002h3i4j5k6l7m8n",
+      "from": "bob@company.org",
+      "subject": "Meeting Request: Silver Tier Review",
+      "snippet": "Could we schedule a meeting to review the Silver tier implementation? I have some questions about the MCP governance...",
+      "received_at": "2026-02-11T11:45:00Z"
+    },
+    {
+      "id": "mock003p4q5r6s7t8u9v",
+      "from": "notifications@github.com",
+      "subject": "[GitHub] Pull Request Review Requested",
+      "snippet": "You have been requested to review pull request #42: Add Gmail watcher with OAuth2 authentication...",
+      "received_at": "2026-02-11T14:20:00Z"
+    }
+  ]
+}

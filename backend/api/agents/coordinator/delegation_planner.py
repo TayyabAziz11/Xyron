@@ -76,6 +76,13 @@ _PLAN_SYSTEM = """\
 You are a multi-agent workflow planner for Xyron AI. Given a high-level user goal, \
 produce a structured JSON task graph that specialist agents will execute.
 
+You may be given a "World State" block describing what the user is currently
+looking at (current app, browser page/product, open document, selection).
+Use it to resolve vague references in the goal ("this", "it", "that page")
+— e.g. if the goal is "review this product" and World State shows a
+current_product, the node goal should reference that specific product by
+name rather than staying vague.
+
 Return ONLY valid JSON (no prose, no markdown fences) matching:
 {
   "nodes": [
@@ -85,7 +92,9 @@ Return ONLY valid JSON (no prose, no markdown fences) matching:
       "goal": "<detailed instruction for the agent>",
       "depends_on": [],
       "parallel": false,
-      "approval": false
+      "approval": false,
+      "success_condition": {"field": "<world state field, e.g. current_document>", "op": "changed|not_none|equals|contains", "value": "<only for equals/contains>"},
+      "rollback_goal": "<optional: what to do if this step fails and can't be retried — omit if nothing needs undoing>"
     }
   ]
 }
@@ -99,6 +108,11 @@ Rules:
 - depends_on: list of 0-based indices of prerequisite nodes
 - parallel: true only if this node can run concurrently with siblings
 - approval: true for irreversible actions (purchase, deletion, form submit)
+- success_condition and rollback_goal are both OPTIONAL — omit entirely for
+  steps where "the sub-agent reported success" is already good enough
+  (most steps). Only add success_condition when there's a concrete World
+  State field the step should visibly change. Only add rollback_goal for
+  steps with a real side effect worth undoing (e.g. a created file/folder)
 - Max 7 nodes; keep goals concrete and actionable
 """
 
@@ -152,7 +166,7 @@ class DelegationPlanner:
         graph = None
         try:
             graph = await asyncio.wait_for(
-                self._multi_agent_plan_llm(goal, analysis), timeout=15.0
+                self._multi_agent_plan_llm(goal, analysis, context), timeout=15.0
             )
             logger.info("[DELEGATION_MULTI_AGENT] LLM plan created nodes=%d", len(graph.nodes))
         except Exception as exc:
@@ -189,7 +203,9 @@ class DelegationPlanner:
 
     # ── LLM plan ──────────────────────────────────────────────────────────────
 
-    async def _multi_agent_plan_llm(self, goal: str, analysis: GoalAnalysis) -> TaskGraph:
+    async def _multi_agent_plan_llm(
+        self, goal: str, analysis: GoalAnalysis, context: dict | None = None,
+    ) -> TaskGraph:
         """
         Use gpt-4o-mini to create a rich multi-node task graph.
 
@@ -197,16 +213,27 @@ class DelegationPlanner:
         {
           "nodes": [
             {"title": "...", "agent": "browser|coding|automation|personality|verifier",
-             "goal": "...", "depends_on": [], "parallel": false, "approval": false},
+             "goal": "...", "depends_on": [], "parallel": false, "approval": false,
+             "success_condition": {...}, "rollback_goal": "..."},
             ...
           ]
         }
         """
         from api.services.openai_client import openai_client  # noqa: PLC0415
 
+        user_content = f"Goal: {goal}"
+        ws_ctx = (context or {}).get("world_state")
+        if ws_ctx:
+            try:
+                relevant = {k: v for k, v in ws_ctx.items() if v}  # drop empty/None noise
+                if relevant:
+                    user_content += "\n\nWorld State:\n" + json.dumps(relevant, indent=2, default=str)[:600]
+            except (TypeError, ValueError):
+                pass
+
         messages = [
             {"role": "system", "content": _PLAN_SYSTEM},
-            {"role": "user",   "content": f"Goal: {goal}"},
+            {"role": "user",   "content": user_content},
         ]
         raw = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -226,6 +253,13 @@ class DelegationPlanner:
         # First pass: create all nodes, collect node_ids in order
         node_ids: list[str] = []
         for raw in raw_nodes:
+            success_condition = raw.get("success_condition")
+            if not isinstance(success_condition, dict) or not success_condition.get("field"):
+                success_condition = None  # tolerate a malformed/hallucinated shape — never crash the plan
+            rollback_goal = raw.get("rollback_goal")
+            if not isinstance(rollback_goal, str) or not rollback_goal.strip():
+                rollback_goal = None
+
             node = graph.add_node(
                 title=str(raw.get("title", "Step")),
                 agent_type=self._agent_type_from_str(str(raw.get("agent", "automation"))),
@@ -234,6 +268,8 @@ class DelegationPlanner:
                 can_run_parallel=bool(raw.get("parallel", False)),
                 requires_approval=bool(raw.get("approval", False)),
                 max_retries=1,
+                success_condition=success_condition,
+                rollback_goal=rollback_goal,
             )
             node_ids.append(node.node_id)
 

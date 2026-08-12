@@ -39,14 +39,17 @@ MAX_STACK = 50
 # store_app    — app searched/viewed in Microsoft Store
 # installed_app— app successfully installed
 # search_query — web or YouTube search
-# media        — media file played
+# media        — local media file played
+# web_video    — a specific YouTube (or other site) video actually playing,
+#                as opposed to just a search query — see search_youtube's
+#                autoplay path and play_youtube_video
 # window       — active window from screen agent (no tool trigger)
 # repository   — GitHub repo seen via screen/browser perception (Part 10)
 
 ENTITY_TYPES = frozenset({
     "app", "folder", "file", "url", "drive",
     "store_app", "installed_app", "search_query", "media", "window",
-    "repository",
+    "repository", "web_video", "product",
 })
 
 # Maps tool names → entity type(s) they produce
@@ -58,7 +61,8 @@ _TOOL_ENTITY_MAP: dict[str, str] = {
     "write_file":             "file",
     "open_url":               "url",
     "search_web":             "search_query",
-    "search_youtube":         "search_query",
+    "search_youtube":         "search_query",   # may be overridden to web_video — see _make_entity
+    "play_youtube_video":     "web_video",
     "play_media_file":        "media",
     "install_store_app":      "store_app",
     "open_store_app_page":    "store_app",
@@ -79,7 +83,7 @@ _VERB_ENTITY_PREF: dict[str, list[str]] = {
     "delete":   ["file", "folder"],
     "move":     ["file", "folder"],
     "copy":     ["file", "folder"],
-    "play":     ["media", "search_query"],
+    "play":     ["media", "search_query", "web_video"],
     "search":   ["search_query"],
     "navigate": ["folder", "url"],
     "go":       ["folder", "url"],
@@ -173,7 +177,19 @@ class ContextStack:
                     value=f"{repo.get('owner')}/{repo.get('name')}",
                     display=repo.get("name") or "repository",
                     source="screen_agent",
-                    metadata={"from_screen": True, **repo},
+                    # "offer" records what describe() just offered out loud
+                    # (Part 9/10) so a later bare "yes" can be resolved
+                    # without a separate pending-offer state system.
+                    metadata={"from_screen": True, "offer": ["review"], **repo},
+                )
+            elif getattr(snap, "is_browser", False) and getattr(snap, "product", None):
+                product = snap.product
+                entity = ContextEntity(
+                    type="product",
+                    value=product.get("name") or snap.browser_title or "product",
+                    display=product.get("name") or snap.browser_title or "this product",
+                    source="screen_agent",
+                    metadata={"from_screen": True, "offer": ["cheaper", "compare"], **product},
                 )
             elif snap.is_store and snap.store_page:
                 entity = ContextEntity(
@@ -339,6 +355,20 @@ class ContextStack:
                     params.get("name") or "").strip()
             if not name:
                 return None
+            # Live-measured compounding bug: a garbled STT app_name (e.g.
+            # "youtube. open") pushed here got fuzzy-matched by
+            # entity_corrector on a LATER turn as the "best" candidate for
+            # an unrelated garbled transcript, reinforcing the corruption
+            # instead of ever recovering. Never let a leaked sentence
+            # fragment become a future fuzzy-match candidate — same guard
+            # system_tools.py's _launch_app uses to refuse launching one.
+            try:
+                from api.tools.system_tools import is_garbled_app_name
+                if is_garbled_app_name(name):
+                    logger.debug("[CTXSTACK_PUSH_SKIPPED] reason=garbled_app_name name=%r", name)
+                    return None
+            except Exception:
+                pass
             return ContextEntity(
                 type="app", value=name.lower(), display=name, source=tool_name,
                 metadata={"pid": result_data.get("pid")},
@@ -432,8 +462,30 @@ class ContextStack:
             query = (params.get("query") or params.get("q") or "").strip()
             if not query:
                 return None
+            # search_youtube may have autoplayed a specific video rather than
+            # just leaving a search page open — if so, track the actual
+            # video (web_video) instead of the search term, so "pause it" /
+            # "play it again" resolve to what's really playing, not a re-search.
+            played_url = (result_data.get("url") or "").strip()
+            if tool_name == "search_youtube" and result_data.get("autoplayed") and played_url:
+                title = (result_data.get("title") or query).strip()
+                return ContextEntity(
+                    type="web_video", value=played_url, display=title, source=tool_name,
+                    metadata={"url": played_url, "source_query": query},
+                )
             return ContextEntity(
                 type="search_query", value=query.lower(), display=query, source=tool_name,
+            )
+
+        # ── web_video ─────────────────────────────────────────────────────────
+        if entity_type == "web_video":
+            url = (params.get("url") or result_data.get("url") or "").strip()
+            if not url:
+                return None
+            title = (params.get("title") or result_data.get("title") or url).strip()
+            return ContextEntity(
+                type="web_video", value=url, display=title, source=tool_name,
+                metadata={"url": url},
             )
 
         # ── media ─────────────────────────────────────────────────────────────

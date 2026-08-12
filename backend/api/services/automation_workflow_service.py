@@ -164,9 +164,49 @@ class AutomationWorkflowService:
             if delay:
                 time.sleep(delay)
 
+            # Capture {project} after an open_app step. Live-measured that
+            # window-title sniffing here is unreliable: open_app launches
+            # VS Code bare (no folder argument), so its title reads generic
+            # "Welcome - Visual Studio Code" — which _resolve_folder_name
+            # then fuzzy-matched to an unrelated folder named "Welcome"
+            # somewhere on disk. Use the backend's own repo_root instead —
+            # deterministic, no timing dependency, and always correct for
+            # what Xyron itself is actually running against.
+            if action == "open_app" and result.get("success", True) and "project" not in variables:
+                try:
+                    from api.config import settings as _settings_wf
+                    variables["project"] = _settings_wf.repo_root.name
+                except Exception:
+                    pass
+
         completion = workflow.get("completion_message", f"Done. {wf_name} completed.")
+
+        # Context-aware completion (user feedback: completion speech should
+        # reference what's actually being worked on — "VS Code and GitHub
+        # are open, what are we building?" — not just "opened X"). {project}
+        # was already captured in the loop above right after the open_app
+        # step (before a later step could steal focus, e.g. work_mode's
+        # browser open) — reusing it here rather than re-querying the
+        # foreground window now, which would read the WRONG app.
+        if "{project}" in completion:
+            completion = completion.replace("{project}", variables.get("project", "your project"))
+
         logger.info("[WORKFLOW] '%s' completed (%d steps)", wf_name, len(steps))
         return {"success": True, "spoken": completion, "text": completion, "completed_steps": len(steps)}
+
+    @staticmethod
+    def _open_url_native(url: str) -> dict:
+        """Open a URL in the user's real default Windows browser — never the
+        Playwright automation browser. Delegates to the shared native-launch
+        helper in system_tools.py (same mechanism as open_system_settings)
+        so this isn't a second implementation of the same launch logic."""
+        if not url:
+            return {"success": False, "spoken": "No URL to open."}
+        from api.tools.system_tools import open_url_native
+        if not open_url_native(url):
+            return {"success": False, "spoken": "Couldn't open that page."}
+        label = url.replace("https://", "").replace("http://", "").split("/")[0]
+        return {"success": True, "spoken": f"Opened {label}."}
 
     def _execute_step(self, action: str, step: dict, variables: dict, ctx: dict) -> dict:
         from api.tools import registry as tool_registry
@@ -184,21 +224,35 @@ class AutomationWorkflowService:
         elif action == "browser.fill":
             r = tool_registry.execute("browser_fill", {"selector": params.get("selector", ""), "label": params.get("label", ""), "value": params.get("value", "")}, ctx)
         elif action in ("browser.press", "browser.type"):
+            # Reuses browser_workspace (the real, shared, CDP-controlled
+            # browser) via the same main-loop bridge browser_tools.py uses —
+            # _ensure_browser() no longer exists; it was a separate,
+            # throwaway Playwright Chromium instance disconnected from every
+            # other browser-aware part of this codebase.
             try:
-                from api.tools.browser_tools import _ensure_browser
-                page = _ensure_browser()
-                if action == "browser.press":
-                    page.keyboard.press(params.get("key", "Enter"))
-                else:
-                    page.keyboard.type(params.get("text", ""), delay=50)
+                from api.agents.browser_agent.browser_workspace import browser_workspace
+                from api.services.main_loop import run_coro_from_thread
+                page = run_coro_from_thread(browser_workspace.get_or_create_page(), timeout=30.0)
+
+                async def _do():
+                    if action == "browser.press":
+                        await page.keyboard.press(params.get("key", "Enter"))
+                    else:
+                        await page.keyboard.type(params.get("text", ""), delay=50)
+
+                run_coro_from_thread(_do(), timeout=12.0)
                 return {"success": True, "spoken": ""}
             except Exception as exc:
                 return {"success": False, "spoken": str(exc)}
         elif action == "browser.wait":
             try:
-                from api.tools.browser_tools import _ensure_browser
-                page = _ensure_browser()
-                page.wait_for_selector(params.get("selector", "body"), timeout=int(params.get("timeout", 8000)))
+                from api.agents.browser_agent.browser_workspace import browser_workspace
+                from api.services.main_loop import run_coro_from_thread
+                page = run_coro_from_thread(browser_workspace.get_or_create_page(), timeout=30.0)
+                run_coro_from_thread(
+                    page.wait_for_selector(params.get("selector", "body"), timeout=int(params.get("timeout", 8000))),
+                    timeout=12.0,
+                )
                 return {"success": True, "spoken": ""}
             except Exception as exc:
                 return {"success": False, "spoken": str(exc)}
@@ -206,6 +260,17 @@ class AutomationWorkflowService:
             r = tool_registry.execute("browser_screenshot", {}, ctx)
         elif action == "browser.close":
             r = tool_registry.execute("browser_close", {}, ctx)
+        elif action == "desktop.open_url":
+            # Distinct from browser.goto: that drives the Playwright
+            # automation browser (headless=False Chromium on the Linux/WSL2
+            # side — via WSLg this shows as a separate "Linux browser"
+            # window, not the user's real Windows Chrome). browser.goto is
+            # right when a later step needs to click/fill something in that
+            # page; desktop.open_url is for "open this so the user can see
+            # it in their actual browser" — same native `start` mechanism
+            # open_system_settings already uses for ms-settings: URIs, which
+            # opens in the user's real default Windows browser.
+            return self._open_url_native(params.get("url", ""))
         elif action == "desktop.type":
             r = tool_registry.execute("desktop_type", {"text": params.get("text", "")}, ctx)
         elif action == "desktop.hotkey":

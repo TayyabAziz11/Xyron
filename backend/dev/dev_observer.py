@@ -135,6 +135,10 @@ async def observer_loop() -> None:
                 _LOOP_INTERVAL, _INSIGHT_INTERVAL)
     while True:
         try:
+            from api.services.background_scheduler import scheduler as _sched
+            if not _sched.should_run("dev_observer"):
+                await asyncio.sleep(_LOOP_INTERVAL)
+                continue
             from api.services.cognitive_state import cognitive_state as cs
             if cs.code_mode:
                 insight = await _maybe_insight()

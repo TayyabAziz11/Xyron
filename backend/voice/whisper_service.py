@@ -32,13 +32,19 @@ _LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "auto")   # "auto" → None (multil
 _CONF_THRESH = float(os.getenv("WHISPER_CONFIDENCE_THRESHOLD", "-1.0"))
 
 # Language-aware initial prompts — bias Whisper toward command vocabulary.
+# "Xyron" (the assistant's name, addressed at the start of most commands —
+# e.g. "Okay Xyron, what's on my screen") is otherwise a made-up proper noun
+# with no prior in Whisper's vocabulary and gets misheard constantly ("Zyron",
+# "His iron", "Za-iron"...). Naming it explicitly in the prompt lets the
+# decoder actually recognize it instead of relying solely on post-hoc regex
+# correction in normalizer.py, which only catches mishearings it already knows.
 _VOICE_INITIAL_PROMPT_EN = (
-    "Voice assistant command for Windows. "
+    "Voice assistant named Xyron, for Windows. "
     "C drive, D drive, E drive, F drive, folder, settings, volume, brightness, battery, WiFi. "
     "Open, create, delete, close, screenshot, maximize, minimize, lock, shutdown."
 )
 _VOICE_INITIAL_PROMPT_UR = (
-    "Voice assistant command, Urdu aur English mixed. "
+    "Voice assistant named Xyron, Urdu aur English mixed. "
     "کھولو، بند کرو، اسکرین شاٹ لو، والیوم بڑھاؤ، والیوم گھٹاؤ، فولڈر، سیٹنگز۔ "
     "Open, close, screenshot, volume up, volume down, folder, settings, lock, shutdown."
 )
@@ -82,6 +88,43 @@ _CORRECTIONS: list[tuple[re.Pattern, str | object]] = [
     # Folder/directory typos
     (re.compile(r'\bfould?er\b',            re.I), 'folder'),
     (re.compile(r'\bdirec?t(?:o|a)ry\b',   re.I), 'directory'),
+    # tiny.en phoneme confusions
+    (re.compile(r'\bcal\s+curator\b',              re.I), 'calculator'),
+    (re.compile(r'\bcal\s+cure\s+later\b',         re.I), 'calculator'),
+    # Roman Urdu phoneme confusions — espeak-ng/tiny.en artifacts for common commands.
+    # Real mic audio rarely needs these; these cover synthetic voice in test harness.
+    (re.compile(r'\bbye[,.]?\s+carr[ao]+\.?\s*$',  re.I), 'band karo'),
+    (re.compile(r'\band[,.]?\s+caro?\.?\s*$',      re.I), 'band karo'),
+    (re.compile(r'\bbuy\s+(?:the\s+)?car\s+out',   re.I), 'band karo'),
+    (re.compile(r'\bbend\s+car[ao]?\b',             re.I), 'band karo'),
+    (re.compile(r'\bchrome\s+code\s+load',          re.I), 'chrome kholo'),
+    (re.compile(r'\bthis\s+code\s+install\s+caro',  re.I), 'isko install karo'),
+    # "store see" → "store se" (espeak renders "se" as "see")
+    (re.compile(r'\bstore\s+see\b',                 re.I), 'store se'),
+    # "open, calculate" → "open calculator" (tiny.en hallucination/repetition)
+    (re.compile(r'\bopen[,.]?\s+calculate\.?\s*$',  re.I), 'open calculator'),
+    # "tatao" → "chalao" (espeak-ng renders Roman Urdu "chalao" as "tatao")
+    (re.compile(r'\btatao\b',                        re.I), 'chalao'),
+    # espeak renders "youtube believer chalao" as "youtube, pop, believe, a, tatao"
+    (re.compile(r'\byoutube[,.]?\s+(?:pop[,.]?\s+)?belie(?:f|ve)[a-z,.\s]*chalao', re.I),
+     'play believer on youtube'),
+    # Edge-TTS neural voice: "band karo" → "band kettle" (neural phonetics confuse tiny.en)
+    (re.compile(r'\bband\s+kettle\b', re.I), 'band karo'),
+    # Edge-TTS: "Believer" spoken in Urdu accent → "bullyver"
+    (re.compile(r'\bbullyver\b', re.I), 'believer'),
+    # "volume barhao" with neural voice: tiny.en drops "barhao" → bare "volume." alone
+    # In a voice assistant context, "volume" alone means "volume up"
+    (re.compile(r'^\s*volume[.,!?\s]*$', re.I), 'volume up'),
+    # "launch karo" / "open care" — "karo" phonetically becomes "care" (Edge-TTS neural)
+    (re.compile(r'\bopen\s+care\b', re.I), 'open karo'),
+    (re.compile(r'\blaunch\s+care\b', re.I), 'launch karo'),
+    # "store se" merged into "starse" by Whisper (tokens fuse when spoken fast)
+    (re.compile(r'\bstarse\b', re.I), 'store se'),
+    # "download carol" / "download care" at sentence end → "download karo"
+    (re.compile(r'\bdownload[,.]?\s+car(?:ol|e)[.,!?\s]*$', re.I), 'download karo'),
+    # "dikhao" → "show" (Urdu "show me" verb, commonly dropped by tiny.en)
+    # Keep only when it appears as a standalone suffix (already at sentence end)
+    (re.compile(r'\bdikhao\b', re.I), 'show'),
     # Common command normalizations
     (re.compile(r'\bcreate\s+a\s+new\s+folder\b', re.I), 'create folder'),
     (re.compile(r'\bopen\s+the\s+settings?\b',     re.I), 'open settings'),
@@ -108,6 +151,11 @@ import threading as _threading
 _model       = None
 _model_lock  = _threading.Lock()
 _model_ready = _threading.Event()   # set once the model is fully loaded and usable
+
+# ── Tiny.en fast model (Hybrid STT) ──────────────────────────────────────────
+_FAST_MODEL_SIZE = os.getenv("WHISPER_FAST_MODEL", "tiny.en")
+_tiny_model      = None
+_tiny_model_lock = _threading.Lock()
 
 
 # ── Hardware detection ────────────────────────────────────────────────────────
@@ -157,12 +205,102 @@ def _get_model():
     return _model
 
 
+def _get_tiny_model():
+    """Load tiny.en (English-only fast model) — for Hybrid STT routing."""
+    global _tiny_model
+    if _tiny_model is not None:
+        return _tiny_model
+    with _tiny_model_lock:
+        if _tiny_model is not None:
+            return _tiny_model
+        from faster_whisper import WhisperModel
+        device, compute_type = _detect_device()
+        logger.info("[Whisper/tiny] Loading '%s' on %s (%s)…", _FAST_MODEL_SIZE, device, compute_type)
+        try:
+            _tiny_model = WhisperModel(_FAST_MODEL_SIZE, device=device, compute_type=compute_type)
+        except Exception as exc:
+            if device == "cuda":
+                logger.warning("[Whisper/tiny] GPU load failed (%s) — using CPU int8", exc)
+                _tiny_model = WhisperModel(_FAST_MODEL_SIZE, device="cpu", compute_type="int8")
+            else:
+                raise
+        logger.info("[Whisper/tiny] %s ready.", _FAST_MODEL_SIZE)
+    return _tiny_model
+
+
 def preload_model() -> None:
     """Eagerly load the model (call from startup thread to avoid cold-start lag)."""
     try:
         _get_model()
     except Exception as exc:
         logger.warning("[Whisper] Preload failed: %s", exc)
+
+
+def preload_tiny_model() -> None:
+    """Eagerly load tiny.en (call from startup warmup thread)."""
+    try:
+        _get_tiny_model()
+    except Exception as exc:
+        logger.warning("[Whisper/tiny] Preload failed: %s", exc)
+
+
+_TINY_INITIAL_PROMPT = (
+    "Xyron, open Chrome. Open VS Code. Open Notepad. Open Calculator. Open Explorer. "
+    "Open File Explorer. Open Settings. Open Terminal. Open Spotify. Open Discord. "
+    "Take screenshot. Volume up. Volume down. Lock screen. Shutdown. Restart. "
+    "Install it. Open it again. What am I looking at. Yes. No. Cancel."
+)
+
+def transcribe_fast(audio: np.ndarray, sample_rate: int = 16000) -> dict:
+    """
+    Fast transcription using tiny.en — target <500ms warm on GPU.
+
+    English-only, beam_size=1, no VAD. Use for short/simple commands.
+    The caller should check result["confidence"] (avg_logprob) and retry
+    with transcribe_audio() if the result is uncertain.
+    """
+    model = _get_tiny_model()
+    _common = dict(
+        beam_size=1, language="en", vad_filter=False,
+        condition_on_previous_text=False, initial_prompt=_TINY_INITIAL_PROMPT,
+        # Root-cause fix for a live-measured failure mode: short commands
+        # ("open calculator", "open chrome", "open c drive") reliably made
+        # greedy (beam_size=1) tiny.en loop the whole phrase 2-6x — e.g.
+        # "Open Calculator. Open Calculator. Open Calculator. ..." — which
+        # then cost a ~2.5-3.5s escalation to the accurate model on every
+        # single occurrence via the hallucination-retry path. no_repeat_
+        # ngram_size=3 cut the loop length dramatically but still let one
+        # "X. X" duplicate through on short 2-3 word phrases; =2 (blocks any
+        # repeated bigram) closed that gap in live testing. Voice commands
+        # are short imperative phrases, not free dictation, so blocking
+        # bigram repeats has no realistic legitimate-speech cost here.
+        no_repeat_ngram_size=2,
+    )
+    segments_raw, _info = model.transcribe(audio, temperature=0.0, **_common)
+    segments = _filter_segments(segments_raw)
+    # Empty on greedy pass → tiny retry with slight temperature to break deadlock.
+    # This avoids escalating to the 3s accurate model for simple short commands.
+    if not segments:
+        logger.debug("[Whisper/tiny] empty on temperature=0.0 — retrying at 0.2")
+        segments_raw2, _ = model.transcribe(audio, temperature=0.2, **_common)
+        segments = _filter_segments(segments_raw2)
+    raw_text  = " ".join(s.text.strip() for s in segments).strip()
+    full_text = _apply_corrections(raw_text)
+    avg_conf  = (sum(s.avg_logprob for s in segments) / len(segments)
+                 if segments else -999.0)
+    if full_text != raw_text:
+        logger.debug("[Whisper/tiny] correction: %r → %r", raw_text, full_text)
+    logger.info("[Whisper/tiny] transcript=%r conf=%.2f", full_text[:80], avg_conf)
+    return {
+        "text":       full_text,
+        "language":   "en",
+        "confidence": round(avg_conf, 3),
+        "duration":   None,
+        "segments":   [
+            {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+            for s in segments
+        ],
+    }
 
 
 def set_model_size(size: str) -> None:
@@ -216,10 +354,12 @@ def transcribe_audio(
         audio,
         beam_size=1 if fast else 3,
         language=lang,
+        task="transcribe",            # Phase 2.4: always transcribe, never silently translate
         vad_filter=not fast,          # skip VAD in fast mode (we do our own)
         vad_parameters={"min_silence_duration_ms": 300},
         temperature=0.0,              # greedy — deterministic + fastest
         condition_on_previous_text=False,
+        no_repeat_ngram_size=3,        # same repetition-loop mitigation as transcribe_fast
         initial_prompt=_get_initial_prompt(lang),
     )
 

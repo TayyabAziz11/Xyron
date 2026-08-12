@@ -67,6 +67,16 @@ _FILESYSTEM_NAV_TOOLS = frozenset({
 })
 
 
+def _resolve_web_app_url(app_name: str) -> Optional[str]:
+    """Best-effort, exception-safe wrapper — this runs on the hot
+    update_from_tool path and must never raise or block on import errors."""
+    try:
+        from api.tools.system_tools import resolve_web_app_url
+        return resolve_web_app_url(app_name)
+    except Exception:
+        return None
+
+
 def _infer_platform(tool_name: str, params: dict, result_data: dict) -> Optional[str]:
     """Infer the active platform from a successful tool execution."""
     app = (params.get("app_name") or params.get("app") or
@@ -171,7 +181,41 @@ class ActiveContextService:
                 if any(s in _app_low for s in ("microsoft store", "windowsstore", "winstore", "store")):
                     self._ctx["current_platform"] = "microsoft_store"
                     self._ctx["current_goal"]     = "app_installation"
+                    self._ctx["current_url"]      = None
                     logger.info("[ACTIVE_CONTEXT_UPDATE] platform=microsoft_store app=%s", app_name)
+                # YouTube detection — root-cause fix for "open youtube" then
+                # "play X" never resolving as a follow-up. intent_router
+                # always routes a bare "open youtube" through
+                # open_application (app_name="youtube"), never through
+                # search_youtube — but current_platform was previously only
+                # ever set to "youtube" by the search_youtube tool itself,
+                # so a bare "open youtube" left current_platform unset and
+                # follow_up_resolver_v2's fast platform-context path (which
+                # requires platform in {microsoft_store, youtube, explorer})
+                # never engaged for exactly this sequence.
+                elif "youtube" in _app_low:
+                    self._ctx["current_platform"] = "youtube"
+                    self._ctx["current_goal"]     = "media_search"
+                    self._ctx["current_url"]      = _resolve_web_app_url(app_name)
+                    logger.info("[ACTIVE_CONTEXT_UPDATE] platform=youtube app=%s", app_name)
+                else:
+                    # current_url was declared in the initial context dict
+                    # but never actually written anywhere. Needed so a
+                    # later web-interaction follow-up ("click sign in")
+                    # can tell the automation-browser fallback flow what
+                    # page to transfer into. Any OTHER web-shortcut app
+                    # (github, gmail, etc.) unconditionally refreshes
+                    # current_platform to "web" or clears it to None for a
+                    # non-web app — never left stale from an earlier turn's
+                    # different platform (e.g. still "youtube" after
+                    # opening github), which is exactly the kind of bug
+                    # _FILESYSTEM_NAV_TOOLS's comment above already
+                    # documents for the drive/folder case.
+                    _web_url = _resolve_web_app_url(app_name)
+                    self._ctx["current_url"]      = _web_url
+                    self._ctx["current_platform"] = "web" if _web_url else None
+                    if _web_url:
+                        logger.info("[ACTIVE_CONTEXT_UPDATE] url=%s app=%s platform=web", _web_url, app_name)
 
             # Drive opened — previously not handled at all (open_drive was
             # missing from _GOAL_FROM_TOOL), which is exactly why stale
@@ -217,6 +261,22 @@ class ActiveContextService:
                 query = params.get("query") or ""
                 self._ctx["current_entity"]   = query
                 self._ctx["last_action"]      = f"searched youtube for {query}"
+                _yt_url = result_data.get("url")
+                if _yt_url:
+                    self._ctx["current_url"] = _yt_url
+
+            # Generic website open — records current_url the same way as
+            # the open_application web-shortcut branch above, for sites not
+            # in the app-name shortcut table (open_url's own _URL_MAP).
+            if tool_name == "open_url":
+                _ou_url = result_data.get("url") or params.get("url")
+                if _ou_url:
+                    self._ctx["current_url"]      = _ou_url
+                    # Unconditional refresh — see the open_application "web"
+                    # branch above for why this must never be left stale
+                    # from an earlier turn's platform.
+                    self._ctx["current_platform"] = "youtube" if "youtube" in _ou_url else "web"
+                    self._ctx["last_action"]      = f"opened {_ou_url}"
 
             # Store PDP navigation / install tracking
             if tool_name in ("install_store_app", "open_store_app_page", "install_store_app_exec"):
