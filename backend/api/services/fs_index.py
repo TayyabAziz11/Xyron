@@ -118,6 +118,62 @@ PRUNE_DIRS = {
     "System Volume Information",
 }
 
+# ---------------------------------------------------------------------------
+# Semantic content roots (Phase 1 — System Intelligence)
+#
+# Content extraction + embeddings are expensive (parse + GPU encode), so we
+# scope them to folders that actually hold user work instead of every file
+# on every drive. Plain filename indexing above still covers the whole disk.
+# ---------------------------------------------------------------------------
+
+_CONTENT_FOLDER_NAMES = {
+    "desktop", "documents", "downloads", "pictures", "videos", "music",
+    "onedrive", "google drive",
+}
+
+
+def _discover_semantic_roots() -> List[Path]:
+    """User-content folders under every scan root's home-equivalent dir."""
+    roots: List[Path] = []
+    candidates = [Path.home()]
+    win_home = _detect_win_user_home()
+    if win_home:
+        candidates.append(win_home)
+    for home in candidates:
+        try:
+            for child in home.iterdir():
+                if child.is_dir() and child.name.lower() in _CONTENT_FOLDER_NAMES:
+                    roots.append(child)
+        except OSError:
+            continue
+    # Xyron's own repo is the active dev workspace — always content-worthy.
+    try:
+        from api.config import settings as _settings
+        if _settings.repo_root.is_dir():
+            roots.append(_settings.repo_root)
+    except Exception:
+        pass
+    return roots
+
+
+SEMANTIC_ROOTS: List[Path] = _discover_semantic_roots()
+
+
+def is_content_worthy(path: Path) -> bool:
+    """True if *path* sits under a semantic root or inside a git repo/VS Code workspace."""
+    try:
+        for root in SEMANTIC_ROOTS:
+            if path == root or root in path.parents:
+                return True
+        # Any ancestor containing a .git dir marks the subtree as a project.
+        for parent in path.parents:
+            if (parent / ".git").is_dir():
+                return True
+    except OSError:
+        pass
+    return False
+
+
 REBUILD_INTERVAL_SECONDS = 6 * 3600  # 6 hours
 STARTUP_DELAY_SECONDS = 5            # wait before first build on startup
 
@@ -141,12 +197,48 @@ _MIGRATIONS = [
     "ALTER TABLE entries ADD COLUMN lowercase_name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE entries ADD COLUMN modified_time  REAL NOT NULL DEFAULT 0",
     "ALTER TABLE entries ADD COLUMN accessible     INTEGER NOT NULL DEFAULT 1",
+    # Phase 1 — semantic filesystem intelligence
+    "ALTER TABLE entries ADD COLUMN content_hash   TEXT    NOT NULL DEFAULT ''",
+    "ALTER TABLE entries ADD COLUMN keywords       TEXT    NOT NULL DEFAULT ''",
+    "ALTER TABLE entries ADD COLUMN has_content    INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE entries ADD COLUMN last_opened    REAL    NOT NULL DEFAULT 0",
+    "ALTER TABLE entries ADD COLUMN open_count     INTEGER NOT NULL DEFAULT 0",
 ]
 
 # Index DDL — created AFTER migrations so all columns definitely exist.
 _INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_entries_lowercase_name ON entries (lowercase_name);
 CREATE INDEX IF NOT EXISTS idx_entries_drive         ON entries (drive);
+CREATE INDEX IF NOT EXISTS idx_entries_has_content   ON entries (has_content);
+CREATE INDEX IF NOT EXISTS idx_entries_last_opened   ON entries (last_opened);
+CREATE INDEX IF NOT EXISTS idx_entries_open_count    ON entries (open_count);
+"""
+
+# Phase 1.5 — Context-Aware Filesystem: usage learning tables.
+# open_events feeds time-of-day/weekday/folder/app/project affinity scoring.
+# learned_resolutions is the "tier 0" — an exact (query -> path) pairing the
+# user has repeatedly confirmed, promoted above every context tier.
+_AUX_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS open_events (
+    id             INTEGER PRIMARY KEY,
+    entry_id       INTEGER NOT NULL,
+    ts             REAL    NOT NULL,
+    hour           INTEGER NOT NULL,
+    weekday        INTEGER NOT NULL,
+    active_app     TEXT    NOT NULL DEFAULT '',
+    active_folder  TEXT    NOT NULL DEFAULT '',
+    active_project TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_open_events_entry ON open_events (entry_id);
+CREATE INDEX IF NOT EXISTS idx_open_events_ts    ON open_events (ts);
+
+CREATE TABLE IF NOT EXISTS learned_resolutions (
+    query_norm  TEXT    NOT NULL,
+    path        TEXT    NOT NULL,
+    hits        INTEGER NOT NULL DEFAULT 1,
+    last_used   REAL    NOT NULL,
+    PRIMARY KEY (query_norm, path)
+);
 """
 
 # Legacy alias so existing callers that reference DDL still work.
@@ -195,6 +287,19 @@ def _drive_for(path: Path) -> str:
     if len(parts) >= 3 and parts[0] == "/" and parts[1] == "mnt":
         return f"/{parts[1]}/{parts[2]}"
     return parts[0] if parts else "/"
+
+
+def _quick_hash(path: Path) -> Optional[str]:
+    """
+    Cheap change-detection fingerprint (size:mtime) — avoids re-reading and
+    re-embedding file content that hasn't changed since the last pass.
+    Not cryptographic; only used to short-circuit unnecessary re-extraction.
+    """
+    try:
+        st = path.stat()
+        return f"{st.st_size}:{st.st_mtime}"
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +536,8 @@ class FSIndex:
                 pass
         # 3. Create indexes that depend on new columns (now guaranteed to exist).
         conn.executescript(_INDEX_DDL)
+        # 4. Phase 1.5 usage-learning tables (independent of the migrations above).
+        conn.executescript(_AUX_TABLE_DDL)
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -452,6 +559,31 @@ class FSIndex:
         time.sleep(STARTUP_DELAY_SECONDS)
 
         while True:
+            try:
+                from api.services.background_scheduler import scheduler as _sched
+                # wait_for_idle_window only blocks for `timeout` seconds and its
+                # return value was previously ignored — a rebuild would fire even
+                # while a voice session was actively mid-conversation (observed
+                # live: full C:/E: rebuild kicked off mid-turn, correlated with a
+                # 200%+ CPU event-loop-blocker and a stalled STT stage). Keep
+                # re-polling for a real idle window instead of forcing through,
+                # with a generous cap so the 6h rebuild cadence can't stall forever.
+                _waited_s = 0.0
+                _max_wait_s = 1800.0  # 30 min safety valve
+                while not _sched.wait_for_idle_window(timeout=120.0):
+                    _waited_s += 120.0
+                    if _waited_s >= _max_wait_s:
+                        logger.warning(
+                            "[FS_INDEX] idle window never opened after %.0fs — "
+                            "proceeding with rebuild anyway", _waited_s,
+                        )
+                        break
+                    logger.info(
+                        "[FS_INDEX] still waiting for idle window (voice active) — "
+                        "waited=%.0fs", _waited_s,
+                    )
+            except Exception:
+                pass
             try:
                 self._rebuild()
             except Exception as exc:  # noqa: BLE001
@@ -502,6 +634,455 @@ class FSIndex:
 
         total_elapsed = time.monotonic() - start
         logger.info("[FS_INDEX] ready entries=%d total_elapsed=%.1fs", len(rows), total_elapsed)
+
+        try:
+            self._content_pass()
+        except Exception:
+            logger.exception("[FS_INDEX] content/embedding pass failed")
+
+        try:
+            self._prune_old_events()
+        except Exception:
+            logger.exception("[FS_INDEX] open_events prune failed")
+
+    def _content_pass(self) -> None:
+        """
+        Second pass: extract text + build embeddings for files under
+        SEMANTIC_ROOTS / git repos only (see is_content_worthy). Runs after
+        the cheap filename scan so plain path search is never delayed by it.
+        Skips files whose content_hash hasn't changed since last pass.
+        """
+        from api.services.content_extractor import extract_text, is_supported
+        from api.services.semantic_index import semantic_index
+
+        conn = _get_thread_conn(self._db_path)
+        candidates = conn.execute(
+            "SELECT id, path, content_hash FROM entries WHERE type = 'file'"
+        ).fetchall()
+
+        start = time.monotonic()
+        batch: List[tuple] = []
+        embed_batch: List[tuple] = []
+        scanned = 0
+
+        for entry_id, path_str, old_hash in candidates:
+            p = Path(path_str)
+            if not is_supported(p) or not is_content_worthy(p):
+                continue
+
+            try:
+                from api.services.background_scheduler import scheduler as _sched
+                _sched.wait_for_idle_window(timeout=30.0)
+            except Exception:
+                pass
+
+            scanned += 1
+            new_hash = _quick_hash(p)
+            if new_hash is None:
+                continue
+            if new_hash == old_hash:
+                continue  # unchanged since last content pass
+
+            text = extract_text(p)
+            if not text:
+                continue
+
+            batch.append((new_hash, text[:2000], 1, entry_id))
+            embed_batch.append((entry_id, text))
+
+            if len(embed_batch) >= 64:
+                self._flush_content_batch(batch, embed_batch)
+                batch, embed_batch = [], []
+
+        if batch or embed_batch:
+            self._flush_content_batch(batch, embed_batch)
+
+        semantic_index.save()
+        logger.info(
+            "[FS_CONTENT_PASS] scanned=%d embedded=%d elapsed=%.1fs",
+            scanned, semantic_index.count, time.monotonic() - start,
+        )
+
+    def _flush_content_batch(self, batch: List[tuple], embed_batch: List[tuple]) -> None:
+        from api.services.semantic_index import semantic_index
+        if batch:
+            with self._lock:
+                conn = _get_thread_conn(self._db_path)
+                conn.executemany(
+                    "UPDATE entries SET content_hash = ?, keywords = ?, has_content = ? WHERE id = ?",
+                    batch,
+                )
+                conn.commit()
+        if embed_batch:
+            semantic_index.add_batch(embed_batch)
+
+    # ------------------------------------------------------------------
+    # Incremental updates — used by fs_watcher for real-time indexing.
+    # No full rescan: each call touches only the affected row(s).
+    # ------------------------------------------------------------------
+
+    def upsert_single(self, path: Path, index_content: bool = True) -> Optional[int]:
+        """
+        Insert or refresh a single file/folder. Returns the entry id.
+
+        index_content=False skips the inline content-extraction/embedding
+        step — used by fs_watcher, which defers that work to its own
+        idle-window-gated queue so watchdog callbacks stay fast.
+        """
+        try:
+            is_dir = path.is_dir()
+            st = path.stat()
+        except OSError:
+            return None
+
+        drive = _drive_for(path)
+        now = time.time()
+        entry_type = "folder" if is_dir else "file"
+        size = 0 if is_dir else st.st_size
+
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            conn.execute(
+                "INSERT INTO entries (path, name, lowercase_name, type, drive, size, "
+                "modified_time, accessible, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
+                "modified_time=excluded.modified_time, indexed_at=excluded.indexed_at, "
+                "accessible=1",
+                (str(path), path.name, path.name.lower(), entry_type, drive, size, st.st_mtime, now),
+            )
+            conn.commit()
+            row = conn.execute("SELECT id FROM entries WHERE path = ?", (str(path),)).fetchone()
+
+        entry_id = row[0] if row else None
+        logger.debug("[FS_INDEX_UPSERT] path=%s id=%s", path, entry_id)
+
+        if entry_id is not None and not is_dir and index_content:
+            self._maybe_index_content(entry_id, path)
+        return entry_id
+
+    def _maybe_index_content(self, entry_id: int, path: Path) -> None:
+        """Extract + embed content for a single file if it qualifies."""
+        from api.services.content_extractor import extract_text, is_supported
+        from api.services.semantic_index import semantic_index
+
+        if not is_supported(path) or not is_content_worthy(path):
+            return
+        new_hash = _quick_hash(path)
+        if new_hash is None:
+            return
+        text = extract_text(path)
+        if not text:
+            return
+
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            conn.execute(
+                "UPDATE entries SET content_hash = ?, keywords = ?, has_content = 1 WHERE id = ?",
+                (new_hash, text[:2000], entry_id),
+            )
+            conn.commit()
+        semantic_index.add(entry_id, text)
+        semantic_index.save()
+        logger.debug("[FS_INDEX_CONTENT] path=%s embedded", path)
+
+    def remove_path(self, path: Path) -> None:
+        """Delete a single path (and its semantic embedding) from the index."""
+        from api.services.semantic_index import semantic_index
+
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            row = conn.execute("SELECT id FROM entries WHERE path = ?", (str(path),)).fetchone()
+            conn.execute("DELETE FROM entries WHERE path = ?", (str(path),))
+            # Directory deletes also remove every descendant row.
+            conn.execute("DELETE FROM entries WHERE path LIKE ?", (f"{path}/%",))
+            conn.commit()
+
+        if row:
+            semantic_index.remove(row[0])
+        logger.debug("[FS_INDEX_REMOVE] path=%s", path)
+
+    def rename_path(self, old_path: Path, new_path: Path) -> None:
+        """
+        Rewrite path/name for a moved/renamed file or folder. Handles
+        directory renames by rewriting every descendant's path prefix
+        in one statement instead of walking the subtree again.
+        """
+        old_s, new_s = str(old_path), str(new_path)
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            conn.execute(
+                "UPDATE entries SET path = ?, name = ?, lowercase_name = ? WHERE path = ?",
+                (new_s, new_path.name, new_path.name.lower(), old_s),
+            )
+            # Descendants: replace the old prefix with the new one.
+            conn.execute(
+                "UPDATE entries SET path = ? || substr(path, ?) "
+                "WHERE path LIKE ?",
+                (new_s, len(old_s) + 1, f"{old_s}/%"),
+            )
+            conn.commit()
+        logger.debug("[FS_INDEX_RENAME] old=%s new=%s", old_path, new_path)
+
+    def mark_opened(self, path: Path, context: Optional[dict] = None) -> None:
+        """
+        Record that *path* was actually opened — feeds frequency ranking and,
+        when *context* is supplied, the Phase 1.5 usage-learning model
+        (time-of-day / weekday / active app / active folder / active project
+        affinity — see usage_model.py).
+        """
+        now = time.time()
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            cur = conn.execute(
+                "UPDATE entries SET last_opened = ?, open_count = open_count + 1 WHERE path = ?",
+                (now, str(path)),
+            )
+            if context is not None and cur.rowcount:
+                row = conn.execute("SELECT id FROM entries WHERE path = ?", (str(path),)).fetchone()
+                if row:
+                    lt = time.localtime(now)
+                    conn.execute(
+                        "INSERT INTO open_events (entry_id, ts, hour, weekday, active_app, "
+                        "active_folder, active_project) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (row[0], now, lt.tm_hour, lt.tm_wday,
+                         context.get("active_app", ""), context.get("active_folder", ""),
+                         context.get("active_project", "")),
+                    )
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Phase 1.5 — candidate lookups for the context-priority cascade.
+    # Every method here is a single indexed SQLite query — cheap enough to
+    # run unconditionally on the resolution hot path without hurting latency.
+    # ------------------------------------------------------------------
+
+    def get_recent_files(self, limit: int = 300, max_age_days: float = 30.0) -> List[tuple]:
+        """(id, path, last_opened) for recently opened files, newest first."""
+        cutoff = time.time() - max_age_days * 86400
+        conn = _get_thread_conn(self._db_path)
+        return conn.execute(
+            "SELECT id, path, last_opened FROM entries "
+            "WHERE type = 'file' AND last_opened > ? ORDER BY last_opened DESC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+
+    def get_frequent_files(self, limit: int = 300) -> List[tuple]:
+        """(id, path, open_count) for the most-opened files, highest first."""
+        conn = _get_thread_conn(self._db_path)
+        return conn.execute(
+            "SELECT id, path, open_count FROM entries "
+            "WHERE type = 'file' AND open_count > 0 ORDER BY open_count DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def get_candidates_under_root(
+        self, root: Path, type_filter: Optional[str] = None,
+        name_hint: Optional[str] = None, limit: int = 2000,
+    ) -> List[tuple]:
+        """
+        (id, path) for entries inside *root* — used by the workspace/folder
+        tiers. Without name_hint, a large project (thousands of entries)
+        can silently truncate before the actual match under an arbitrary
+        LIMIT — so callers that already have a query should always pass its
+        significant words as name_hint: this pushes an OR'd LIKE filter
+        into SQL so the right file is never dropped by the row cap,
+        regardless of project size.
+        """
+        conditions = ["(path = ? OR path LIKE ?)"]
+        params: list = [str(root), f"{root}/%"]
+        if type_filter in ("file", "folder"):
+            conditions.append("type = ?")
+            params.append(type_filter)
+        if name_hint:
+            tokens = [t for t in name_hint.lower().split() if len(t) >= 3][:5]
+            if tokens:
+                or_clause = " OR ".join(["lowercase_name LIKE ?"] * len(tokens))
+                conditions.append(f"({or_clause})")
+                params.extend(f"%{t}%" for t in tokens)
+        where = " AND ".join(conditions)
+        conn = _get_thread_conn(self._db_path)
+        return conn.execute(
+            f"SELECT id, path FROM entries WHERE {where} LIMIT ?", (*params, limit),
+        ).fetchall()
+
+    def get_by_ids(self, ids: List[int]) -> List[tuple]:
+        """(id, path, modified_time, last_opened, open_count) for a specific id list."""
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        conn = _get_thread_conn(self._db_path)
+        return conn.execute(
+            f"SELECT id, path, modified_time, last_opened, open_count "
+            f"FROM entries WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+
+    def get_usage_affinity(self, entry_ids: List[int], now_ctx: dict) -> dict:
+        """
+        Batch-compute a 0..1 affinity score per entry_id from open_events —
+        blends time-of-day, weekday, active-app, active-folder and
+        active-project match rates against this entry's own history.
+        Returns {} immediately if there's no context or no candidates —
+        keeps the common cold-start case free.
+        """
+        if not entry_ids:
+            return {}
+        placeholders = ",".join("?" * len(entry_ids))
+        conn = _get_thread_conn(self._db_path)
+        rows = conn.execute(
+            f"SELECT entry_id, hour, weekday, active_app, active_folder, active_project "
+            f"FROM open_events WHERE entry_id IN ({placeholders})",
+            entry_ids,
+        ).fetchall()
+        if not rows:
+            return {}
+
+        by_entry: dict[int, list] = {}
+        for entry_id, hour, weekday, app, folder, project in rows:
+            by_entry.setdefault(entry_id, []).append((hour, weekday, app, folder, project))
+
+        cur_hour = now_ctx.get("hour")
+        cur_weekday = now_ctx.get("weekday")
+        cur_app = now_ctx.get("active_app") or ""
+        cur_folder = now_ctx.get("active_folder") or ""
+        cur_project = now_ctx.get("active_project") or ""
+
+        affinity: dict[int, float] = {}
+        for entry_id, events in by_entry.items():
+            n = len(events)
+            parts, weights = [], []
+
+            if cur_hour is not None:
+                hour_hits = sum(1 for h, *_ in events if min((h - cur_hour) % 24, (cur_hour - h) % 24) <= 2)
+                parts.append(hour_hits / n); weights.append(0.25)
+            if cur_weekday is not None:
+                wd_hits = sum(1 for _, w, *_ in events if w == cur_weekday)
+                parts.append(wd_hits / n); weights.append(0.15)
+            if cur_app:
+                app_hits = sum(1 for *_, a, _f, _p in events if a == cur_app)
+                parts.append(app_hits / n); weights.append(0.15)
+            if cur_folder:
+                folder_hits = sum(1 for *_, _a, f, _p in events if f == cur_folder)
+                parts.append(folder_hits / n); weights.append(0.25)
+            if cur_project:
+                proj_hits = sum(1 for *_, _a, _f, p in events if p == cur_project)
+                parts.append(proj_hits / n); weights.append(0.20)
+
+            if parts:
+                total_w = sum(weights)
+                affinity[entry_id] = sum(p * w for p, w in zip(parts, weights)) / total_w
+
+        return affinity
+
+    # ------------------------------------------------------------------
+    # Phase 1.5 — learned query -> path resolutions ("tier 0").
+    # A pairing is written only when the user has actually confirmed a
+    # candidate (accepted a medium-confidence guess or picked one from a
+    # disambiguation list) — see file_resolver.record_confirmed_choice().
+    # ------------------------------------------------------------------
+
+    def record_learned_resolution(self, query_norm: str, path: str) -> None:
+        if not query_norm or not path:
+            return
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            conn.execute(
+                "INSERT INTO learned_resolutions (query_norm, path, hits, last_used) "
+                "VALUES (?, ?, 1, ?) "
+                "ON CONFLICT(query_norm, path) DO UPDATE SET "
+                "hits = hits + 1, last_used = excluded.last_used",
+                (query_norm, path, time.time()),
+            )
+            conn.commit()
+        logger.info("[FS_LEARNED_RESOLUTION] query=%r path=%s", query_norm, path)
+
+    def get_learned_resolution(self, query_norm: str) -> Optional[tuple]:
+        """Return (path, hits) for the strongest learned match, or None."""
+        if not query_norm:
+            return None
+        conn = _get_thread_conn(self._db_path)
+        row = conn.execute(
+            "SELECT path, hits FROM learned_resolutions WHERE query_norm = ? "
+            "ORDER BY hits DESC, last_used DESC LIMIT 1",
+            (query_norm,),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def _prune_old_events(self, max_age_days: float = 180.0) -> None:
+        cutoff = time.time() - max_age_days * 86400
+        with self._lock:
+            conn = _get_thread_conn(self._db_path)
+            conn.execute("DELETE FROM open_events WHERE ts < ?", (cutoff,))
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Semantic + ranked search
+    # ------------------------------------------------------------------
+
+    def search_semantic_ranked(
+        self,
+        query: str,
+        limit: int = 10,
+        active_folder: Optional[str] = None,
+    ) -> List[tuple]:
+        """
+        Rank candidates by a blend of semantic similarity, recency,
+        open frequency, and active-folder relevance.
+
+        Returns list of (score, Path, breakdown_dict), best first.
+        Logs [FS_SEMANTIC_RANK] with the winning candidate's breakdown.
+        """
+        from api.services.semantic_index import semantic_index
+
+        hits = semantic_index.search(query, k=max(limit * 5, 40))
+        if not hits:
+            return []
+
+        ids = [h[0] for h in hits]
+        sims = dict(hits)
+        placeholders = ",".join("?" * len(ids))
+        conn = _get_thread_conn(self._db_path)
+        rows = conn.execute(
+            f"SELECT id, path, modified_time, last_opened, open_count "
+            f"FROM entries WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+
+        now = time.time()
+        scored: List[tuple] = []
+        for entry_id, path_str, mtime, last_opened, open_count in rows:
+            sim = max(0.0, sims.get(entry_id, 0.0))
+
+            age_days = max(0.0, now - max(mtime, last_opened)) / 86400.0
+            recency = 0.5 ** (age_days / 14.0)  # 14-day half-life
+
+            import math
+            frequency = min(1.0, math.log1p(open_count) / math.log1p(20))
+
+            folder_relevance = 0.0
+            if active_folder:
+                if active_folder.lower() in path_str.lower():
+                    folder_relevance = 1.0
+
+            score = (
+                0.55 * sim
+                + 0.20 * recency
+                + 0.15 * frequency
+                + 0.10 * folder_relevance
+            )
+            scored.append((score, Path(path_str), {
+                "sim": round(sim, 3), "recency": round(recency, 3),
+                "frequency": round(frequency, 3), "folder": folder_relevance,
+            }))
+
+        scored.sort(key=lambda x: -x[0])
+        top = scored[:limit]
+        if top:
+            logger.info(
+                "[FS_SEMANTIC_RANK] query=%r top=%s score=%.3f breakdown=%s",
+                query, top[0][1].name, top[0][0], top[0][2],
+            )
+        return top
 
     def _walk(self, root: Path):
         """

@@ -32,25 +32,6 @@ const SAMPLE_RATE   = 16_000
 const WS_RECONNECT_MS = 2_000
 const WS_TIMEOUT_MS   = 5_000
 
-function playWakeBeep(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const Cls = window.AudioContext ?? (window as any).webkitAudioContext
-    if (!Cls) return
-    const ctx  = new Cls() as AudioContext
-    const osc  = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.connect(gain)
-    gain.connect(ctx.destination)
-    osc.frequency.value = 880
-    gain.gain.setValueAtTime(0.25, ctx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15)
-    osc.start(ctx.currentTime)
-    osc.stop(ctx.currentTime + 0.15)
-    osc.onended = () => ctx.close().catch(() => {})
-  } catch { /* ok */ }
-}
-
 const WORKLET_CODE = `
 class PcmProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -129,7 +110,6 @@ export function useWakeWord(
               wakeCooldown = true
               const { model, confidence } = msg
               console.log(`[WakeWord] triggered — model=${model} conf=${confidence?.toFixed(3)}`)
-              playWakeBeep()
               if (WORK_MODE_MODELS.includes(model) && workModeRef.current) {
                 workModeRef.current()
               } else {

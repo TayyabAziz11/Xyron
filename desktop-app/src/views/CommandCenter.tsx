@@ -19,8 +19,7 @@ import { NotesPanel }          from '@/components/voice/NotesPanel'
 import { MeetingPanel }        from '@/components/voice/MeetingPanel'
 import { ProfileSwitcher }     from '@/components/voice/ProfileSwitcher'
 import { ProactiveToast }      from '@/components/system/ProactiveToast'
-import { useVoiceWS as useVoiceSession } from '@/hooks/useVoiceWS'
-import { useWakeWord }         from '@/hooks/useWakeWord'
+import { useVoiceRuntime }     from '@/contexts/VoiceRuntimeContext'
 import { useReminders }        from '@/hooks/useReminders'
 import { useAssistantSettings } from '@/hooks/useAssistantSettings'
 import { useCommands }         from '@/hooks/useCommands'
@@ -286,26 +285,12 @@ function CommandHistoryItem({ cmd, onRerun }: { cmd: Command; onRerun: (text: st
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function CommandCenterPage() {
-  const session    = useVoiceSession()
-  // Keep a ref so wakeActivate never recreates on every session object change
-  const sessionRef = useRef(session)
-  sessionRef.current = session
-
-  const wakeActivate = useCallback(() => {
-    const s = sessionRef.current
-    if (!s.isActive) s.startSession()
-    else if (s.state === 'idle' || s.state === 'listening') s.startListening()
-  }, [])
-
-  // Delay wake-word startup by 1.5s so the page renders fully before getUserMedia
-  // fires — prevents WebKit2GTK freezing the Tauri renderer on navigation.
-  const [wakeEnabled, setWakeEnabled] = useState(false)
-  useEffect(() => {
-    const t = setTimeout(() => setWakeEnabled(true), 1500)
-    return () => clearTimeout(t)
-  }, [])
-
-  const { listening: wakeListening } = useWakeWord(wakeActivate, wakeEnabled)
+  // Session + wake-word are owned globally by VoiceRuntimeProvider (mounted
+  // once in App.tsx, above the route switch) so the sockets and mic stream
+  // survive navigation away from this page. This component only reads and
+  // drives that shared state — it must never instantiate its own
+  // useVoiceWS()/useWakeWord() (that would create a second live pair).
+  const { wakeListening, ...session } = useVoiceRuntime()
   const { data: commands, submit, submitting, lastResult, refetch } = useCommands()
   const { settings, saveSettings, speak, stop, isSpeaking } = useVoice()
   const { getDraft, confirmDraft, rejectDraft, editDraft, executing } = useDrafts()
@@ -619,19 +604,33 @@ export default function CommandCenterPage() {
                       onClick={session.isActive ? session.stopSession : session.startSession}
                     />
 
-                    {/* Status text */}
+                    {/* Status text — Part 7 UX polish: while a tool is running, show
+                        what it's actually doing (from the backend's activity_events
+                        stream) instead of a generic "PROCESSING…"; falls back to
+                        "THINKING…" only while genuinely reasoning with no tool yet. */}
                     <div className="flex flex-col items-center gap-2 mt-2">
-                      <AnimatePresence mode="wait">
-                        <motion.p key={session.state}
-                          initial={{ opacity:0, y:4 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0 }}
-                          className="font-mono text-sm font-black tracking-[0.25em]"
-                          style={{
-                            color: isListening ? '#00ff88' : isSpeakingS ? '#a78bfa' : isProcessing ? '#00ffff' : '#ff2020',
-                            animation: 'glowPulse 2s ease-in-out infinite',
-                          }}>
-                          {isListening ? "I'M LISTENING" : isSpeakingS ? 'XYRON SPEAKING' : isProcessing ? 'PROCESSING…' : session.isActive ? 'SAY "HEY XYRON"' : 'TAP TO ACTIVATE'}
-                        </motion.p>
-                      </AnimatePresence>
+                      {(() => {
+                        const activityTitle = isProcessing ? session.activity?.title : undefined
+                        const statusLabel = isListening ? "I'M LISTENING"
+                          : isSpeakingS ? 'XYRON SPEAKING'
+                          : activityTitle ? activityTitle.toUpperCase()
+                          : isProcessing ? 'THINKING…'
+                          : session.isActive ? 'SAY "HEY XYRON"'
+                          : 'TAP TO ACTIVATE'
+                        return (
+                          <AnimatePresence mode="wait">
+                            <motion.p key={statusLabel}
+                              initial={{ opacity:0, y:4 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0 }}
+                              className="font-mono text-sm font-black tracking-[0.25em]"
+                              style={{
+                                color: isListening ? '#00ff88' : isSpeakingS ? '#a78bfa' : isProcessing ? '#00ffff' : '#ff2020',
+                                animation: 'glowPulse 2s ease-in-out infinite',
+                              }}>
+                              {statusLabel}
+                            </motion.p>
+                          </AnimatePresence>
+                        )
+                      })()}
                       <p className="font-mono text-[10px] text-text-muted">
                         {isListening ? 'Speak your command clearly' : session.isActive ? 'Wake word listening active' : 'Click orb or say wake word'}
                       </p>

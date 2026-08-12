@@ -196,6 +196,31 @@ _SAFE_GUARD_TOOLS = {
     "disable_startup_app",
 }
 
+# Gate for Tier 2.5 (object_resolver) — only worth calling on utterances that
+# actually look like an open/navigate request.
+_OBJECT_RESOLVER_VERB_RE = re.compile(
+    r'\b(open|show|go\s+(?:to|inside|into)|take\s+me\s+to|browse|navigate\s+to|find|locate)\b',
+    re.I,
+)
+
+
+def _params_for_object(tool: str, obj) -> dict:
+    """Map an ObjectResolution onto the params shape the target tool expects."""
+    if tool == "smart_open":
+        p: dict = {"query": obj.name, "type": obj.object_type if obj.object_type in ("folder", "file") else "any"}
+        if obj.scope.get("drive"):
+            p["drive"] = obj.scope["drive"]
+        return p
+    if tool == "open_drive":
+        return {"drive": (obj.name or "").strip().upper()[:1]}
+    if tool == "open_application":
+        return {"app_name": obj.name}
+    if tool == "open_url":
+        return {"url": obj.name} if obj.name.lower().startswith(("http://", "https://")) else {"query": obj.name}
+    if tool == "open_system_settings":
+        return {"page": obj.name}
+    return {"query": obj.name}
+
 
 class IntentRouter:
 
@@ -259,7 +284,8 @@ class IntentRouter:
         # ── Media controls ───────────────────────────────────────────────────
         # "play" — can be standalone; "resume" requires a media noun so that
         # document names like "resume" (CV) are not hijacked as playback commands.
-        add(r'\b(?:play)\s*(?:music|song|audio|video|it|that)?\b',
+        # Exclude "play X on youtube/spotify/yt" — handled by search_youtube pattern
+        add(r'\bplay(?!\s+\S+.*\s+on\s+(?:youtube|yt|spotify))\s*(?:music|song|audio|video|it|that)?\b',
             "media_control", lambda m: {"action": "play_pause"})
         add(r'\b(?:resume|unpause)\s+(?:music|song|audio|video|it|that|playback|the\s+(?:music|audio))\b',
             "media_control", lambda m: {"action": "play_pause"})
@@ -483,6 +509,19 @@ class IntentRouter:
                 return "file"
             return "any"
 
+        # Filler/connector words that can appear between a drive-context clause
+        # and the actual command verb in a compound utterance — e.g. "Now in
+        # E drive, can you also open perfume folder?" has "can you also"
+        # between "E drive" and "open". Without excluding these, D1's query
+        # capture greedily swallows them as the query itself (confirmed bug:
+        # produced smart_open(query="can you also open", drive="E") instead
+        # of failing over to the correct "open perfume folder" rule further
+        # down the rule list). Excluding them makes D1 correctly NOT match
+        # here, so route() falls through to the dedicated
+        # "open <name> folder" rule instead.
+        _D_FILLER = (r'the|my|a|an|in|on|named|called|can|you|also|please|'
+                     r'could|would|just|now|well|kindly|to')
+
         # D1: drive FIRST → "in E drive open folder named python"
         add(
             r'\b(?:in|on|from)\s+(?P<d1>[a-zA-Z])\s+(?:drive|disk)\b'
@@ -490,7 +529,7 @@ class IntentRouter:
             r'(?:(?:the|my|a)\s+)?'
             r'(?:(?P<t1>folder|directory|file|document|dir)\s+)?'
             r'(?:(?:named|called)\s+)?'
-            r'(?P<q1>(?!(?:the|my|a|an|in|on|named|called)\b)\S+(?:\s+\S+){0,3})',
+            r'(?P<q1>(?!(?:' + _D_FILLER + r')\b)\S+(?:\s+\S+){0,3})',
             'smart_open',
             lambda m: {
                 "query": m.group("q1").strip().rstrip(".,!?"),
@@ -505,7 +544,7 @@ class IntentRouter:
             r'(?:(?:the|my|a)\s+)?'
             r'(?:(?P<t2>folder|directory|file|document|dir)\s+)?'
             r'(?:(?:named|called)\s+)?'
-            r'(?P<q2>(?!(?:the|a|my|in|on|named|called)\b)\S+(?:\s+\S+){0,2}?)'
+            r'(?P<q2>(?!(?:' + _D_FILLER + r')\b)\S+(?:\s+\S+){0,2}?)'
             r'\s+(?:in|on|from)\s+(?P<d2>[a-zA-Z])\s+(?:drive|disk)\b',
             'smart_open',
             lambda m: {
@@ -609,6 +648,99 @@ class IntentRouter:
             "brightness_control", lambda m: {"action": "increase", "step": 10})
         add(r'\b(?:brightness|screen)\s+(?:ghata(?:o)?|kam\s+(?:karo|kar|kro)|dark\s+kar(?:o)?)\b',
             "brightness_control", lambda m: {"action": "decrease", "step": 10})
+
+        # ── YouTube play/search ─────────────────────────────────────────────────
+        # "play X on YouTube", "play X on youtube"
+        add(
+            r'\bplay\s+(.+?)\s+on\s+(?:youtube|yt)\b',
+            "search_youtube",
+            lambda m: {"query": m.group(1).strip()},
+        )
+        # "search YouTube for X", "watch X on youtube"
+        add(
+            r'\b(?:search\s+(?:youtube|yt)\s+for|watch\s+.+?\s+on\s+(?:youtube|yt))\s+(.+)',
+            "search_youtube",
+            lambda m: {"query": m.group(1).strip()},
+        )
+        # Roman Urdu: "youtube X chalao", "youtube pe X chalao/chlao"
+        add(
+            r'\byoutube\s+(?:pe\s+)?(.+?)\s+(?:chalao|chlao|chalo|play\s+karo)\b',
+            "search_youtube",
+            lambda m: {"query": m.group(1).strip()},
+        )
+        # Roman Urdu: "youtube par/pr X [chalao]" — "par" form + chalao optional
+        # Edge-TTS neural voices: Whisper often drops "chalao" at end, outputs "pr" for "par"
+        add(
+            r'\byoutube\s+(?:par|pr)\s+(.+?)(?:\s+(?:chalao|chlao|chalo))?[\s.,!?]*$',
+            "search_youtube",
+            lambda m: {"query": m.group(1).strip().rstrip(".,!?").strip()},
+        )
+        # "X dikhao" / "X show" — Urdu "show me X" → search (no youtube context = web search)
+        add(
+            r'^(.+?)\s+(?:dikhao|dikha|show|show\s+karo|search\s+karo)[.,!?\s]*$',
+            "search_web",
+            lambda m: {"query": m.group(1).strip().rstrip(".,!?")},
+        )
+        # Fallback: "latest/recent/new X" — Whisper drops Urdu verb but retains noun phrase
+        add(
+            r'^(?:latest|recent|new|newest)\s+(.+?)\.?\s*$',
+            "search_web",
+            lambda m: {"query": m.group(0).strip().rstrip(".,!?")},
+        )
+        # "X research/news/updates/info" without explicit verb
+        add(
+            r'^(.+?)\s+(?:news|research|updates?|info|information)\.?\s*$',
+            "search_web",
+            lambda m: {"query": m.group(0).strip().rstrip(".,!?")},
+        )
+
+        # ── Microsoft Store install / download ──────────────────────────────────
+        # "download/install/get X from microsoft store" → install_store_app
+        add(
+            r'\b(?:download|install|get)\s+(.+?)\s+from\s+(?:microsoft\s+)?(?:the\s+)?store\b',
+            "install_store_app",
+            lambda m: {"app_name": m.group(1).strip()},
+        )
+        # "install/download/get X" (bare, without store context — intent_router provides store routing)
+        add(
+            r'\b(?:install|get|set\s+up|setup)\s+(?:the\s+)?([A-Za-z][\w\s]{2,30}?)\s+(?:app\b|application\b)',
+            "install_store_app",
+            lambda m: {"app_name": m.group(1).strip()},
+        )
+        # Canonical bare + compound store-install detection, shared with
+        # voice_ws.py Tier 0g and both follow-up resolvers via store_agent.py.
+        # Catches "open microsoft store and install X" — the compound phrasing
+        # the two rules above miss (neither has an "open ... and" shape) — and
+        # backstops bare "install X" for any caller that reaches intent_router
+        # directly without going through voice_ws.py's Tier 0g bypass first.
+        from api.services.store_agent import COMPOUND_RE as _sa_compound_re
+        from api.services.store_agent import BARE_RE as _sa_bare_re
+        from api.services.store_agent import clean_product as _sa_clean_product
+        add(
+            _sa_compound_re.pattern,
+            "install_store_app",
+            lambda m: {"app_name": _sa_clean_product(m.group("product"))},
+        )
+        add(
+            _sa_bare_re.pattern,
+            "install_store_app",
+            lambda m: {"app_name": _sa_clean_product(m.group("product"))},
+        )
+
+        # ── Bare known-app name → open_application ──────────────────────────────
+        # Handles "chrome." when Whisper drops the Urdu verb "kholo" (accent issue).
+        # Only matches if the ENTIRE transcript is one of these exact app names.
+        _BARE_APPS = (
+            "chrome", "firefox", "edge", "microsoft edge",
+            "notepad", "calculator", "spotify", "discord", "steam",
+            "settings", "explorer", "file explorer", "vs code", "vscode",
+            "whatsapp", "telegram", "teams", "slack", "zoom",
+        )
+        add(
+            r'^\s*(' + '|'.join(re.escape(a) for a in _BARE_APPS) + r')\s*[.!?]?\s*$',
+            "open_application",
+            lambda m: {"app_name": m.group(1).strip()},
+        )
 
         # ── Work mode / focus mode → run_workflow(name="work_mode") ─────────────
         # Tier2 fast-path so "it's work time" never falls through to LLM
@@ -759,6 +891,20 @@ class IntentRouter:
             lambda m: {"query": m.group("q_opfolder").strip().rstrip(".,!?"), "type": "folder"},
         )
 
+        # ── "open <name> folder/directory" — must be before open_application catch-all ──
+        # Handles: "open hackathon folder", "open python directory", "open client folder"
+        add(
+            r'\b(?:open|show|go\s+to|browse)\s+(?:the\s+|my\s+|a\s+)?'
+            r'(?P<q_named_folder>[\w\s\-\.]{2,40}?)'
+            r'\s+(?:folder|directory)\s*[.!?]?\s*$',
+            'smart_open',
+            lambda m: {
+                "query": m.group("q_named_folder").strip().rstrip(".,!? "),
+                "type": "folder",
+            },
+        )
+        logger.debug("[FOLDER_INTENT_DETECTED] pattern=open_name_folder registered")
+
         add(r'\b(?:open|launch|start|run|fire\s+up|pull\s+up)\s+(.+)',
             "open_application",
             _clean_app_name)
@@ -816,6 +962,29 @@ class IntentRouter:
         if _os_lc.getenv("LOCAL_ONLY_MODE", "").lower() in ("1", "true", "yes"):
             logger.info("[IntentRouter] LOCAL_ONLY_MODE=true — classifier load skipped")
             return
+
+        # Wait for critical voice-path warmup (Kokoro + Whisper) to finish
+        # before loading this on CUDA. Confirmed root cause of the
+        # keepalive-timeout incident: this constructor's tensor/tokenizer
+        # deserialization runs on a plain thread and holds the GIL for
+        # extended stretches, starving the asyncio event loop that also
+        # has to service uvicorn's own WebSocket ping/pong — that starvation
+        # is what produced "code=1011 reason=keepalive ping timeout" during
+        # the wake/greeting window. This thread already runs in the
+        # background (started at IntentRouter.__init__, i.e. import time),
+        # so waiting here costs nothing on any path that matters.
+        try:
+            from api.services.readiness_service import readiness_service as _rs_wait
+            logger.info("[GPU_BACKGROUND_DEFERRED] component=sentence_transformer_classifier waiting_for=core_ready")
+            _rs_wait.wait_core_ready(timeout=60.0)
+        except Exception:
+            pass
+        try:
+            from api.services.gpu_coordinator import wait_for_voice_idle as _wait_voice_idle
+            _wait_voice_idle("sentence_transformer_classifier", timeout=30.0)
+        except Exception:
+            pass
+
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
             import numpy as np
@@ -837,10 +1006,16 @@ class IntentRouter:
             self._classifier_ready = True
             logger.info("[IntentRouter] Semantic classifier ready (%d tools embedded)", len(names))
         except ImportError:
-            logger.warning("[IntentRouter] sentence-transformers not installed — Tier 3 disabled. "
-                           "Run: pip install sentence-transformers")
+            logger.exception(
+                "[IntentRouter] sentence-transformers import chain failed — Tier 3 disabled permanently "
+                "for this process (this is a one-time startup thread, never retried per-request). "
+                "The generic 'not installed' guess was misleading: on this environment the real cause "
+                "is usually a numpy/pandas/scikit-learn ABI mismatch several imports deep inside "
+                "sentence_transformers, not a missing package — see the traceback above for the actual "
+                "failing import."
+            )
         except Exception:
-            logger.exception("[IntentRouter] Failed to load classifier")
+            logger.exception("[IntentRouter] Failed to load classifier — Tier 3 disabled permanently for this process")
 
     def _semantic_route(self, text: str) -> RouteResult:
         if not self._classifier_ready:
@@ -900,6 +1075,34 @@ class IntentRouter:
                 logger.info("[IntentRouter] Tier2 regex: %r → %s params=%s",
                             text[:60], tool, params)
                 return result
+
+        # Tier 2.5 — Object Resolver (Phase 3.5): catches compositional
+        # phrasings the fixed regex shapes above don't cover — "go inside
+        # perfume", "take me to perfume", "open it" — using explicit-noun/
+        # pronoun/scope evidence instead of yet another regex. Deterministic
+        # and offline (Part 12: no LLM on the critical path for obvious
+        # filesystem commands). Only fires on utterances that actually look
+        # like an open/navigate request, and only acts on a confident result.
+        if _OBJECT_RESOLVER_VERB_RE.search(text):
+            try:
+                from api.services.object_resolver import resolve as _obj_resolve, tool_for as _obj_tool_for
+                obj = _obj_resolve(text)
+                # 0.6 cleanly separates every confident resolution path
+                # (explicit noun 0.95, pronoun/context-stack 0.9, scoped
+                # filesystem match up to 0.85, known app name 0.75) from the
+                # "no evidence at all" unknown fallback (0.3) — see
+                # object_resolver.resolve().
+                if obj.object_type != "unknown" and obj.confidence >= 0.6 and obj.name:
+                    tool = _obj_tool_for(obj.object_type)
+                    params = _params_for_object(tool, obj)
+                    result = RouteResult(tool, params, 2, obj.confidence)
+                    with self._cache_lock:
+                        self._cache[key] = result
+                    logger.info("[IntentRouter] Tier2.5 object_resolver: %r → %s params=%s conf=%.2f",
+                                text[:60], tool, params, obj.confidence)
+                    return result
+            except Exception:
+                logger.debug("[IntentRouter] object_resolver tier failed", exc_info=True)
 
         # Tier 3 — semantic classifier
         result = self._semantic_route(text)

@@ -38,9 +38,9 @@ public class _WinFG {
 $h=[_WinFG]::GetForegroundWindow()
 $sb=New-Object System.Text.StringBuilder(256)
 [_WinFG]::GetWindowText($h,$sb,256)|Out-Null
-$pid=0u;[_WinFG]::GetWindowThreadProcessId($h,[ref]$pid)|Out-Null
-$p=Get-Process -Id ([int]$pid) -ErrorAction SilentlyContinue
-Write-Output "TITLE:$($sb.ToString())|PROC:$($p.Name)|PID:$pid"
+$xpid=[uint32]0;[_WinFG]::GetWindowThreadProcessId($h,[ref]$xpid)|Out-Null
+$p=Get-Process -Id ([int]$xpid) -ErrorAction SilentlyContinue
+Write-Output "TITLE:$($sb.ToString())|PROC:$($p.Name)|PID:$xpid"
 } catch { Write-Output "ERR:$($_.Exception.Message)" }
 """
 
@@ -68,9 +68,14 @@ class _WindowContextService:
         now = time.monotonic()
         with self._lock:
             if self._cached and now - self._cached_at < _CACHE_TTL:
+                logger.debug("[WINDOW_CTX_CACHE_HIT] age_ms=%.0f", (now - self._cached_at) * 1000)
                 return dict(self._cached)
 
+        t0 = time.monotonic()
         result = self._query()
+        ms = (time.monotonic() - t0) * 1000
+        logger.debug("[WINDOW_CTX_QUERY_MS] ms=%.0f proc=%s", ms,
+                     (result or {}).get("proc_name", "?"))
 
         with self._lock:
             self._cached    = result

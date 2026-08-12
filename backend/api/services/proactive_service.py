@@ -84,6 +84,13 @@ class ProactiveService:
     def _loop(self) -> None:
         while self._running:
             try:
+                from api.services.background_scheduler import scheduler as _sched
+                if not _sched.should_run("proactive"):
+                    time.sleep(_CHECK_INTERVAL)
+                    continue
+            except Exception:
+                pass
+            try:
                 self._check_all()
             except Exception as exc:
                 logger.debug("Proactive check error: %s", exc)

@@ -13,7 +13,8 @@ from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s",
+    format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s",
+    datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
 
@@ -32,6 +33,10 @@ if settings.onnx_provider and not _os.environ.get("ONNX_PROVIDER"):
 from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity, dev, brain, takeover, dashboard
 from .routers import auth as auth_router
 from .routers import monitor as monitor_router
+from .routers import agents as agents_router
+from .routers import browser as browser_router
+from .routers import fs_search as fs_search_router
+from .routers import world_state as world_state_router
 
 logger = logging.getLogger(__name__)
 
@@ -63,65 +68,163 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup() -> None:
-    _init_agent_registry()
-    # Pre-warm all models in background threads — eliminates cold-start lag on first request
     import threading as _threading
 
-    def _warmup_all() -> None:
-        import logging as _log, sys as _sys
-        _l = _log.getLogger("startup.warmup")
-        # Ensure backend/ is on sys.path so "voice.*" imports resolve
-        _backend_path = str(settings.repo_root / "backend")
-        if _backend_path not in _sys.path:
-            _sys.path.insert(0, _backend_path)
-        # 1. Whisper STT
-        try:
-            from .routers.voice import _get_local_whisper_model
-            from voice.whisper_service import _detect_device as _wd
-            _get_local_whisper_model()
-            _dev, _ct = _wd()
-            _l.info("[Warmup] Whisper ready — device=%s compute=%s", _dev, _ct)
-        except Exception as exc:
-            _l.warning("[Warmup] Whisper: %s", exc)
-        # 2. Kokoro TTS
-        try:
-            import os as _os
+    # ai_operator's registry (LinkedIn/Gmail/Odoo/etc. business-automation
+    # agents) is not on the voice/text critical path — nothing in it is
+    # required for the first interaction. Register it on a background
+    # thread instead of blocking the very first line of startup.
+    _threading.Thread(target=_init_agent_registry, daemon=True, name="ai-operator-registry-init").start()
+    from .services.readiness_service import readiness_service as _rs
+    from .services.background_scheduler import scheduler as _sched
+
+    # ── Phase 4.14: critical-path boot ──────────────────────────────────────
+    # Previously `set_core_ready()` fired almost immediately at boot — long
+    # before Whisper/Kokoro/intent routing had actually finished loading in
+    # their background threads — so a session could connect and speak while
+    # models were still cold (measured: ~1 minute first-STT, warmup finishing
+    # after the user's first command). The gate now only opens once every
+    # service in Part 1's critical list has actually been attempted:
+    # Whisper fast, Whisper accurate, Kokoro, intent routing,
+    # conversation engine. Browser/CDP is deliberately NOT in this list —
+    # Chrome must stay untouched until a real browser task is dispatched
+    # (see browser_agent.run() / _get_page_with_repair — the only lazy
+    # entry point). Do not reintroduce eager Chrome warmup here.
+    _critical_models_done = _threading.Event()
+
+    def _critical_model_warmup() -> None:
+        """Kokoro + both Whisper models + intent router. Pure CPU/GPU work —
+        no event loop needed, so this runs in a plain background thread."""
+        import time as _t
+        _l = logging.getLogger("startup.critical_boot")
+
+        def _run(name: str, fn) -> None:
+            _t0 = _t.monotonic()
+            try:
+                fn()
+                _rs.mark_service(name, True)
+                _l.info("[CRITICAL_BOOT_DONE] service=%s ms=%.0f", name, (_t.monotonic() - _t0) * 1000)
+            except Exception as exc:
+                _rs.mark_service(name, False)
+                _l.warning("[CRITICAL_BOOT_FAIL] service=%s error=%s", name, exc)
+
+        def _kokoro() -> None:
             from .routers.voice import _get_kokoro, _kokoro_to_wav
-            k = _get_kokoro()
-            if k is not None:
-                _kokoro_to_wav("Ready.", "nova", 1.0)
-                # Pre-synthesize all time-of-day boss greeting variants into the TTS cache.
-                # First user activation hits cache → instant response (no GPU cold-start wait).
-                for _tod in ("morning", "afternoon", "evening"):
-                    _kokoro_to_wav(
-                        f"Good {_tod}, boss. I'm Xyron, ready and at your service. Just give the word.",
-                        "onyx", 1.0,
-                    )
-                _l.info("[Warmup] Kokoro ready — provider=%s (greeting cache warm)",
-                        _os.environ.get("ONNX_PROVIDER", "CPU"))
-        except Exception as exc:
-            _l.warning("[Warmup] Kokoro: %s", exc)
-        # 3. Intent router (sentence-transformer)
+            if _get_kokoro() is None:
+                raise RuntimeError("kokoro model unavailable")
+            _kokoro_to_wav("Ready.", "nova", 1.0)
+
+        def _whisper_fast() -> None:
+            import numpy as _np
+            from voice.whisper_service import transcribe_fast as _tr_fast
+            _tr_fast(_np.zeros(16000, dtype=_np.float32))
+
+        def _whisper_accurate() -> None:
+            import numpy as _np
+            from voice.whisper_service import transcribe_audio as _tr
+            _tr(_np.zeros(16000, dtype=_np.float32), 16000, "en", True)
+
+        def _intent() -> None:
+            # Best-effort: Tier 3 semantic classifier is known-broken on some
+            # environments (sentence-transformers/sklearn ABI mismatch) and
+            # degrades gracefully to keyword/LLM tiers — still attempt the
+            # warm-up so any failure surfaces now, not on the user's first turn.
+            from .services.intent_router import intent_router as _ir
+            if not _ir.classifier_ready:
+                raise RuntimeError("semantic classifier unavailable (degraded — keyword/LLM tiers still active)")
+
+        _threads = [
+            _threading.Thread(target=_run, args=(n, f), daemon=True, name=f"boot-{n}")
+            for n, f in (
+                ("tts", _kokoro),
+                ("whisper_fast", _whisper_fast),
+                ("whisper_accurate", _whisper_accurate),
+                ("intent", _intent),
+            )
+        ]
+        for _th in _threads:
+            _th.start()
+        for _th in _threads:
+            _th.join(timeout=45.0)
+        _critical_models_done.set()
+
+    _threading.Thread(target=_critical_model_warmup, daemon=True, name="critical-model-warmup").start()
+
+    def _conversation_check() -> None:
         try:
-            from .services.intent_router import intent_router as _ir  # noqa: F401
-            _dev_st = str(getattr(getattr(_ir, "_model", None), "device", "unknown"))
-            _l.info("[Warmup] IntentRouter ready — device=%s classifier=%s",
-                    _dev_st, _ir.classifier_ready)
+            from .agents.personality.personality_engine import personality_engine  # noqa: F401
+            from .agents.agent_runtime import agent_runtime  # noqa: F401
+            from .agents.browser_agent.conversation_layer import narrate  # noqa: F401
+            _rs.mark_service("conversation", True)
         except Exception as exc:
-            _l.warning("[Warmup] IntentRouter: %s", exc)
-        # 4. WakeWordService — loads OWW + tiny Whisper wake model
+            _rs.mark_service("conversation", False)
+            logger.warning("[CRITICAL_BOOT_FAIL] service=conversation error=%s", exc)
+
+    async def _critical_boot_supervisor() -> None:
+        import time as _t
+        _t0 = _t.monotonic()
+        _conversation_check()
+        logger.info("[BROWSER_LAZY_INIT_SKIPPED] reason=backend_startup")
+        # Bounded wait — Whisper/Kokoro/intent classifier only. 45s covers
+        # a cold model load with margin; anything still running past that
+        # is reported as a blocker but the gate opens anyway.
+        await asyncio.to_thread(_critical_models_done.wait, 45.0)
+        _rs.set_core_ready()
+        logger.info("[CRITICAL_BOOT_TOTAL_MS] %.0f", (_t.monotonic() - _t0) * 1000)
+
+        # One bounded, synchronous "Sure." pre-cache — Kokoro is guaranteed
+        # warm by this point, closing the race that used to cost ~2.1s on
+        # the single first-ever request.
         try:
-            from voice.wake_word_service import wake_word_service as _wws
-            import time as _wt; _wt.sleep(1)  # allow OWW background thread to finish
-            _l.info("[Warmup] WakeWordService ready — oww=%s", _wws._oww_ready)
-        except Exception as exc:
-            _l.warning("[Warmup] WakeWordService: %s", exc)
-        # 5. Ollama — preload voice model so first request isn't a cold start (~18s → <2s)
+            from .services.tts_cache_service import tts_cache as _tcc_sure
+            _tcc_sure.synthesize_or_cached("Sure.", "nova", 1.0)
+            # Problem 1 fix: also pre-cache the greeting's Layer-3 fallback
+            # ("I'm listening.") for both voices actually exercised by this
+            # app (nova = default, onyx = the other configured session
+            # voice), so the greeting has a guaranteed-available fallback
+            # to fall back to if the personalized greeting's live synth
+            # times out under real-world load — instead of silently skipping.
+            for _fb_voice in ("nova", "onyx"):
+                _tcc_sure.synthesize_or_cached("I'm listening.", _fb_voice, 1.0)
+        except Exception:
+            pass
+
+        _threading.Thread(target=_secondary_boot, daemon=True, name="secondary-boot").start()
+
+    def _await_voice_idle(_l: "logging.Logger") -> None:
+        """
+        Problem 4 fix: this loop used to run unconditionally, so a fresh
+        backend start racing a live wake/manual-start session kept
+        synthesizing dozens of `nova` ACK/conversation-layer phrases on the
+        same Kokoro GPU path the live session needed for its greeting and
+        ack — measured as ACK_SYNTH_MS in the 9-18s range for a live `onyx`
+        session while this loop ground through 40+ phrases untouched by
+        voice_activity. Block before every phrase while a voice session is
+        active; resume once it goes idle.
+        """
+        from api.services.voice_activity import is_active as _va_is_active
+        from api.routers.debug import is_voice_session_connected as _va_session_connected
+
+        def _should_pause() -> bool:
+            return _va_is_active() or _va_session_connected()
+
+        if _should_pause():
+            _l.info("[TTS_CACHE_WARMUP_PAUSED] reason=voice_session")
+            while _should_pause():
+                _threading.Event().wait(0.5)
+            _l.info("[TTS_CACHE_WARMUP_RESUMED]")
+
+    def _secondary_boot() -> None:
+        """Everything NOT required for the first command — Ollama,
+        wake-word, full TTS ack-phrase cache. Starts only after the
+        critical gate opens, so it never competes with Whisper/Kokoro/
+        browser warm-up for CPU/GPU during the boot window that matters."""
+        _l = logging.getLogger("startup.secondary_boot")
+
         try:
             import os as _os_w, time as _owt
             _voice_model = _os_w.getenv("OLLAMA_VOICE_MODEL", "qwen2.5:1.5b")
             _os_w.environ.setdefault("OLLAMA_MODEL", _voice_model)
-            # Check model exists before warmup — avoids long download stall
             try:
                 import ollama as _olc
                 _olc_client = _olc.Client(host=_os_w.getenv("OLLAMA_API_URL", "http://localhost:11434"))
@@ -131,38 +234,155 @@ async def startup() -> None:
                 _model_ready = False
             if _model_ready:
                 _wt0 = _owt.monotonic()
-                from api.services.openai_client import offline_generate as _og
+                from .services.openai_client import offline_generate as _og
                 _og("hi", system="You are Xyron.")
                 _wms = (_owt.monotonic() - _wt0) * 1000
                 _l.info("[Warmup] Ollama preloaded model=%s keep_alive=30m warmup_ms=%.0f", _voice_model, _wms)
+                _rs.mark_service("ollama", True)
             else:
                 _l.warning("[Warmup] Ollama model %r not found — run: ollama pull %s", _voice_model, _voice_model)
+                _rs.mark_service("ollama", False)
         except Exception as exc:
             _l.warning("[Warmup] Ollama: %s", exc)
-        # 6. Pre-generate TTS ack cache for instant playback (On it / Opening / Done)
-        try:
-            from .routers.voice import _kokoro_to_wav
-            import pathlib as _pl
-            _cache_dir = _pl.Path("/tmp/xyron-ack")
-            _cache_dir.mkdir(parents=True, exist_ok=True)
-            for _key, _text in [("on_it", "On it."), ("opening", "Opening."),
-                                  ("done", "Done."), ("got_it", "Got it.")]:
-                _out = _cache_dir / f"{_key}.wav"
-                if not _out.exists():
-                    _wav = _kokoro_to_wav(_text, "nova", 1.1)
-                    if _wav:
-                        _out.write_bytes(_wav)
-            _l.info("[Warmup] TTS ack cache ready at %s", _cache_dir)
-        except Exception as exc:
-            _l.warning("[Warmup] TTS cache: %s", exc)
+            _rs.mark_service("ollama", False)
 
-    _threading.Thread(target=_warmup_all, daemon=True, name="model-warmup").start()
+        try:
+            import numpy as _np_rvc, time as _rvct
+            from voice.rvc_engine import rvc_engine as _rvc_w
+            if _rvc_w.is_available():
+                _rvc_t0 = _rvct.monotonic()
+                from voice.rvc_engine import _float_to_wav as _f2wav
+                _dummy_wav = _f2wav(_np_rvc.zeros(4800, dtype=_np_rvc.float32), 24000)
+                _rvc_w.convert(_dummy_wav, preset="calm", emotion_state="CALM")
+                _rvc_w._last_latency_ms = 0.0  # don't let the warmup call itself trip the latency guard
+                _rvc_ms = (_rvct.monotonic() - _rvc_t0) * 1000
+                _l.info("[Warmup] RVC (tier=%s) JIT-warmed in %.0fms — first live utterance won't pay this cost",
+                         _rvc_w.get_tier(), _rvc_ms)
+            else:
+                _l.info("[Warmup] RVC not enabled/available — skipping warmup")
+        except Exception as exc:
+            _l.warning("[Warmup] RVC: %s", exc)
+
+        try:
+            from voice.wake_word_service import wake_word_service as _wws
+            import time as _wt; _wt.sleep(1)
+            _l.info("[Warmup] WakeWordService ready — oww=%s", _wws._oww_ready)
+            _rs.mark_service("wakeword", _wws._oww_ready)
+        except Exception as exc:
+            _l.warning("[Warmup] WakeWordService: %s", exc)
+            _rs.mark_service("wakeword", False)
+
+        try:
+            from .services.tts_cache_service import tts_cache as _tcc
+            _ACK_PHRASES = [
+                "On it.", "Opening.", "Done.", "Got it.", "Sure.",
+                "Opening Chrome.", "Opening VS Code.", "Opening Notepad.",
+                "Opening Calculator.", "Opening Explorer.",
+                "Opening File Explorer.", "Opening Spotify.", "Opening Discord.",
+                "Opening Microsoft Edge.", "Opening Firefox.", "Opening Terminal.",
+                "Opening Task Manager.", "Opening Microsoft Store.",
+                "Opening E Drive.", "Opening C Drive.", "Opening D Drive.",
+                "Opening F Drive.",
+            ]
+            _synth_ok = 0
+            _l.info("[TTS_CACHE_BUILD_VOICE] voice=nova")
+            for _phrase in _ACK_PHRASES:
+                _await_voice_idle(_l)
+                try:
+                    _wav = _tcc.synthesize_or_cached(_phrase, "nova", 1.0)
+                    if _wav:
+                        _synth_ok += 1
+                except Exception:
+                    pass
+            _l.info("[Warmup] TTS ACK cache pre-built: %d/%d phrases ready",
+                    _synth_ok, len(_ACK_PHRASES))
+
+            # Completion phrases now always speak (per user feedback: silence
+            # on success read as broken) — pre-warm the past-tense versions
+            # too, mirroring _ACK_PHRASES above, so the always-on completion
+            # response is also an instant cache hit instead of a fresh
+            # Kokoro synthesis on every single command.
+            _COMPLETION_PHRASES = [
+                "Done.", "All set.", "Settings is open.", "There's Settings.",
+                "Chrome opened.", "VS Code opened.", "Notepad opened.",
+                "Calculator is open.", "Explorer opened.",
+                "File Explorer opened.", "Spotify opened.", "Discord opened.",
+                "Microsoft Edge opened.", "Firefox opened.", "Terminal opened.",
+                "Task Manager opened.", "Microsoft Store opened.",
+                "E drive is open.", "C drive is open.", "D drive is open.",
+                "F drive is open.",
+            ]
+            _comp_synth_ok = 0
+            for _phrase in _COMPLETION_PHRASES:
+                _await_voice_idle(_l)
+                try:
+                    _wav = _tcc.synthesize_or_cached(_phrase, "nova", 1.0)
+                    if _wav:
+                        _comp_synth_ok += 1
+                except Exception:
+                    pass
+            _l.info("[Warmup] TTS completion cache pre-built: %d/%d phrases ready",
+                    _comp_synth_ok, len(_COMPLETION_PHRASES))
+        except Exception as exc:
+            _l.warning("[Warmup] TTS ACK cache: %s", exc)
+
+        # Phase 4.15: the travel Conversation Layer's static phrase pools
+        # (ack/delay/opening-browser/cancelled/comparison-started) were never
+        # pre-cached, so every one paid a full, uncached Kokoro synthesis
+        # pass on first use — live-measured as the reason narration audio
+        # started *after* the (now pre-warmed, near-instant) browser action
+        # it was describing had already completed. Same fix as the ACK
+        # cache above, applied to the conversation-layer's fixed lines.
+        try:
+            from .agents.browser_agent.conversation_layer import (
+                _ACK_PHRASES as _CL_ACK, _DELAY_PHRASES as _CL_DELAY,
+                _OPENING_BROWSER_PHRASES as _CL_OPENING,
+            )
+            _CL_STATIC_PHRASES = [
+                *_CL_ACK, *_CL_DELAY, *_CL_OPENING,
+                "Done — I've cancelled that.", "Okay, cancelled.", "No problem, I've stopped there.",
+                "Let me see which one gives you the best balance between price and travel time.",
+                "Let me weigh these against each other for you.",
+                "I'm looking at price, duration, and stops together — not just the cheapest number.",
+                "Still the same set of options here.", "Same options as before.",
+            ]
+            _cl_synth_ok = 0
+            for _phrase in _CL_STATIC_PHRASES:
+                _await_voice_idle(_l)
+                try:
+                    _wav = _tcc.synthesize_or_cached(_phrase, "nova", 1.0)
+                    if _wav:
+                        _cl_synth_ok += 1
+                except Exception:
+                    pass
+            _l.info("[Warmup] Conversation-layer phrase cache pre-built: %d/%d phrases ready",
+                    _cl_synth_ok, len(_CL_STATIC_PHRASES))
+        except Exception as exc:
+            _l.warning("[Warmup] Conversation-layer phrase cache: %s", exc)
+
+        _rs.set_ready()
+        _sched.on_ready()
+
+    asyncio.create_task(_critical_boot_supervisor())
+
+    # Optional: pre-warm XTTS-v2 in background (only if MULTILINGUAL_TTS_PRELOAD=true).
+    # Disabled by default — XTTS-v2 needs ~2GB VRAM; enable only on machines with headroom.
+    # With XTTS not preloaded, multilingual responses are spoken by Kokoro (localized text).
+    try:
+        from voice.xtts_service import preload_background as _xtts_preload
+        _xtts_preload()
+    except Exception:
+        pass
+
     # Start background services
     try:
         from .config import settings as _s
         from .services.screen_context_service import screen_context_service
         from .services.proactive_service import proactive_service
         from .tools import browser_tools  # noqa: F401 — registers browser tools
+        from .services.background_scheduler import scheduler as _sched1, JobPriority as _JP1
+        _sched1.register("proactive", _JP1.BACKGROUND_IDLE_ONLY)
+        _sched1.register("screen_context", _JP1.BACKGROUND_IDLE_ONLY)
         if _s.openai_api_key and _s.openai_api_key.startswith("sk-"):
             screen_context_service.start(_s.openai_api_key)
             proactive_service.start(_s.openai_api_key)
@@ -175,6 +395,8 @@ async def startup() -> None:
         if _backend_path2 not in sys.path:
             sys.path.insert(0, _backend_path2)
         from dev.dev_observer import observer_loop
+        from .services.background_scheduler import scheduler as _sched2, JobPriority as _JP2
+        _sched2.register("dev_observer", _JP2.BACKGROUND_IDLE_ONLY)
         asyncio.create_task(observer_loop())
         logger.info("[DEV_OBSERVER] background task started")
     except Exception as _exc2:
@@ -183,6 +405,8 @@ async def startup() -> None:
     # Phase 12 — start Self-Reflection Engine background loop
     try:
         from cognition.reflection import reflection_engine
+        from .services.background_scheduler import scheduler as _sched3, JobPriority as _JP3
+        _sched3.register("reflection", _JP3.BACKGROUND_IDLE_ONLY)
         asyncio.create_task(reflection_engine.start_loop(interval_minutes=30))
         logger.info("[REFLECTION] background loop started (30-min interval)")
     except Exception as _exc3:
@@ -198,6 +422,15 @@ async def startup() -> None:
     except Exception as _exc4:
         logger.warning("[CORE_TOOLS] warmup skipped: %s", _exc4)
 
+    # Capture the main event loop so worker-thread tool executors (browser_tools.py)
+    # can safely bridge into browser_workspace's Playwright objects, which are
+    # bound to this specific loop — see main_loop.py's docstring.
+    try:
+        from .services.main_loop import set_main_loop as _set_main_loop
+        _set_main_loop(asyncio.get_event_loop())
+    except Exception as _exc_ml:
+        logger.warning("[MAIN_LOOP] capture skipped: %s", _exc_ml)
+
     # System monitor — start background sampler
     try:
         from .services.system_monitor_service import system_monitor as _sysmon
@@ -208,9 +441,44 @@ async def startup() -> None:
     # Filesystem index — trigger singleton import so background scan starts immediately
     try:
         from .services.fs_index import fs_index as _fsidx  # noqa: F401 — side-effect: starts bg scan
+        from .services.background_scheduler import scheduler as _sched4, JobPriority as _JP4
+        _sched4.register("fs_index", _JP4.BACKGROUND_IDLE_ONLY)
         logger.info("[FS_INDEX] background scan started (ready=%s)", _fsidx.is_ready)
     except Exception as _exc6:
         logger.warning("[FS_INDEX] startup skipped: %s", _exc6)
+
+    # Phase 1 — System Intelligence: real-time filesystem watcher (semantic roots only)
+    try:
+        from .services.fs_watcher import fs_watcher as _fswatch
+        from .services.background_scheduler import scheduler as _sched7, JobPriority as _JP7
+        _sched7.register("fs_watcher_content", _JP7.BACKGROUND_IDLE_ONLY)
+        _fswatch.start()
+        logger.info("[FS_WATCHER] real-time indexing started")
+    except Exception as _exc7:
+        logger.warning("[FS_WATCHER] startup skipped: %s", _exc7)
+
+    # Phase 2 — Perception Engine: supersedes the standalone World State
+    # background-refresh thread from Phase 1.6. world_state.refresh_sensors()
+    # (window/workspace/Explorer) is still called every tick — just as one
+    # step inside the unified perception loop now, alongside the new
+    # browser/desktop/selection observation, instead of a second independent
+    # thread doing an overlapping poll. Must be an asyncio task (not a plain
+    # background thread) because Browser Perception awaits Playwright Page
+    # methods bound to this event loop — see event_dispatcher.py.
+    try:
+        from .services.perception import perception_engine as _perception_boot
+        _perception_boot.start()
+        logger.info("[PERCEPTION_ENGINE] observation loop started")
+    except Exception as _exc8:
+        logger.warning("[PERCEPTION_ENGINE] startup skipped: %s", _exc8)
+
+    # Note: the "Sure." TTS pre-cache, readiness gate (set_core_ready), STT
+    # warm-up (Whisper fast + accurate), and conversation-engine checks
+    # (personality engine + agent runtime) all now live in
+    # `_critical_boot_supervisor`/`_critical_model_warmup` above — see the
+    # Phase 4.14 block at the top of this function. They used to run here,
+    # unordered relative to the readiness gate, which is exactly what let
+    # sessions connect before models were actually warm.
 
 
 # CORS — allow the Next.js dashboard
@@ -253,3 +521,7 @@ app.include_router(takeover.router)
 app.include_router(dashboard.router)
 app.include_router(auth_router.router, prefix="/api/v1")
 app.include_router(monitor_router.router, prefix="/api/v1")
+app.include_router(agents_router.router)
+app.include_router(browser_router.router)
+app.include_router(fs_search_router.router)
+app.include_router(world_state_router.router)

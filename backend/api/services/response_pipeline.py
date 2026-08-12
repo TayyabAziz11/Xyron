@@ -22,8 +22,33 @@ logger = logging.getLogger(__name__)
 _OPENAI_TIMEOUT_S  = 8.0          # give up on OpenAI after 8s (streaming first-token)
 _FALLBACK_DURATION = 60.0         # use Ollama for this many seconds after one failure
 _OLLAMA_BASE       = "http://localhost:11434/v1"
-_OLLAMA_MODEL      = "llama3.2"   # override with OLLAMA_MODEL env var at startup
+_OLLAMA_MODEL      = "qwen2.5:1.5b"  # override with OLLAMA_MODEL env var at startup
+# qwen3:4b was tried and reverted: its default "thinking" mode burns ~9.5s of
+# real generation time on internal reasoning before any spoken answer, and
+# neither the OpenAI-compat nor native /api/chat think:false flag suppressed
+# it on Ollama 0.20.7 — unusable for voice latency. qwen2.5:1.5b generates in
+# ~170ms once warm and is what api/main.py already preloads at startup.
 _openai_failed_until: float = 0.0 # epoch time; 0 = circuit closed (use OpenAI)
+
+# A fresh AsyncOpenAI() rebuilds the whole httpx connection pool (new TCP+TLS
+# handshake) on every single voice turn. Combined with the SDK's default
+# max_retries=2, one slow/failed connect attempt turns an 8s timeout into a
+# ~16-24s wall-clock stall that starves the WS keepalive — live-measured via
+# asyncio debug mode as a 9.96s single-step block in _producer(). We already
+# have our own circuit-breaker + Ollama fallback above, so SDK-level retries
+# only add uncontrolled latency; disable them and reuse one pooled client.
+_openai_client: "AsyncOpenAI | None" = None
+
+
+def _get_openai_client() -> "AsyncOpenAI":
+    global _openai_client
+    if _openai_client is None:
+        from openai import AsyncOpenAI
+        from api.config import settings as _cfg
+        _openai_client = AsyncOpenAI(
+            api_key=_cfg.openai_api_key, timeout=_OPENAI_TIMEOUT_S, max_retries=0,
+        )
+    return _openai_client
 
 # Sentence boundary after .  !  ?  followed by whitespace or end-of-string
 _SENT_RE = re.compile(r'(?<=[.!?])(?:\s+|$)')
@@ -155,16 +180,23 @@ async def stream_response_with_tts(
         chunk_idx = 0
 
         try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=_cfg.openai_api_key, timeout=_OPENAI_TIMEOUT_S)
+            client = _get_openai_client()
 
-            async with await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=200,
-                temperature=0.7,
-                stream=True,
-            ) as stream:
+            # Hard backstop: even with max_retries=0, a stalled connect/TLS
+            # handshake could still hang past _OPENAI_TIMEOUT_S in rare cases.
+            # wait_for guarantees this step can never starve the event loop
+            # (and the WS keepalive) beyond one bounded window.
+            stream_cm = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=200,
+                    temperature=0.7,
+                    stream=True,
+                ),
+                timeout=_OPENAI_TIMEOUT_S,
+            )
+            async with stream_cm as stream:
                 async for chunk in stream:
                     delta = ""
                     if chunk.choices and chunk.choices[0].delta:
@@ -188,9 +220,40 @@ async def stream_response_with_tts(
                         pending = parts[-1]
 
         except Exception as exc:
-            _openai_failed_until = time.time() + _FALLBACK_DURATION
-            logger.warning("[MODEL_SWITCH_LOCAL] [MODEL_FALLBACK] openai stream failed: %s — using ollama for %.0fs",
-                           exc, _FALLBACK_DURATION)
+            # A hard billing/quota failure (e.g. "credit_balance_exhausted",
+            # "insufficient_quota") will not clear up on its own in 60s the
+            # way a transient timeout might — keep hammering OpenAI every
+            # minute and every retry just burns _OPENAI_TIMEOUT_S for nothing.
+            # Open the circuit much longer for that case specifically.
+            _exc_s = str(exc)
+            _is_quota_error = any(
+                s in _exc_s for s in (
+                    "insufficient_quota", "credit_balance_exhausted",
+                    "no credits remaining", "invalid_api_key",
+                )
+            )
+            _fallback_s = 1800.0 if _is_quota_error else _FALLBACK_DURATION
+            _openai_failed_until = time.time() + _fallback_s
+            logger.warning(
+                "[MODEL_SWITCH_LOCAL] [MODEL_FALLBACK] openai stream failed: %s — using ollama for %.0fs%s",
+                exc, _fallback_s, " (billing/quota — long backoff)" if _is_quota_error else "",
+            )
+            # This turn is the one that *discovered* the failure — if nothing
+            # was already streamed to the user (chunk_idx == 0), don't leave
+            # them with dead air. Previously this path fell straight through
+            # to the empty sentinel below and the user got total silence
+            # (live-observed: "[Pipeline] done — 0 chunks" + TTS_NO_AUDIO_SENT).
+            # Answer THIS turn via Ollama too, not just subsequent ones.
+            if chunk_idx == 0:
+                try:
+                    async def _passthrough(_w: Optional[bytes]) -> Optional[bytes]:
+                        return _w
+                    async for _sent, _wav, _idx, _fin in _ollama_stream(transcript, history, voice, speed):
+                        chunk_idx += 1
+                        tts_task = asyncio.create_task(_passthrough(_wav))
+                        await queue.put((_sent, tts_task, chunk_idx, _fin))
+                except Exception as _fallback_exc:
+                    logger.error("[MODEL_FALLBACK] same-turn ollama rescue also failed: %s", _fallback_exc)
         finally:
             # Flush remaining fragment as final
             remaining = _strip_md(pending)
@@ -286,11 +349,13 @@ async def quick_response(
     messages.append({"role": "user", "content": transcript})
 
     try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=_cfg.openai_api_key, timeout=_OPENAI_TIMEOUT_S)
+        client = _get_openai_client()
         logger.info("[MODEL_ROUTE] quick_response using=openai model=%s", model)
-        resp = await client.chat.completions.create(
-            model=model, messages=messages, max_tokens=150, temperature=0.7,
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model, messages=messages, max_tokens=150, temperature=0.7,
+            ),
+            timeout=_OPENAI_TIMEOUT_S,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:

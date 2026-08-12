@@ -26,8 +26,11 @@ dev = [
     "flake8>=4.0.0",
 ]
 voice = [
-    "openai-whisper>=20231117",
-    "pyaudio>=0.2.13",
+    # openai-whisper and pyaudio were declared here but confirmed unused
+    # (zero import sites anywhere in the codebase) in the 2026 platform-
+    # stabilization audit — faster-whisper (a different package, declared
+    # in requirements.txt) is the actual STT engine. Removed rather than
+    # left as dead declarations.
     "sounddevice>=0.4.6",
     "numpy>=1.24.0",
 ]

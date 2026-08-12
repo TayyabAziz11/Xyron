@@ -67,6 +67,13 @@ class ReflectionEngine:
         while True:
             await asyncio.sleep(interval_minutes * 60)
             try:
+                from api.services.background_scheduler import scheduler as _sched
+                if not _sched.should_run("reflection"):
+                    logger.debug("[Reflection] cycle skipped — voice active or boot delay")
+                    continue
+            except Exception:
+                pass
+            try:
                 await self.run_reflection_cycle()
             except Exception as exc:
                 logger.warning("[Reflection] cycle error: %s", exc)

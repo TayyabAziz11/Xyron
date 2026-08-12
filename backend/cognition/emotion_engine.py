@@ -104,8 +104,8 @@ class EmotionEngine:
             "[EmotionEngine] text=%r → emotion=%s energy=%.2f conf=%.2f (%.1fms)",
             text[:50], result.emotion, result.energy, result.confidence, ms,
         )
-        if result.confidence < 0.4:
-            result = self._llm_fallback(text, result)
+        # LLM fallback disabled on voice hot path: synchronous 3s Ollama call blocks event loop.
+        # Heuristic is sufficient for routing decisions; full LLM analysis is not needed here.
         return result
 
     # ── Heuristic detection ───────────────────────────────────────────────────
@@ -186,12 +186,12 @@ class EmotionEngine:
         if word_count >= 6 and exclaim_count == 0 and caps_count == 0 and question_count <= 1:
             return EmotionResult("calmness", 0.15, 0.62, 0.28)
 
-        # SERIOUSNESS: short direct text, no emotion markers
-        if word_count >= 3 and exclaim_count == 0 and humor_hits == 0 and question_count <= 1:
+        # SERIOUSNESS: short direct text, no emotion markers (1+ words covers all commands)
+        if word_count >= 1 and exclaim_count == 0 and humor_hits == 0 and question_count <= 1:
             return EmotionResult("seriousness", 0.25, 0.55, 0.32)
 
-        # Uncertain — pass to LLM fallback
-        return EmotionResult("calmness", 0.20, 0.32, 0.20)
+        # Uncertain — return calmness at safe confidence; LLM fallback skipped in voice path
+        return EmotionResult("calmness", 0.20, 0.50, 0.20)
 
     # ── LLM fallback ─────────────────────────────────────────────────────────
 

@@ -40,12 +40,17 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_OWW_BUILTIN_DIR  = Path(__file__).parent.parent.parent
+_OWW_BUILTIN_DIR: Optional[Path] = None   # None until a real openwakeword install is found
+_OWW_IMPORT_ERROR: Optional[str] = None
 try:
     import openwakeword as _oww
     _OWW_BUILTIN_DIR = Path(_oww.__file__).parent / "resources" / "models"
-except Exception:
-    pass
+except Exception as _oww_exc:
+    # Do NOT fall back to the repo root here — that silently produces a path
+    # like "<repo>/melspectrogram.onnx" that will never exist, and the real
+    # import failure gets swallowed. Leave _OWW_BUILTIN_DIR unset; _load_all()
+    # checks for that and marks the service unavailable with the real reason.
+    _OWW_IMPORT_ERROR = f"{type(_oww_exc).__name__}: {_oww_exc}"
 
 _CUSTOM_MODELS_DIR   = Path(os.getenv("WAKE_MODELS_DIR", os.path.expanduser("~/.xyron/wake_models")))
 _FALLBACK_MODEL      = os.getenv("WAKE_WORD_MODEL", "hey_jarvis").strip()
@@ -126,6 +131,14 @@ class WakeWordService:
 
     def _load_all(self) -> None:
         try:
+            if _OWW_BUILTIN_DIR is None:
+                logger.error("[OPENWAKEWORD_IMPORT_FAILED] error=%s", _OWW_IMPORT_ERROR)
+                logger.error("[WakeWord] openwakeword package unavailable — wake detection "
+                              "disabled (not falling back to an invalid model path)")
+                self._oww_ready = False
+                logger.info("[WAKE_MODELS_READY] oww=False")
+                return
+
             import onnxruntime as ort  # type: ignore
 
             # Suppress memcpy / node-assignment warnings (severity 3 = ERROR only)
@@ -137,8 +150,18 @@ class WakeWordService:
 
             # Load shared feature extraction models
             builtin = str(_OWW_BUILTIN_DIR)
-            self._mel_sess = ort.InferenceSession(f"{builtin}/melspectrogram.onnx", sess_options=_so)
-            self._emb_sess = ort.InferenceSession(f"{builtin}/embedding_model.onnx", sess_options=_so)
+            _mel_path = f"{builtin}/melspectrogram.onnx"
+            _emb_path = f"{builtin}/embedding_model.onnx"
+            _dir_ok = os.path.exists(_mel_path) and os.path.exists(_emb_path)
+            logger.info("[WAKE_MODEL_DIRECTORY] path=%s exists=%s", builtin, _dir_ok)
+            if not _dir_ok:
+                logger.error("[WakeWord] required preprocessing models missing at %s — "
+                              "wake detection disabled", builtin)
+                self._oww_ready = False
+                logger.info("[WAKE_MODELS_READY] oww=False")
+                return
+            self._mel_sess = ort.InferenceSession(_mel_path, sess_options=_so)
+            self._emb_sess = ort.InferenceSession(_emb_path, sess_options=_so)
 
             loaded: list[str] = []
 
@@ -174,11 +197,15 @@ class WakeWordService:
                 self._oww_ready = True
                 logger.info("[WakeWord] Ready — models: %s  cooldown=%.1fs",
                             ", ".join(loaded), _COOLDOWN_S)
+                logger.info("[WAKE_MODELS_READY] oww=True")
             else:
                 logger.error("[WakeWord] No models loaded — wake detection disabled")
+                logger.info("[WAKE_MODELS_READY] oww=False")
 
         except Exception as exc:
             logger.error("[WakeWord] Load failed: %s", exc, exc_info=True)
+            self._oww_ready = False
+            logger.info("[WAKE_MODELS_READY] oww=False")
 
     # ── Feature extraction ────────────────────────────────────────────────────
 
@@ -308,7 +335,8 @@ class WakeWordService:
         for name, conf in near_misses:
             thresh = self._thresholds.get(name, _DEFAULT_THRESHOLD)
             if conf >= thresh * 0.80:
-                logger.info("[WakeWord] WAKE_REJECTED_LOW_CONF model=%s conf=%.3f threshold=%.3f",
+                logger.info("[WakeWord] WAKE_REJECTED_LOW_CONF model=%s conf=%.3f threshold=%.3f "
+                            "reason=below_threshold",
                             name, conf, thresh)
 
         # Hard-negative mining: log near-misses above noise floor

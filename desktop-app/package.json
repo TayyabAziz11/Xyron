@@ -5,6 +5,7 @@
   "scripts": {
     "dev:frontend": "vite",
     "dev": "tauri dev",
+    "dev:win": "tauri dev",
     "dev:wsl": "NO_AT_BRIDGE=1 PULSE_SERVER=unix:/mnt/wslg/PulseServer WEBKIT_DISABLE_DMABUF_RENDERER=1 ALSA_CONFIG_PATH=/home/tayyab/.asoundrc DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-ai-operator tauri dev 2>&1 | grep -Ev 'ERROR:dbus|ERROR:content.*network_service|object_proxy|Connection refused|ALSA lib|PcmOpen|snd_|alsa_util|chunked_data_pipe' || true",
     "build:frontend": "vite build",
     "build": "tauri build",

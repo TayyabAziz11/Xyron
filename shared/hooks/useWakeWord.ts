@@ -28,6 +28,8 @@ const WS_RECONNECT_MS = 2_000
 const WS_TIMEOUT_MS   = 100_000   // 100s — backend waits up to 90s for OWW models on cold start
 const WS_POLL_MS      = 200       // check WS health every 200ms (was 1000ms)
 
+let _wakeWsInstanceCounter = 0
+
 function httpToWs(url: string): string {
   return url.replace(/^http:\/\//, 'ws://').replace(/^https:\/\//, 'wss://')
 }
@@ -36,26 +38,6 @@ function getWsBase(): string {
   const http = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
   return httpToWs(http)
 }
-
-function playWakeBeep(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const Cls = window.AudioContext ?? (window as any).webkitAudioContext
-    if (!Cls) return
-    const ctx  = new Cls() as AudioContext
-    const osc  = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.connect(gain)
-    gain.connect(ctx.destination)
-    osc.frequency.value = 880
-    gain.gain.setValueAtTime(0.25, ctx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15)
-    osc.start(ctx.currentTime)
-    osc.stop(ctx.currentTime + 0.15)
-    osc.onended = () => ctx.close().catch(() => {})
-  } catch { /* ok */ }
-}
-
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 // Pass enabled=false to defer mic/WS startup until the user explicitly activates
@@ -96,6 +78,8 @@ export function useWakeWord(onActivate: () => void, enabled = true) {
         const url = `${getWsBase()}/api/v1/voice/ws/wake`
         ws = new WebSocket(url)
         ws.binaryType = 'arraybuffer'
+        const _wakeInstanceId = `wake-${++_wakeWsInstanceCounter}`
+        console.log(`[WAKE_WS_INSTANCE_CREATED] instance_id=${_wakeInstanceId}`)
 
         const timer = setTimeout(() => {
           ws?.close()
@@ -120,7 +104,6 @@ export function useWakeWord(onActivate: () => void, enabled = true) {
               const { model, confidence } = msg
               console.log(`[WAKE_EVENT_RECEIVED] model=${model} conf=${confidence?.toFixed(3)}`)
               console.log('[START_SESSION_BEGIN] calling wakeActivate → startSession()')
-              playWakeBeep()
               activateRef.current()
               // Re-arm after 4s
               setTimeout(() => {
