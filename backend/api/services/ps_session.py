@@ -20,6 +20,15 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Cap on how long a call waits to acquire the lock, independent of its own
+# `timeout`. A caller whose own asyncio-level wrapper already gave up (e.g.
+# asyncio.wait_for(..., timeout=1.5) on a call passing timeout=6) leaves this
+# session still running under the lock for up to its own `timeout` before
+# self-resolving — an unrelated caller queued up right after would otherwise
+# silently inherit whatever's left of that abandoned wait. Bounding the
+# acquire means contention fails fast with "PowerShell busy" instead.
+_LOCK_WAIT_CAP = 3.0
+
 _PS_PATHS = [
     "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
     "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
@@ -77,7 +86,9 @@ class _PersistentSession:
 
     def run(self, command: str, timeout: int = 10) -> tuple[bool, str]:
         """Execute a PowerShell command. Returns (success, stdout)."""
-        with self._lock:
+        if not self._lock.acquire(timeout=min(timeout, _LOCK_WAIT_CAP)):
+            return False, "PowerShell busy"
+        try:
             if not self._alive():
                 if not self._start():
                     return False, "PowerShell not available"
@@ -130,6 +141,8 @@ class _PersistentSession:
                 pass
             self._proc = None
             return False, "Command timed out"
+        finally:
+            self._lock.release()
 
     def shutdown(self) -> None:
         with self._lock:

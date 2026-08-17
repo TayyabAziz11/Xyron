@@ -20,6 +20,7 @@ Log prefixes: [SCREEN_AGENT_QUERY] [SCREEN_AGENT_CACHED] [SCREEN_AGENT_DESCRIBE]
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import threading
@@ -40,6 +41,33 @@ _PS_EXPLORER_CMD = (
     "if($w){ $w.Document.Folder.Self.Path }else{ '' }"
 )
 
+# Chrome address-bar (omnibox) URL read via UI Automation — the working
+# fallback for when CDP is unreachable (see _get_browser_url_cdp's docstring
+# and _get_browser_url_uia below: CDP requires Chrome to have been launched
+# with --remote-debugging-port, which a normal everyday Chrome session never
+# is, and there is no way to retroactively attach). Chrome's address bar
+# AutomationId is an unstable per-build numeric value (e.g. "view_1012"),
+# but its ClassName is the stable "OmniboxViewViews" across Chrome versions
+# — verified live. Runs against the first Chrome process with a real
+# top-level window, independent of which window currently has focus, since
+# GetForegroundWindow() from window_context already establishes that Chrome
+# IS the foreground app before this is ever called.
+_PS_CHROME_OMNIBOX_CMD = (
+    "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes; "
+    "$procs = Get-Process -Name chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }; "
+    "if (-not $procs) { Write-Output 'URL:' } else { "
+    "$h = $procs[0].MainWindowHandle; "
+    "$root=[System.Windows.Automation.AutomationElement]::FromHandle($h); "
+    "$cond=New-Object System.Windows.Automation.PropertyCondition("
+    "[System.Windows.Automation.AutomationElement]::ClassNameProperty,'OmniboxViewViews'); "
+    "$addr=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$cond); "
+    "if ($addr) { "
+    "$vp=$addr.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); "
+    "Write-Output ('URL:' + $vp.Current.Value) "
+    "} else { Write-Output 'URL:' } "
+    "}"
+)
+
 # Regexes for title parsing
 _CHROME_RE      = re.compile(r'^(.+?)\s+-\s+Google Chrome\s*$', re.IGNORECASE)
 _EDGE_RE        = re.compile(r'^(.+?)\s+-\s+Microsoft Edge\s*$', re.IGNORECASE)
@@ -50,6 +78,19 @@ _VSCODE_RE      = re.compile(
     re.IGNORECASE,
 )
 _EXPLORER_RE    = re.compile(r'^(.+?)\s*$')   # title IS the folder name in Explorer
+
+# GitHub repo title pattern ("owner/repo: description") — GitHub sets this
+# as the literal <title> on repo pages. Used as a fallback when the CDP tab
+# URL is unavailable (e.g. the bridge — see cdp_config.py — isn't reachable,
+# which happens whenever Chrome wasn't launched with the debug port), since
+# without a URL classify_github_page() has nothing to work with and
+# describe() would otherwise fall all the way to a bare title echo. Less
+# certain than the URL-confirmed path, so phrasing stays hedged ("It looks
+# like...") rather than the flat "You're looking at your X repository."
+_TITLE_GITHUB_REPO_RE = re.compile(
+    r'^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/'
+    r'(?P<repo>[A-Za-z0-9._-]+):\s*(?P<desc>.+)$'
+)
 
 # Trailing " - <something>" / " | <something>" boilerplate — Windows and
 # browser titles routinely tack their own app/site name onto the end
@@ -189,6 +230,17 @@ class ScreenSnapshot:
                 _dl.info("[SCREEN_CONTEXT_DESCRIPTION] app=%r page_type=%s desc=%r",
                          self.active_app, self.page_type, desc[:120])
                 return desc
+
+        if self.is_browser and not self.repository:
+            m = _TITLE_GITHUB_REPO_RE.match(self.browser_title or "")
+            if m:
+                owner, repo, desc = m.group("owner"), m.group("repo"), m.group("desc").strip()
+                sentence = f"It looks like you're viewing the {repo} repository by {owner} on GitHub."
+                if desc:
+                    sentence += f" It's described as: {desc}."
+                _dl.info("[SCREEN_CONTEXT_DESCRIPTION] app=%r title_github_fallback=%s/%s desc=%r",
+                         self.active_app, owner, repo, sentence[:120])
+                return sentence
 
         if self.is_store:
             if self.store_page:
@@ -490,7 +542,14 @@ class ScreenContextAgent:
         if snap.is_explorer and not snap.explorer_path:
             snap.explorer_path = self._get_explorer_path()
 
-        # Step 4: Browser URL via CDP (optional, non-blocking if port closed)
+        # Step 4: Browser URL. UIA (address-bar read) tried first — fast
+        # (~30ms warm) and works against a normal, already-running Chrome
+        # window. CDP is the fallback for environments where the bridge in
+        # cdp_config.py actually is reachable (it never attaches to a
+        # normal everyday Chrome session, which is never launched with
+        # --remote-debugging-port — see _get_browser_url_cdp's docstring).
+        if snap.is_browser and not snap.browser_url:
+            snap.browser_url = self._get_browser_url_uia()
         if snap.is_browser and not snap.browser_url:
             snap.browser_url = self._get_browser_url_cdp()
 
@@ -521,6 +580,19 @@ class ScreenContextAgent:
                         snap.page_type = pt
             except Exception as exc:
                 logger.debug("[SCREEN_AGENT] local URL classification failed: %s", exc)
+
+        # Step 4c: on a shopping page with no schema.org data yet (the
+        # common case — full product name/price/rating needs a live page
+        # scrape via browser_workspace, a *different* Chrome instance than
+        # the one being read here), record at least the tab title as a
+        # name guess. Without this, describe() falls back to the generic
+        # "you appear to be shopping" sentence AND — more importantly —
+        # context_stack never gets a "product" entity, so a follow-up
+        # ("find me something cheaper") has nothing to search for and
+        # replies "I don't have a product in context." Step 5 below
+        # overrides this with real schema.org data when world_state has it.
+        if snap.is_browser and snap.page_type == "shopping" and not snap.product and snap.browser_title:
+            snap.product = {"name": snap.browser_title}
 
         # Step 5 (Part 8/9): let Perception Engine's world_state data (richer —
         # has Playwright schema.org product extraction, etc.) override/augment
@@ -626,14 +698,49 @@ class ScreenContextAgent:
         """
         try:
             from api.services.ps_session import ps_session as _pss
-            if _pss.is_warm:
-                ok, out = _pss.run(_PS_EXPLORER_CMD, timeout=6)
-                if ok and out.strip():
-                    path = out.strip()
-                    logger.info("[SCREEN_AGENT_EXPLORER] path=%r", path)
-                    return path
+            ok, out = _pss.run(_PS_EXPLORER_CMD, timeout=6)
+            if ok and out.strip():
+                path = out.strip()
+                logger.info("[SCREEN_AGENT_EXPLORER] path=%r", path)
+                return path
         except Exception as exc:
             logger.debug("[SCREEN_AGENT] explorer path error: %s", exc)
+        return ""
+
+    def _get_browser_url_uia(self) -> str:
+        """
+        Read the current tab URL directly out of Chrome's address bar via
+        Windows UI Automation, over the same persistent ps_session used
+        everywhere else in this file. Works against the user's own,
+        normally-launched Chrome — unlike CDP, which requires Chrome to
+        have been started with --remote-debugging-port (see
+        _get_browser_url_cdp's docstring for why that's unreachable for a
+        normal Chrome session). Verified live: ~330ms cold (UIA assembly
+        load), ~30ms warm.
+
+        Chrome's omnibox shows a display-simplified URL (scheme and
+        sometimes "www." stripped) — normalized here with a scheme prefix
+        so downstream urlparse()-based classification (classify_github_page
+        / classify_page_type) gets a real netloc instead of parsing the
+        whole string as a path.
+        """
+        try:
+            from api.services.ps_session import ps_session as _pss
+            ok, out = _pss.run(_PS_CHROME_OMNIBOX_CMD, timeout=6)
+            if not ok:
+                return ""
+            out = (out or "").strip()
+            if not out.startswith("URL:"):
+                return ""
+            url = out[len("URL:"):].strip()
+            if not url:
+                return ""
+            if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url):
+                url = "https://" + url
+            logger.debug("[SCREEN_AGENT_UIA] url=%r", url[:80])
+            return url
+        except Exception as exc:
+            logger.debug("[SCREEN_AGENT_UIA] unavailable: %s", exc)
         return ""
 
     def _get_browser_url_cdp(self) -> str:
@@ -657,7 +764,7 @@ class ScreenContextAgent:
             import urllib.request
             import json as _json
             _endpoint = _get_cdp_config().endpoint
-            with urllib.request.urlopen(f"{_endpoint}/json", timeout=1.0) as resp:
+            with urllib.request.urlopen(f"{_endpoint}/json", timeout=0.5) as resp:
                 tabs = _json.loads(resp.read())
                 for tab in tabs:
                     if tab.get("type") == "page":
@@ -672,6 +779,30 @@ class ScreenContextAgent:
 
 # Module-level singleton
 screen_context_agent = ScreenContextAgent()
+
+
+# ── Vision-enriched description (real screen understanding) ──────────────────
+# Merges the fast, structured title/URL-based description above with what a
+# vision model (perception/vision_perception.py, reused not reinvented)
+# actually reports seeing on screen — the part describe() alone can never
+# provide since it never looks at pixels.
+
+_MAX_VISION_COMPOSED_LEN = 320  # keep the merged answer TTS-reasonable
+
+
+def compose_with_vision(structured_desc: str, vision_text: str) -> str:
+    """Append real visual detail to the structured description. Structured
+    description stays first (reliable, always available); vision_text is
+    never fabricated — it's exactly what the vision model reported, or this
+    returns structured_desc unchanged if vision_text is empty."""
+    vision_text = (vision_text or "").strip()
+    if not vision_text:
+        return structured_desc
+    combined = f"{structured_desc.rstrip()} {vision_text}"
+    if len(combined) > _MAX_VISION_COMPOSED_LEN:
+        head = combined[:_MAX_VISION_COMPOSED_LEN].rsplit(" ", 1)[0]
+        combined = (head or combined[:_MAX_VISION_COMPOSED_LEN]).strip() + "…"
+    return combined
 
 
 # ── Repository follow-ups (Part 10) ───────────────────────────────────────────
@@ -785,12 +916,11 @@ _PRODUCT_FOLLOWUP_ACTIONS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\bcheaper\s+(?:option|alternative|price)\b', re.I), "cheaper"),
 ]
 
-# How many search-result candidates to try opening before giving up, and how
-# many priced candidates are "enough" to stop early — keeps a live search
-# to a handful of seconds rather than working through every result.
+# How many search-result candidates to open concurrently, and how many
+# priced results are "enough" to report back (checked all at once via
+# asyncio.gather in _search_prices, not sequentially — see its docstring).
 _PRODUCT_SEARCH_MAX_CANDIDATES = 4
 _PRODUCT_SEARCH_ENOUGH_PRICES  = 2
-_PRODUCT_SEARCH_NAV_TIMEOUT_MS = 8_000
 
 
 def match_product_followup(text: str) -> Optional[str]:
@@ -802,6 +932,36 @@ def match_product_followup(text: str) -> Optional[str]:
     return None
 
 
+async def _check_price_candidate(url: str, title: str) -> Optional[dict]:
+    """Open one candidate result in its own tab and read its price — a
+    single unit of work run concurrently (not sequentially) across
+    candidates by _search_prices below. Each call goes through
+    browser_workspace.new_tab_if_approved, the same approval choke point
+    the single-candidate version always used; it's the sanctioned way to
+    open additional tabs (documented in browser_workspace.py) and is safe
+    to call multiple times concurrently — each call gets its own Page."""
+    try:
+        from api.agents.browser_agent.browser_workspace import browser_workspace
+        page = await browser_workspace.new_tab_if_approved(
+            url, approved=True, reason="product_price_comparison_candidate",
+        )
+        if page is None:
+            return None
+        try:
+            from api.agents.browser_agent.browser_reader import BrowserReader
+            price = await BrowserReader().extract_price(page)
+            if price:
+                return {"title": (title or url)[:60], "price": price}
+            return None
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
 async def _search_prices(product_name: str) -> list[dict]:
     """Open a NEW tab (never navigates the user's current product tab away
     — unlike repository follow-ups, which intentionally redirect the same
@@ -809,7 +969,13 @@ async def _search_prices(product_name: str) -> list[dict]:
     product, and read real prices off the top results. The user's own
     follow-up command ("find me something cheaper") is the approval this
     gate exists for. Returns [] (never raises) if the browser isn't
-    connected or nothing priced was found."""
+    connected or nothing priced was found.
+
+    Candidates are checked concurrently (asyncio.gather), not one at a
+    time — the previous sequential version could take up to
+    MAX_CANDIDATES x NAV_TIMEOUT (4 x 8s = 32s) in the worst case; running
+    them at once bounds the wait to roughly the single slowest candidate
+    instead, and in practice most complete in a few seconds."""
     try:
         from api.agents.browser_agent.browser_workspace import browser_workspace
         if not browser_workspace.is_healthy:
@@ -817,41 +983,35 @@ async def _search_prices(product_name: str) -> list[dict]:
 
         import urllib.parse
         search_url = f"https://www.google.com/search?q={urllib.parse.quote(product_name + ' price')}"
-        page = await browser_workspace.new_tab_if_approved(
+        search_page = await browser_workspace.new_tab_if_approved(
             search_url, approved=True, reason="product_price_comparison",
         )
-        if page is None:
+        if search_page is None:
             return []
 
         try:
             from api.agents.browser_agent.browser_reader import BrowserReader
-            reader = BrowserReader()
-            results = await reader.extract_search_results(page)
-
-            candidates: list[dict] = []
-            for r in results[:_PRODUCT_SEARCH_MAX_CANDIDATES]:
-                url = r.get("url", "")
-                if not url.startswith("http"):
-                    continue
-                try:
-                    await page.goto(url, wait_until="domcontentloaded",
-                                     timeout=_PRODUCT_SEARCH_NAV_TIMEOUT_MS)
-                    price = await reader.extract_price(page)
-                    if price:
-                        candidates.append({
-                            "title": (r.get("title") or url)[:60],
-                            "price": price,
-                        })
-                except Exception:
-                    continue
-                if len(candidates) >= _PRODUCT_SEARCH_ENOUGH_PRICES:
-                    break
-            return candidates
+            results = await BrowserReader().extract_search_results(search_page)
         finally:
             try:
-                await page.close()
+                await search_page.close()
             except Exception:
                 pass
+
+        candidate_urls = [
+            (r.get("url", ""), r.get("title", ""))
+            for r in results[:_PRODUCT_SEARCH_MAX_CANDIDATES]
+            if r.get("url", "").startswith("http")
+        ]
+        if not candidate_urls:
+            return []
+
+        results_raw = await asyncio.gather(
+            *(_check_price_candidate(url, title) for url, title in candidate_urls),
+            return_exceptions=True,
+        )
+        candidates = [r for r in results_raw if isinstance(r, dict)]
+        return candidates[:_PRODUCT_SEARCH_ENOUGH_PRICES]
     except Exception as exc:
         logger.debug("[PRODUCT_FOLLOWUP_SEARCH] failed: %s", exc)
         return []
@@ -928,3 +1088,88 @@ async def handle_screen_offer_confirmation() -> Optional[str]:
     if entity.type == "repository":
         return await handle_repository_followup(offer[0])
     return None
+
+
+# ── Generic descriptive follow-ups ("what is this", "tell me more") ─────────
+# Distinct from the repository/product action-verb follow-ups above ("review
+# it", "compare it") — this catches plain descriptive questions asked right
+# after a screen query, for ANY entity type screen_agent can push (window/
+# store_app/app/folder, not just repository/product). Without this, a
+# generic "what is this? tell me more about it" fell through to the normal
+# intent router, which had no ContextStack entity to resolve it against and
+# misrouted it to a browser research agent that searched the literal
+# follow-up text ("this? can you tell me more about it?" — 0 results).
+
+_GENERIC_FOLLOWUP_RE = re.compile(
+    r'\b(?:'
+    r'what(?:\'s|\s+is)\s+(?:this|that)\b'
+    r'|tell\s+me\s+more(?:\s+about\s+(?:it|this|that))?\b'
+    r'|explain\s+(?:this|that|it)\b'
+    r'|(?:can\s+you\s+)?elaborate(?:\s+on\s+(?:it|this|that))?\b'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def match_generic_followup(text: str) -> bool:
+    """True if *text* is a generic descriptive follow-up ("what is this",
+    "tell me more about it", "explain this") that should resolve against
+    the last screen-agent ContextStack entity rather than being routed as
+    a fresh command/search."""
+    return bool(_GENERIC_FOLLOWUP_RE.search(text))
+
+
+async def handle_generic_followup() -> Optional[str]:
+    """Answer a generic descriptive follow-up using the last screen-agent
+    ContextStack entity. Returns None (caller falls through to normal
+    routing) if there's nothing fresh enough to expand on."""
+    try:
+        from api.services.context_stack import context_stack
+        entity = context_stack.peek()
+    except Exception:
+        entity = None
+
+    if not entity or entity.source != "screen_agent":
+        return None
+    if time.time() - entity.pushed_at > _SCREEN_OFFER_MAX_AGE_S:
+        return None
+
+    if entity.type == "repository":
+        return await handle_repository_followup("review")
+    if entity.type == "product" and entity.metadata:
+        return _describe_product(entity.metadata)
+
+    # window / store_app / app / folder — no structured data to expand on;
+    # the only way to say anything more is to actually look again, this
+    # time vision-enriched (mirrors the Tier 0x screen-query path).
+    try:
+        snap = await asyncio.to_thread(screen_context_agent.get_fresh)
+        desc = snap.describe()
+    except Exception as exc:
+        logger.debug("[GENERIC_FOLLOWUP] failed: %s", exc)
+        return None
+
+    # Vision enrichment is best-effort on top of the description above,
+    # which is already valid and worth returning on its own. A timeout or
+    # any other vision failure must only skip enrichment, not blank out
+    # the whole answer — that's what previously turned a good "you're
+    # looking at X" into a silent None, falling through to the intent
+    # router and misrouting the turn to a browser research agent.
+    try:
+        openai_key = ""
+        from api.config import settings as _gf_cfg
+        if _gf_cfg.openai_api_key and _gf_cfg.openai_api_key.startswith("sk-"):
+            openai_key = _gf_cfg.openai_api_key
+
+        if openai_key:
+            from api.services.perception import vision_perception as _vp
+            vision_result = await asyncio.wait_for(
+                asyncio.to_thread(_vp.maybe_capture, "generic_followup", openai_key),
+                timeout=2.5,
+            )
+            if vision_result and vision_result.get("description"):
+                desc = compose_with_vision(desc, vision_result["description"])
+    except Exception as exc:
+        logger.debug("[GENERIC_FOLLOWUP_VISION] skipped: %s", exc)
+
+    return desc

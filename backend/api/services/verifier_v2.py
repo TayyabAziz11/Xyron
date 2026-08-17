@@ -154,6 +154,23 @@ def _lookup_app(app_name: str) -> dict:
     key = app_name.lower().strip().rstrip(".")
     if key in _APP_VERIFY_TABLE:
         return _APP_VERIFY_TABLE[key]
+    # The launch path (system_tools._exec_open_application) resolves aliases
+    # and strips filler words ("search chrome" → "chrome", "google chrome" →
+    # "chrome") before ever calling launch_app — but this verify path was
+    # checking the raw, un-normalized app_name from the tool params, so a
+    # launch that correctly resolved and succeeded could still fail
+    # verification because "search chrome" isn't a real process name. Reuse
+    # the exact same normalizer so launch and verify always agree on the
+    # canonical app name.
+    try:
+        from api.tools.system_tools import _normalise_app as _norm_app
+        norm_key = _norm_app(app_name)
+        if norm_key != key and norm_key in _APP_VERIFY_TABLE:
+            return _APP_VERIFY_TABLE[norm_key]
+        if norm_key != key:
+            key = norm_key
+    except Exception:
+        pass
     # Generic fallback: use the app name itself. Flagged so
     # _verify_app_launch can refuse to accept a bare shell-host process
     # (cmd/conhost/powershell) as evidence — see

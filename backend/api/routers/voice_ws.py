@@ -287,6 +287,18 @@ async def ws_wake(websocket: WebSocket) -> None:
                             if not _ready:
                                 logger.info("[WS/wake] WAKE_REJECTED_NOT_READY — Whisper unavailable after 2s")
                                 matched, transcript = False, ""
+                                # Previously this rejection was invisible to the
+                                # user — OWW fired, nothing happened, no signal
+                                # the frontend could show. On a slow-loading
+                                # machine (large/cold Whisper model, slow disk)
+                                # this silently swallows every "Hey Xyron" during
+                                # the warmup window. Tell the frontend so it can
+                                # show a "still starting up" indicator instead.
+                                await _send(websocket, {
+                                    "type":   "wake_not_ready",
+                                    "model":  model_name,
+                                    "ts":     int(time.time() * 1000),
+                                })
                             else:
                                 matched, transcript = await loop.run_in_executor(
                                     None, verify_wake_phrase, clip
@@ -370,6 +382,130 @@ _SILENCE_FRAMES    = 9       # 9 × 80ms = 720ms silence → end of speech
 _MIN_SPEECH_FRAMES = 9       # < 720ms → too short, discard (9 × 80ms frames)
 _SHORT_MIN_SPEECH_FRAMES = 3 # 240ms — single-word commands ("cancel") during an active flight session
 _INTERRUPT_RMS     = 0.020   # RMS above this during TTS = user interrupt
+
+# ── Audio front-end cleanup (noise suppression + gain normalization) ────────
+# Runs AFTER the silence/duration/speech-ratio gates below have already
+# confirmed the clip contains real speech — never applied to raw audio that
+# might still get discarded as silence/noise, so it can't turn a noise floor
+# into a false "speech" pass.
+_DENOISE_OVER_SUBTRACT = 1.5   # spectral subtraction strength
+_DENOISE_FLOOR         = 0.05  # keep at least this fraction of original magnitude (avoids musical-noise artifacts)
+_DENOISE_NPERSEG       = 400   # 25ms window at 16kHz
+_DENOISE_NOVERLAP      = 200   # 12.5ms hop
+_NORMALIZE_TARGET_PEAK = 0.95  # consistent peak level into Whisper regardless of mic gain/distance
+_NORMALIZE_MAX_GAIN    = 10.0  # cap amplification so a near-silent residual noise floor isn't blown up
+
+
+def _denoise_and_normalize(audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
+    """
+    Lightweight STT front-end cleanup: FFT spectral-gate noise suppression,
+    then peak gain normalization. Pure numpy/scipy — no new model/dependency.
+    """
+    audio_clean = audio
+    try:
+        from scipy.signal import istft, stft
+
+        _, _, Zxx = stft(audio, fs=sample_rate, nperseg=_DENOISE_NPERSEG, noverlap=_DENOISE_NOVERLAP)
+        mag = np.abs(Zxx)
+        phase = np.angle(Zxx)
+
+        # Noise profile: median magnitude of the quietest 20% of frames —
+        # robust without needing leading "silence" audio (already trimmed
+        # away upstream by the time this runs).
+        frame_energy = mag.mean(axis=0)
+        n_noise_frames = max(1, int(0.2 * len(frame_energy)))
+        noise_frame_idx = np.argsort(frame_energy)[:n_noise_frames]
+        noise_profile = np.median(mag[:, noise_frame_idx], axis=1, keepdims=True)
+
+        mag_clean = np.maximum(mag - _DENOISE_OVER_SUBTRACT * noise_profile, _DENOISE_FLOOR * mag)
+        Zxx_clean = mag_clean * np.exp(1j * phase)
+        _, audio_clean = istft(Zxx_clean, fs=sample_rate, nperseg=_DENOISE_NPERSEG, noverlap=_DENOISE_NOVERLAP)
+        audio_clean = audio_clean[:len(audio)].astype(np.float32)
+    except Exception as exc:
+        logger.debug("[AUDIO_DENOISE_SKIPPED] error=%s", exc)
+        audio_clean = audio
+
+    peak = float(np.max(np.abs(audio_clean))) if audio_clean.size else 0.0
+    if peak > 1e-6:
+        gain = min(_NORMALIZE_TARGET_PEAK / peak, _NORMALIZE_MAX_GAIN)
+        audio_clean = (audio_clean * gain).astype(np.float32)
+
+    return audio_clean
+
+
+# ── Semantic transcript correction (GPT-4o-mini) ─────────────────────────────
+# Runs after STT, before the transcript reaches intent matching. Only fires
+# when STT confidence itself signals uncertainty — hybrid_stt_router's own
+# _SIMPLE_VOCAB short-circuit already covers well-known commands, so this
+# targets the residual cases: a plausible-sounding but wrong word/entity name
+# that confidence-only heuristics can't catch. Fails open (returns the
+# original transcript unchanged) on any timeout/error or when OpenAI is
+# unavailable/rate-limited — never blocks or breaks a turn.
+_CORRECTION_CONF_THRESHOLD = -0.35  # only correct transcripts STT itself is unsure about
+_CORRECTION_TIMEOUT_S      = 2.0
+
+
+def _needs_semantic_correction(transcript: str, confidence: float) -> bool:
+    from voice.hybrid_stt_router import _SIMPLE_VOCAB
+    norm = transcript.lower().strip().rstrip(".!?,")
+    if norm in _SIMPLE_VOCAB:
+        return False
+    return confidence < _CORRECTION_CONF_THRESHOLD
+
+
+async def _correct_transcript_semantic(transcript: str, confidence: float) -> str:
+    """
+    Best-effort GPT-4o-mini pass that fixes likely Whisper misrecognitions
+    using recent app/folder/file context, before intent matching runs.
+    Returns the original transcript unchanged on any failure/timeout or when
+    correction isn't warranted.
+    """
+    if not transcript or not _needs_semantic_correction(transcript, confidence):
+        return transcript
+
+    try:
+        from api.services.openai_client import openai_client
+        if not openai_client.available:
+            return transcript
+
+        from api.services.context_stack import context_stack as _cstack
+        _recent = [e.display for e in _cstack.recent(5) if e.display]
+        _context_line = f"Recently used: {', '.join(_recent)}." if _recent else ""
+
+        _prompt = (
+            "You are correcting a speech-to-text transcript of a spoken voice-assistant "
+            "command for a Windows desktop assistant named Xyron. The transcript may "
+            "contain phonetic misrecognitions. Fix ONLY clear transcription errors — "
+            "keep the same intent and wording otherwise. If the transcript already looks "
+            "correct, return it unchanged. Reply with ONLY the corrected transcript, no "
+            "quotes, no explanation.\n"
+            f"{_context_line}\n"
+            f"Transcript: {transcript}"
+        )
+        _t0 = time.time()
+        _corrected = await asyncio.wait_for(
+            asyncio.to_thread(
+                openai_client.generate,
+                [{"role": "user", "content": _prompt}],
+                "gpt-4o-mini", 60, 0.0,
+            ),
+            timeout=_CORRECTION_TIMEOUT_S,
+        )
+        _ms = (time.time() - _t0) * 1000
+        _corrected = (_corrected or "").strip().strip('"')
+        if _corrected and _corrected.lower() != transcript.lower():
+            logger.info("[TRANSCRIPT_SEMANTIC_CORRECTED] ms=%.0f %r → %r",
+                        _ms, transcript[:80], _corrected[:80])
+            return _corrected
+        return transcript
+    except asyncio.TimeoutError:
+        logger.debug("[TRANSCRIPT_SEMANTIC_CORRECTION] timed out (%ss) — using original",
+                     _CORRECTION_TIMEOUT_S)
+        return transcript
+    except Exception as exc:
+        logger.debug("[TRANSCRIPT_SEMANTIC_CORRECTION] failed: %s — using original", exc)
+        return transcript
+
 
 # ── Greeting phrase pool (latency/UX polish pass) ───────────────────────────
 # "I'm listening." is a frontend STATE, not a greeting — it read as robotic.
@@ -796,6 +932,19 @@ async def ws_session(websocket: WebSocket) -> None:
                     is_speaking = False
                     stuck_since = None
                     if websocket.client_state == WebSocketState.CONNECTED:
+                        # Previously this recovery was silent — the user hears
+                        # nothing at all (no audio was ever sent, that's the
+                        # whole trigger condition) and the UI just flips back
+                        # to "listening" with no explanation, which reads as
+                        # the app having gone completely unresponsive. Speak
+                        # a short apology so there's audible confirmation
+                        # something happened and what to do next.
+                        try:
+                            _stuck_text = "Sorry, that took too long — please try again."
+                            await _send(websocket, {"type": "response", "text": _stuck_text, "chunk": 1})
+                            await _tts_with_fallback(_stuck_text)
+                        except Exception as _stuck_exc:
+                            logger.debug("[TTS_STUCK_RECOVERY_SPEAK_FAILED] %r", _stuck_exc)
                         await _send(websocket, {"type": "listening"})
                     logger.info("[VOICE_STATE_RECOVERED] from=speaking to=listening")
             else:
@@ -1660,6 +1809,20 @@ async def ws_session(websocket: WebSocket) -> None:
             await _send(websocket, {"type": "listening"})
             return
 
+        # ── Audio front-end cleanup — noise suppression + gain normalization ──
+        # Only reached after every silence/duration/ratio gate above has
+        # already confirmed real speech, so cleanup never risks amplifying
+        # pure noise. Runs before STT so Whisper gets a cleaner, level-
+        # normalized signal regardless of mic quality/distance.
+        try:
+            _pre_clean_rms = _pre_rms
+            audio = _denoise_and_normalize(audio, 16000)
+            _post_clean_rms = float(np.sqrt(np.mean(audio ** 2)))
+            logger.debug("[AUDIO_CLEANUP] rms_before=%.5f rms_after=%.5f",
+                         _pre_clean_rms, _post_clean_rms)
+        except Exception as _clean_exc:
+            logger.debug("[AUDIO_CLEANUP_FAILED] error=%s", _clean_exc)
+
         # ── Phase 4.12: immediate <1s acknowledgement ─────────────────────────
         # Fired here — after every real-speech validation gate has passed, but
         # BEFORE STT (which can take 3-4s: STT_ROUTER_DECISION + a low-
@@ -1708,9 +1871,30 @@ async def ws_session(websocket: WebSocket) -> None:
         _stt_secondary = None  # Phase 2.1: secondary model result (for N-best)
         try:
             from voice.hybrid_stt_router import route as _stt_route
-            _stt_route_out = await asyncio.to_thread(
-                _stt_route, audio, _audio_dur_ms, _session_state
-            )
+            # hybrid_stt_router.route() is a plain synchronous call into
+            # faster-whisper with no internal timeout — on a machine where
+            # the Whisper model is still loading (slow disk/cold cache) or
+            # the model lock is held by another warmup thread, this could
+            # block asyncio.to_thread's worker indefinitely with zero
+            # feedback to the user (live-measured: session sits silent past
+            # the 12s stuck-watchdog with is_speaking never even set, since
+            # nothing downstream of this call has run yet). Bound it so a
+            # hang degrades to "please repeat" instead of a dead session.
+            try:
+                _stt_route_out = await asyncio.wait_for(
+                    asyncio.to_thread(_stt_route, audio, _audio_dur_ms, _session_state),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[STT_TIMEOUT] audio_ms=%.0f — Whisper call exceeded 25s, "
+                               "model likely still loading/unavailable", _audio_dur_ms)
+                is_speaking = True
+                _stt_timeout_text = "Sorry, I'm still starting up — please try again in a moment."
+                await _send(websocket, {"type": "response", "text": _stt_timeout_text, "chunk": 1})
+                await _tts_with_fallback(_stt_timeout_text)
+                is_speaking = False
+                await _send(websocket, {"type": "listening"})
+                return
             # Unpack 3-tuple (result, model, secondary); secondary may be None
             result, _stt_model = _stt_route_out[0], _stt_route_out[1]
             _stt_secondary = _stt_route_out[2] if len(_stt_route_out) > 2 else None
@@ -1909,6 +2093,17 @@ async def ws_session(websocket: WebSocket) -> None:
             is_speaking = False
             await _send(websocket, {"type": "listening"})
             return
+
+        # ── Semantic transcript correction — before any intent matching
+        # consumes the transcript, including the fast-path agent dispatch
+        # immediately below. Only fires on low-confidence STT results (see
+        # _needs_semantic_correction); fails open to the original transcript.
+        _corrected_transcript = await _correct_transcript_semantic(
+            transcript, result.get("confidence", -999.0)
+        )
+        if _corrected_transcript != transcript:
+            transcript = _corrected_transcript
+            result["text"] = transcript
 
         # ── Phase 4.14 Part 3: Parallel pipeline — fast-path agent dispatch ───
         # A confident "book a flight/hotel/ticket" match is unambiguous enough
@@ -2566,26 +2761,46 @@ async def ws_session(websocket: WebSocket) -> None:
             if _SCREEN_QUERY_RE.search(transcript):
                 from api.services.screen_context_agent import screen_context_agent as _sca
                 _screen_t0 = time.time()
-                # Force an on-demand Perception Engine tick before reading the
-                # snapshot. Without this, screen_context_agent's world_state
-                # enrichment (GitHub repo / shopping page / page-type aware
-                # descriptions) reads whatever the passive background loop last
-                # published — and nothing currently drives that loop for a plain
-                # voice query, so it's reliably empty and every screen-query
-                # answer degrades to "you're viewing '<raw window title>' in
-                # <app>" instead of the actually-composed description. Bounded
-                # so a slow/unreachable CDP connection can't stall the turn —
-                # falls back to the same title-only description on timeout.
-                try:
-                    from api.services.perception.perception_engine import perception_engine as _pcep
-                    await asyncio.wait_for(_pcep.refresh_now(), timeout=1.5)
-                except asyncio.TimeoutError:
-                    logger.info("[SCREEN_QUERY_PERCEPTION_REFRESH] timed out — using existing world_state snapshot")
-                except Exception as _pcep_exc:
-                    logger.debug("[SCREEN_QUERY_PERCEPTION_REFRESH] skipped: %s", _pcep_exc)
+                # world_state's browser/repository/product enrichment is kept
+                # fresh by perception_engine's own independent observation
+                # loop (started once at boot in main.py, ticks every 2.5s,
+                # NOT gated behind background_scheduler's BACKGROUND_PAUSE —
+                # it keeps running during an active voice session). A manual
+                # blocking refresh_now() kick here used to add up to 1.5s to
+                # every screen query and, on timeout, left its underlying
+                # PowerShell call still running and holding ps_session's lock
+                # (see ps_session.py's _LOCK_WAIT_CAP fix) — contending with
+                # this same turn's window_context/explorer-path PS calls
+                # right after it. world_state.get_context(refresh=False) is
+                # at most ~2.5s stale, which is fine for "what's on screen".
                 _screen_snap = await asyncio.to_thread(_sca.get_fresh)
-                _lat["screen_context"] = (time.time() - _screen_t0) * 1000
                 _screen_resp = _screen_snap.describe()
+
+                # Real visual understanding: enrich the fast title/URL-based
+                # description with what a vision model actually sees on
+                # screen, bounded so a slow/unavailable OpenAI call never
+                # blocks the turn past this cap. vision_perception.maybe_
+                # capture() self-throttles to one real call per 30s
+                # (perception/vision_perception.py), so rapid repeat screen
+                # queries reuse the last real read instead of re-paying the
+                # API round-trip every time.
+                try:
+                    from api.config import settings as _vcfg
+                    if _vcfg.openai_api_key and _vcfg.openai_api_key.startswith("sk-"):
+                        from api.services.perception import vision_perception as _vp
+                        from api.services.screen_context_agent import compose_with_vision as _compose_vision
+                        _vision_result = await asyncio.wait_for(
+                            asyncio.to_thread(_vp.maybe_capture, "voice_screen_query", _vcfg.openai_api_key),
+                            timeout=2.5,
+                        )
+                        if _vision_result and _vision_result.get("description"):
+                            _screen_resp = _compose_vision(_screen_resp, _vision_result["description"])
+                except asyncio.TimeoutError:
+                    logger.info("[SCREEN_QUERY_VISION] timed out — using structured description only")
+                except Exception as _vision_exc:
+                    logger.debug("[SCREEN_QUERY_VISION] skipped: %s", _vision_exc)
+
+                _lat["screen_context"] = (time.time() - _screen_t0) * 1000
                 # Track what was just described so a later turn ("review it",
                 # "open the README") can resolve the reference (Part 10) —
                 # reuses ContextStack, not a separate GitHub memory system.
@@ -2724,6 +2939,40 @@ async def ws_session(websocket: WebSocket) -> None:
                     return
         except Exception as _so_exc:
             logger.debug("[SCREEN_OFFER_CONFIRM] skipped: %s", _so_exc)
+
+        # ── Tier 0x5: Generic screen follow-ups ("what is this / tell me more") ─
+        # Catches plain descriptive follow-ups against ANY screen-agent
+        # ContextStack entity (window/store_app/app/folder — not just
+        # repository/product, which the tiers above already cover with
+        # their own action-verb phrasing). Must run before intent-router /
+        # DIRECT_AGENT_ROUTE below — without this, "what is this? tell me
+        # more about it" had no ContextStack entity to resolve against and
+        # got misrouted to a browser research agent that literally searched
+        # the follow-up text itself.
+        try:
+            from api.services.screen_context_agent import match_generic_followup, handle_generic_followup
+            if match_generic_followup(transcript):
+                _generic_resp = await handle_generic_followup()
+                if _generic_resp:
+                    logger.info("[GENERIC_FOLLOWUP_RESPONSE] response=%r", _generic_resp)
+                    memory.add_assistant(_generic_resp, tool_name="generic_screen_followup")
+                    last_response_text = _generic_resp
+                    last_activity_t    = time.time()
+                    await _send(websocket, {"type": "response", "text": _generic_resp, "chunk": 1})
+                    _interrupted = await _tts_with_fallback(_generic_resp)
+                    if not _interrupted:
+                        if _tts_state["audio_sent"]:
+                            await _send(websocket, {"type": "done"})
+                            asyncio.create_task(_spawn_tts_watchdog("generic_screen_followup"))
+                        else:
+                            is_speaking = False
+                            await _send(websocket, {"type": "listening"})
+                    else:
+                        is_speaking = False
+                        await _send(websocket, {"type": "listening"})
+                    return
+        except Exception as _gf_exc:
+            logger.debug("[GENERIC_FOLLOWUP] skipped: %s", _gf_exc)
 
         # ── Tier 0: Local clock — instant, offline, no LLM ───────────────────
         try:
