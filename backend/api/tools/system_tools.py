@@ -342,8 +342,13 @@ _APP_ALIASES: Dict[str, str] = {
 
 def _normalise_app(name: str) -> str:
     n = name.lower().strip()
-    # Strip leading determiners: "any setting" → "setting", "my chrome" → "chrome"
-    n = re.sub(r'^(?:an?\s+|the\s+|any\s+|my\s+|some\s+)', '', n)
+    # Strip leading determiners/verb-filler: "any setting" → "setting",
+    # "my chrome" → "chrome", "search chrome" → "chrome" (STT/intent
+    # extraction sometimes leaks a "search"/"open" verb into the app_name
+    # group — e.g. a mis-transcribed "google chrome" — so a bare app name
+    # is recovered instead of failing to resolve or launching the wrong
+    # generic-fallback shell command).
+    n = re.sub(r'^(?:an?\s+|the\s+|any\s+|my\s+|some\s+|search\s+|open\s+)', '', n)
     # Strip trailing filler: "settings app" → "settings", "chrome please" → "chrome"
     n = re.sub(r'\s+(?:app|application|program|software|please|now|for\s+me)\s*$', '', n)
     # Normalize singular → plural for known nouns with known plural forms

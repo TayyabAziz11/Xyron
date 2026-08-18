@@ -14,37 +14,52 @@ correct process without the user having to name it.
 from __future__ import annotations
 
 import logging
-import re
-import subprocess
-import sys
 import time
 import threading
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# ── PowerShell script — P/Invoke GetForegroundWindow (WSL2 path) ─────────────
+# ── PowerShell command — P/Invoke GetForegroundWindow (WSL2 path) ────────────
+# Submitted through ps_session.py's persistent session (see _query_ps below),
+# which wraps this in its own try/catch — no outer try/catch needed here.
+#
+# Single line, no here-string: ps_session feeds commands over an
+# *interactive* stdin pipe (a real .ps1 file loaded via `-File` doesn't have
+# this problem, but that's not how ps_session works). A here-string's
+# closing `'@` must be the first thing on its own line, which is fragile
+# over a piped interactive session — sending one here caused the session's
+# parser to never see a complete statement, so the sentinel was never
+# printed and every call ran out the full timeout, killing and restarting
+# the shared powershell.exe process every single time. A single-line
+# Add-Type call with a PSTypeName existence check (so it only compiles once
+# per process) avoids that entirely — verified directly against a live
+# ps_session: 501ms on first call (Add-Type compile), ~18ms on repeat calls.
+#
+# PowerShell double-quoted strings escape an embedded " by doubling it
+# ("") — backslash is NOT an escape character in PowerShell and doubling
+# is required here, since Add-Type's C# body is itself inside a "..."
+# string.
 
-_PS_SCRIPT = r"""
-try {
-Add-Type -TypeDefinition @"
-using System;using System.Runtime.InteropServices;using System.Text;
-public class _WinFG {
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,StringBuilder s,int c);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
-}
-"@ -ErrorAction Stop
-$h=[_WinFG]::GetForegroundWindow()
-$sb=New-Object System.Text.StringBuilder(256)
-[_WinFG]::GetWindowText($h,$sb,256)|Out-Null
-$xpid=[uint32]0;[_WinFG]::GetWindowThreadProcessId($h,[ref]$xpid)|Out-Null
-$p=Get-Process -Id ([int]$xpid) -ErrorAction SilentlyContinue
-Write-Output "TITLE:$($sb.ToString())|PROC:$($p.Name)|PID:$xpid"
-} catch { Write-Output "ERR:$($_.Exception.Message)" }
-"""
+_WINFG_PS_CMD = (
+    "if (-not ([System.Management.Automation.PSTypeName]'XyronForegroundWindowNative').Type) { "
+    "Add-Type -TypeDefinition "
+    '"using System;using System.Runtime.InteropServices;using System.Text;'
+    "public class XyronForegroundWindowNative{"
+    '[DllImport(""user32.dll"")]public static extern IntPtr GetForegroundWindow();'
+    '[DllImport(""user32.dll"",CharSet=CharSet.Unicode)]public static extern int GetWindowText(IntPtr h,StringBuilder s,int c);'
+    '[DllImport(""user32.dll"")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);'
+    '}" '
+    "}; "
+    "$h=[XyronForegroundWindowNative]::GetForegroundWindow(); "
+    "$sb=New-Object System.Text.StringBuilder(256); "
+    "[XyronForegroundWindowNative]::GetWindowText($h,$sb,256)|Out-Null; "
+    "$xpid=[uint32]0; "
+    "[XyronForegroundWindowNative]::GetWindowThreadProcessId($h,[ref]$xpid)|Out-Null; "
+    "$p=Get-Process -Id ([int]$xpid) -ErrorAction SilentlyContinue; "
+    'Write-Output "TITLE:$($sb.ToString())|PROC:$($p.Name)|PID:$xpid"'
+)
 
-_CACHE_TTL = 2.0   # seconds — balance freshness vs subprocess overhead
+_CACHE_TTL = 2.0   # seconds — balance freshness vs PS round-trip overhead
 
 
 class _WindowContextService:
@@ -53,10 +68,6 @@ class _WindowContextService:
         self._lock    = threading.Lock()
         self._cached  : dict | None = None
         self._cached_at: float      = 0.0
-        self._ps_path : str | None  = None
-        self._ps1_path = "/mnt/c/Windows/Temp/_xyron_fgwin.ps1"
-        self._ps1_win  = "C:\\Windows\\Temp\\_xyron_fgwin.ps1"
-        self._ps1_written = False
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -111,41 +122,35 @@ class _WindowContextService:
             logger.debug("win32gui error: %s", exc)
             return None
 
-    # ── WSL2 PowerShell path ───────────────────────────────────────────────────
-
-    def _find_powershell(self) -> str | None:
-        if self._ps_path:
-            return self._ps_path
-        for p in [
-            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-            "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
-        ]:
-            if Path(p).exists():
-                self._ps_path = p
-                return p
-        return None
-
-    def _ensure_ps1(self) -> None:
-        if self._ps1_written:
-            return
-        try:
-            Path(self._ps1_path).write_text(_PS_SCRIPT, encoding="utf-8")
-            self._ps1_written = True
-        except Exception:
-            pass
+    # ── WSL2 PowerShell path — persistent session ────────────────────────────
+    # Routed through ps_session.py's single reusable powershell.exe process
+    # instead of spawning a fresh subprocess.run([powershell.exe, ...]) per
+    # call. get_fresh() (screen_context_agent.py) bypasses the _CACHE_TTL
+    # cache above on every screen query, so this path used to run cold on
+    # every single query — a fresh cross-VM process spawn costs 1-5s under
+    # load (observed: [SCREEN_AGENT_QUERY] ms=5037), dwarfing everything
+    # else in the turn. ps_session's persistent process cuts that to ~30ms.
 
     def _query_ps(self) -> dict | None:
-        ps = self._find_powershell()
-        if not ps:
-            return None
-        self._ensure_ps1()
         try:
-            r = subprocess.run(
-                [ps, "-NonInteractive", "-NoProfile", "-File", self._ps1_win],
-                capture_output=True, text=True, timeout=6, errors="ignore",
-            )
-            out = (r.stdout or "").strip()
-            if not out or out.startswith("ERR:"):
+            from api.services.ps_session import ps_session
+        except Exception as exc:
+            logger.debug("window context ps_session import error: %s", exc)
+            return None
+        try:
+            ok, out = ps_session.run(_WINFG_PS_CMD, timeout=6)
+            out = (out or "").strip()
+            # ok=False means ps_session itself failed (busy/timeout/died) —
+            # `out` is then a human-readable message like "Command timed
+            # out" or "PowerShell busy", not PS output, and must NOT be
+            # parsed: it contains no ":" so it silently parsed into an
+            # empty-but-truthy {"title": "", "proc_name": "", "pid": 0}
+            # instead of None, which is what caused "I can't tell what's
+            # on your screen" instead of a clear failure.
+            if not ok:
+                logger.debug("window context PS query failed: %s", out)
+                return None
+            if not out or out.startswith("ERROR:") or out.startswith("ERR:"):
                 return None
             # Parse "TITLE:...|PROC:...|PID:..."
             parts = dict(p.split(":", 1) for p in out.split("|") if ":" in p)

@@ -120,7 +120,14 @@ class OpenAIClient:
 
                 if key and key.startswith("sk-"):
                     from openai import OpenAI
-                    self._client = OpenAI(api_key=key)
+                    # max_retries=0 — the SDK's default retry-with-backoff
+                    # treats 429 insufficient_quota the same as a transient
+                    # rate limit and retries anyway, which can never succeed
+                    # until billing is fixed and only adds seconds of wasted
+                    # backoff before falling through to the Ollama fallback
+                    # below (same fix already applied in response_pipeline.py
+                    # for the same observed retry-storm behavior).
+                    self._client = OpenAI(api_key=key, max_retries=0)
                     logger.info("[OpenAIClient] Initialized — 4o cap=%d/hr  mini cap=%d/hr",
                                 self._max_4o, self._max_mini)
                 else:
@@ -142,7 +149,7 @@ class OpenAIClient:
             import urllib.request as _ur
             _ur.urlopen(f"{base_url}/models", timeout=2)  # connectivity check
             from openai import OpenAI
-            client = OpenAI(base_url=base_url, api_key="ollama")
+            client = OpenAI(base_url=base_url, api_key="ollama", max_retries=0)
             logger.info("[OpenAIClient] Ollama fallback ready at %s", base_url)
             return client
         except Exception as exc:

@@ -311,6 +311,12 @@ async def startup() -> None:
                 "Task Manager opened.", "Microsoft Store opened.",
                 "E drive is open.", "C drive is open.", "D drive is open.",
                 "F drive is open.",
+                # Recovery phrases spoken by the STT-timeout and
+                # stuck-speaking-watchdog paths in voice_ws.py — exactly the
+                # moments the system is already under load, so these must
+                # never pay for an uncached live synthesis on top of that.
+                "Sorry, I'm still starting up — please try again in a moment.",
+                "Sorry, that took too long — please try again.",
             ]
             _comp_synth_ok = 0
             for _phrase in _COMPLETION_PHRASES:

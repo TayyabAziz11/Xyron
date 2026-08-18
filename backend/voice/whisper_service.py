@@ -2,8 +2,13 @@
 Whisper STT service — faster-whisper with GPU auto-detection.
 
 Configuration (environment variables):
-  WHISPER_MODEL                 Model size: tiny | base | small | medium | large-v3
-                                Default: "small" (better than "base", still fast on GPU)
+  WHISPER_MODEL                 Model size — default "small" (low-spec-friendly: fast on
+                                CPU, modest RAM). Higher-accuracy opt-in options for
+                                users with more RAM/GPU headroom:
+                                  medium          — noticeably more accurate than small
+                                  large-v3        — most accurate, heaviest (GPU recommended)
+                                  distil-large-v3 — near large-v3 accuracy, lighter/faster
+                                Invalid values fall back to "small" with a warning logged.
   WHISPER_LANGUAGE              ISO code ("en", "ur") or "auto" for multilingual.
                                 Default: "auto" — detects language per utterance.
   WHISPER_CONFIDENCE_THRESHOLD  avg_logprob floor; segments below this are noise.
@@ -27,7 +32,27 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_MODEL_SIZE  = os.getenv("WHISPER_MODEL", "small")
+# "small" stays the default for low-spec hardware; medium/large-v3/distil-large-v3
+# are opt-in higher-accuracy choices for users with more RAM/GPU headroom.
+_SUPPORTED_MODEL_SIZES = frozenset({
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large-v3", "distil-large-v3",
+})
+_DEFAULT_MODEL_SIZE = "small"
+
+
+def _validate_model_size(size: str) -> str:
+    """Fall back to the low-spec default with a warning if size is unrecognized."""
+    if size in _SUPPORTED_MODEL_SIZES:
+        return size
+    logger.warning(
+        "[Whisper] Unrecognized WHISPER_MODEL=%r — falling back to %r. Supported: %s",
+        size, _DEFAULT_MODEL_SIZE, sorted(_SUPPORTED_MODEL_SIZES),
+    )
+    return _DEFAULT_MODEL_SIZE
+
+
+_MODEL_SIZE  = _validate_model_size(os.getenv("WHISPER_MODEL", _DEFAULT_MODEL_SIZE))
 _LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "auto")   # "auto" → None (multilingual)
 _CONF_THRESH = float(os.getenv("WHISPER_CONFIDENCE_THRESHOLD", "-1.0"))
 
@@ -64,6 +89,56 @@ def _get_initial_prompt(lang: Optional[str]) -> str:
         # Bilingual: lets Whisper recognise both Urdu script and English commands
         return _VOICE_INITIAL_PROMPT_EN + " " + _VOICE_INITIAL_PROMPT_UR
     return _VOICE_INITIAL_PROMPT_EN
+
+
+# ── Context-aware hotwords (faster-whisper word-biasing) ────────────────────
+# faster-whisper's `hotwords` param biases decoding toward specific words
+# without replacing initial_prompt — TranscriptionOptions.get_prompt()
+# concatenates hotwords_tokens with the previous_tokens derived from
+# initial_prompt into the same decoder prompt, so this is additive to (not a
+# replacement for) the static _VOICE_INITIAL_PROMPT_*/_TINY_INITIAL_PROMPT
+# vocabulary above. Static = fixed app/command vocabulary; dynamic = whatever
+# the user actually opened/referenced most recently (ContextStack), so an app
+# name that isn't in the static list (e.g. "Notion", "Figma") still gets
+# biased correctly right after it's been opened once.
+_STATIC_HOTWORDS = [
+    "Xyron", "Chrome", "VS Code", "Notepad", "Calculator", "Explorer",
+    "Settings", "Terminal", "Spotify", "Discord", "folder", "drive",
+]
+_MAX_CONTEXT_HOTWORDS = 8
+
+
+def _get_context_hotwords() -> list[str]:
+    """Recently-referenced app/folder/file names from ContextStack, newest
+    first. Best-effort — returns [] if the stack is empty or unavailable."""
+    try:
+        from api.services.context_stack import context_stack as _cstack
+        entities = _cstack.recent(_MAX_CONTEXT_HOTWORDS)
+        seen: set[str] = set()
+        words: list[str] = []
+        for e in entities:
+            name = (e.display or "").strip()
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                words.append(name)
+        return words
+    except Exception as exc:
+        logger.debug("[Whisper/hotwords] context unavailable: %s", exc)
+        return []
+
+
+def _build_hotwords() -> str:
+    """Static command vocabulary + dynamic recent-context entities, merged
+    into a single deduplicated hotwords string for faster-whisper."""
+    seen: set[str] = set()
+    combined: list[str] = []
+    for w in _STATIC_HOTWORDS + _get_context_hotwords():
+        key = w.lower()
+        if key not in seen:
+            seen.add(key)
+            combined.append(w)
+    return " ".join(combined)
+
 
 # Post-processing: fix common phonetic mistakes from Whisper before routing.
 _CORRECTIONS: list[tuple[re.Pattern, str | object]] = [
@@ -152,8 +227,21 @@ _model       = None
 _model_lock  = _threading.Lock()
 _model_ready = _threading.Event()   # set once the model is fully loaded and usable
 
-# ── Tiny.en fast model (Hybrid STT) ──────────────────────────────────────────
-_FAST_MODEL_SIZE = os.getenv("WHISPER_FAST_MODEL", "tiny.en")
+# Dedicated pool for Whisper inference calls. Previously every STT call sat
+# on Python's single global default ThreadPoolExecutor alongside PowerShell
+# polling (system monitor, verifier, ps_session) and Kokoro TTS — on a slow
+# machine a backlog of any one of those could starve the others waiting for
+# a free worker thread. 2 workers lets the fast (tiny/base.en) and accurate
+# (small) models run without serializing behind each other, without letting
+# STT compete with unrelated lightweight background polling for the same pool.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+stt_executor = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper-stt")
+
+# ── Fast model (Hybrid STT) ───────────────────────────────────────────────────
+# base.en (~74M params) instead of tiny.en (~39M) — meaningfully better accuracy
+# on short commands routed here (audio <=1.2s in hybrid_stt_router.py), still
+# fast enough for the same latency budget.
+_FAST_MODEL_SIZE = os.getenv("WHISPER_FAST_MODEL", "base.en")
 _tiny_model      = None
 _tiny_model_lock = _threading.Lock()
 
@@ -253,16 +341,17 @@ _TINY_INITIAL_PROMPT = (
 
 def transcribe_fast(audio: np.ndarray, sample_rate: int = 16000) -> dict:
     """
-    Fast transcription using tiny.en — target <500ms warm on GPU.
+    Fast transcription using base.en — target <500ms warm on GPU.
 
-    English-only, beam_size=1, no VAD. Use for short/simple commands.
+    English-only, beam_size=1, VAD-filtered. Use for short/simple commands.
     The caller should check result["confidence"] (avg_logprob) and retry
     with transcribe_audio() if the result is uncertain.
     """
     model = _get_tiny_model()
     _common = dict(
-        beam_size=1, language="en", vad_filter=False,
+        beam_size=1, language="en", vad_filter=True,
         condition_on_previous_text=False, initial_prompt=_TINY_INITIAL_PROMPT,
+        hotwords=_build_hotwords(),
         # Root-cause fix for a live-measured failure mode: short commands
         # ("open calculator", "open chrome", "open c drive") reliably made
         # greedy (beam_size=1) tiny.en loop the whole phrase 2-6x — e.g.
@@ -308,8 +397,8 @@ def set_model_size(size: str) -> None:
     global _model, _MODEL_SIZE
     _model = None
     _model_ready.clear()    # reset gate so callers wait for the new model to load
-    _MODEL_SIZE = size
-    logger.info("[Whisper] Model size set to '%s'", size)
+    _MODEL_SIZE = _validate_model_size(size)
+    logger.info("[Whisper] Model size set to '%s'", _MODEL_SIZE)
 
 
 # ── Confidence filtering ──────────────────────────────────────────────────────
@@ -361,6 +450,7 @@ def transcribe_audio(
         condition_on_previous_text=False,
         no_repeat_ngram_size=3,        # same repetition-loop mitigation as transcribe_fast
         initial_prompt=_get_initial_prompt(lang),
+        hotwords=_build_hotwords(),
     )
 
     segments  = _filter_segments(segments_raw)

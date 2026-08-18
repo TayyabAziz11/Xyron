@@ -472,6 +472,33 @@ def route(
         "[STT_ACCURATE_RESULT] transcript=%r confidence=%.2f ms=%.0f",
         (acc_result.get("text") or "")[:80], acc_result.get("confidence", -999.0), ms_acc,
     )
+
+    # The accurate model is a second opinion, not an automatic upgrade — it
+    # was previously trusted unconditionally on retry, even when its own
+    # confidence was clearly worse than the fast model's. Live-measured
+    # failure: fast_result "Create a folder in D drive name game." (conf
+    # -0.26) retried on an entity-hint keyword, accurate model came back
+    # with a confidently-wrong hallucination "Play it, folder, in D drive,
+    # name, game." (conf -0.64) that got selected anyway and executed —
+    # dropping the actual command. An empty fast transcript still always
+    # defers to the accurate result (nothing to compare against); otherwise
+    # keep whichever result is actually more confident.
+    _fast_text = (fast_result.get("text") or "").strip()
+    _fast_conf = fast_result.get("confidence", -999.0)
+    _acc_conf  = acc_result.get("confidence", -999.0)
+    _CONF_REGRESSION_MARGIN = 0.15
+    if _fast_text and _acc_conf < _fast_conf - _CONF_REGRESSION_MARGIN:
+        logger.warning(
+            "[STT_RETRY_REGRESSION] accurate model less confident than fast "
+            "(fast_conf=%.2f acc_conf=%.2f) — keeping fast result %r over %r",
+            _fast_conf, _acc_conf, _fast_text[:60], (acc_result.get("text") or "")[:60],
+        )
+        logger.info(
+            "[STT_FINAL_SELECTED] model=tiny.en(retry_regression) transcript=%r total_ms=%.0f",
+            _fast_text[:80], total_ms,
+        )
+        return fast_result, "tiny.en(retry_regression)", acc_result
+
     logger.info(
         "[STT_FINAL_SELECTED] model=small(retry) transcript=%r total_ms=%.0f",
         (acc_result.get("text") or "")[:80], total_ms,

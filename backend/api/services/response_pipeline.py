@@ -73,8 +73,10 @@ async def _kokoro_async(text: str, voice: str, speed: float) -> Optional[bytes]:
     """Synthesize text with Kokoro; retry once on None or exception."""
     for attempt in range(2):
         try:
-            from api.routers.voice import _kokoro_to_wav
-            wav = await asyncio.to_thread(_kokoro_to_wav, text, voice, speed)
+            from api.routers.voice import _kokoro_to_wav, _kokoro_executor
+            wav = await asyncio.get_running_loop().run_in_executor(
+                _kokoro_executor, _kokoro_to_wav, text, voice, speed
+            )
             if wav:
                 return wav
             if attempt == 0:
@@ -106,18 +108,30 @@ async def _ollama_stream(
             messages.append({"role": role, "content": text})
     messages.append({"role": "user", "content": transcript})
 
-    try:
-        import httpx
-        async with httpx.AsyncClient(base_url=_OLLAMA_BASE, timeout=15.0) as client:
-            resp = await client.post(
-                "/chat/completions",
-                json={"model": model, "messages": messages, "max_tokens": 150, "stream": False},
-            )
-            resp.raise_for_status()
-            text_out = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-    except Exception as exc:
-        logger.warning("[MODEL_FALLBACK] ollama failed: %s", exc)
+    # main.py's boot warmup already confirmed whether `model` is actually
+    # pulled and fits in available RAM (mark_service("ollama", ...)) — on a
+    # RAM-constrained machine with the model missing/oversized, every one of
+    # these calls was previously a guaranteed 404/500 that still cost a full
+    # network round-trip (plus retry backoff) on top of the OpenAI failure
+    # that got us here in the first place. Skip straight to the fallback
+    # text instead of repeating a check we already know will fail.
+    from api.services.readiness_service import readiness_service as _rs_ollama
+    if not _rs_ollama.is_service_ready("ollama"):
+        logger.warning("[MODEL_FALLBACK] ollama skipped — marked unavailable at boot (model=%s)", model)
         text_out = "I'm having trouble connecting right now. Please try again."
+    else:
+        try:
+            import httpx
+            async with httpx.AsyncClient(base_url=_OLLAMA_BASE, timeout=15.0) as client:
+                resp = await client.post(
+                    "/chat/completions",
+                    json={"model": model, "messages": messages, "max_tokens": 150, "stream": False},
+                )
+                resp.raise_for_status()
+                text_out = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        except Exception as exc:
+            logger.warning("[MODEL_FALLBACK] ollama failed: %s", exc)
+            text_out = "I'm having trouble connecting right now. Please try again."
 
     text_out = _strip_md(text_out)
     if text_out:

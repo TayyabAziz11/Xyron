@@ -77,6 +77,13 @@ class ReadinessService:
                 self._ready_event.set()
             logger.info("[READY_STATE] %s", state.value)
 
+    def is_service_ready(self, name: str) -> bool:
+        """True only if `mark_service(name, True)` has been called — False for
+        both "marked failed" and "never checked" (fail-closed, since a caller
+        skipping work based on this should only do so on a confirmed failure)."""
+        with self._lock:
+            return self._services.get(name, False)
+
     def mark_service(self, name: str, ok: bool) -> None:
         with self._lock:
             self._services[name] = ok
