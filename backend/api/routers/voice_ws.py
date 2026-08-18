@@ -276,7 +276,7 @@ async def ws_wake(websocket: WebSocket) -> None:
                         _clip_duration_s, _clip_duration_s, _POST_ROLL_FRAMES, _clip_rms,
                     )
                     try:
-                        from voice.whisper_service import verify_wake_phrase, _model_ready
+                        from voice.whisper_service import verify_wake_phrase, _model_ready, stt_executor
                         if not _model_ready.is_set():
                             # Wait briefly rather than failing open — reject if Whisper
                             # doesn't become ready within 2s to prevent false wake triggers.
@@ -301,11 +301,11 @@ async def ws_wake(websocket: WebSocket) -> None:
                                 })
                             else:
                                 matched, transcript = await loop.run_in_executor(
-                                    None, verify_wake_phrase, clip
+                                    stt_executor, verify_wake_phrase, clip
                                 )
                         else:
                             matched, transcript = await loop.run_in_executor(
-                                None, verify_wake_phrase, clip
+                                stt_executor, verify_wake_phrase, clip
                             )
                     except Exception as exc:
                         logger.warning("[WS/wake] Whisper verify error: %s — rejecting wake", exc)
@@ -673,8 +673,11 @@ async def _synthesize_chunk(text: str, voice: str, speed: float) -> Optional[byt
             # to fresh Kokoro synthesis inside synthesize_or_cached(), so
             # this can never return a different voice's audio.
             from api.services.tts_cache_service import tts_cache as _tcc_chunk
+            from api.routers.voice import _kokoro_executor as _kko_exec
             wav = await asyncio.wait_for(
-                asyncio.to_thread(_tcc_chunk.synthesize_or_cached, text, voice, speed),
+                asyncio.get_running_loop().run_in_executor(
+                    _kko_exec, _tcc_chunk.synthesize_or_cached, text, voice, speed
+                ),
                 timeout=25.0,
             )
             if wav:
@@ -1842,7 +1845,10 @@ async def ws_session(websocket: WebSocket) -> None:
         async def _send_immediate_ack() -> None:
             try:
                 from api.services.tts_cache_service import tts_cache as _tcc_ack
-                _ack_wav = await asyncio.to_thread(_tcc_ack.synthesize_or_cached, "Sure.", voice, speed)
+                from api.routers.voice import _kokoro_executor as _kko_exec_ack
+                _ack_wav = await asyncio.get_running_loop().run_in_executor(
+                    _kko_exec_ack, _tcc_ack.synthesize_or_cached, "Sure.", voice, speed
+                )
                 if _ack_wav and websocket.client_state == WebSocketState.CONNECTED:
                     await _send(websocket, {
                         "type": "audio", "data": base64.b64encode(_ack_wav).decode(),
@@ -1871,6 +1877,7 @@ async def ws_session(websocket: WebSocket) -> None:
         _stt_secondary = None  # Phase 2.1: secondary model result (for N-best)
         try:
             from voice.hybrid_stt_router import route as _stt_route
+            from voice.whisper_service import stt_executor as _stt_exec
             # hybrid_stt_router.route() is a plain synchronous call into
             # faster-whisper with no internal timeout — on a machine where
             # the Whisper model is still loading (slow disk/cold cache) or
@@ -1882,7 +1889,9 @@ async def ws_session(websocket: WebSocket) -> None:
             # hang degrades to "please repeat" instead of a dead session.
             try:
                 _stt_route_out = await asyncio.wait_for(
-                    asyncio.to_thread(_stt_route, audio, _audio_dur_ms, _session_state),
+                    asyncio.get_running_loop().run_in_executor(
+                        _stt_exec, _stt_route, audio, _audio_dur_ms, _session_state
+                    ),
                     timeout=25.0,
                 )
             except asyncio.TimeoutError:
@@ -1908,7 +1917,9 @@ async def ws_session(websocket: WebSocket) -> None:
                 try:
                     _retry_state = dict(_session_state) if isinstance(_session_state, dict) else {}
                     _retry_state["force_accurate"] = True
-                    _retry_out = await asyncio.to_thread(_stt_route, audio, _audio_dur_ms, _retry_state)
+                    _retry_out = await asyncio.get_running_loop().run_in_executor(
+                        _stt_exec, _stt_route, audio, _audio_dur_ms, _retry_state
+                    )
                     retry_result, _retry_model = _retry_out[0], _retry_out[1]
                     retry_transcript = retry_result.get("text", "").strip()
                     if retry_transcript:
@@ -4560,8 +4571,11 @@ async def ws_session(websocket: WebSocket) -> None:
                 # synth attempt inside the active session (see fallback below,
                 # which is cache-only and therefore cannot block).
                 try:
+                    from api.routers.voice import _kokoro_executor as _kko_exec_greet
                     _g_wav = await asyncio.wait_for(
-                        asyncio.to_thread(_tcc_greet.synthesize_or_cached, _greeting_text, voice, speed),
+                        asyncio.get_running_loop().run_in_executor(
+                            _kko_exec_greet, _tcc_greet.synthesize_or_cached, _greeting_text, voice, speed
+                        ),
                         timeout=_greeting_timeout,
                     )
                     if _g_wav:

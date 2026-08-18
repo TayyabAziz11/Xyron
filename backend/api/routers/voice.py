@@ -424,6 +424,19 @@ _KOKORO_VOICES: list[dict] = [
 _KOKORO_MODELS_DIR = os.path.expanduser("~/.xyron/models")
 _kokoro_instance = None        # module-level singleton, lazy-loaded once
 _kokoro_lock = __import__("threading").Lock()
+# Dedicated single-worker pool for Kokoro synthesis. Kokoro is documented
+# not thread-safe, and on slow/CPU-bound machines every asyncio.to_thread(...)
+# call for TTS was sharing Python's single global default ThreadPoolExecutor
+# with STT, PowerShell polling, and verifier calls — a backlog of slow (or
+# abandoned-but-still-running, see voice_ws.py's stuck-speaking watchdog)
+# Kokoro calls could starve that shared pool and made unrelated work (system
+# monitor polling, window-context checks) queue up behind it too, live-
+# measured as TTS synthesis for a single short phrase taking 30-90s on a
+# resource-constrained machine. Isolating Kokoro onto its own pool contains
+# that backlog to TTS calls only, and max_workers=1 makes the "not
+# thread-safe" constraint structurally enforced rather than incidental.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+_kokoro_executor = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="kokoro-tts")
 _tts_cache: dict[tuple[str, str, float], bytes] = {}  # (text, voice, speed) → WAV bytes
 _current_emotion_profile: str = ""  # set per-turn by respond-stream; read by _kokoro_to_wav
 _rvc_enabled_for_response: bool = False  # set once per response — never toggled mid-stream
@@ -752,7 +765,7 @@ async def synthesize_text(request: Request):
     # ── 1. Kokoro — local offline, ~850ms CPU / ~80ms GPU ────────────────────
     try:
         wav_bytes = await _asyncio.get_event_loop().run_in_executor(
-            None, _kokoro_to_wav, text, voice, speed
+            _kokoro_executor, _kokoro_to_wav, text, voice, speed
         )
         if wav_bytes:
             logger.info("[TTS] Kokoro (%s): %d chars → %d bytes",
@@ -855,7 +868,7 @@ async def synthesize_stream(request: Request):
     for attempt in range(2):
         try:
             wav_bytes = await _asyncio.get_event_loop().run_in_executor(
-                None, _kokoro_to_wav, text, voice, speed
+                _kokoro_executor, _kokoro_to_wav, text, voice, speed
             )
             if wav_bytes:
                 logger.info("[TTS-Stream] Kokoro: %d chars → %d bytes (attempt %d)",
@@ -4940,7 +4953,7 @@ async def cached_ack(phrase: str):
     text = _text_map[phrase]
     try:
         wav_bytes = await _asyncio.get_event_loop().run_in_executor(
-            None, _kokoro_to_wav, text, "nova", 1.1
+            _kokoro_executor, _kokoro_to_wav, text, "nova", 1.1
         )
         if wav_bytes:
             import pathlib, asyncio

@@ -227,6 +227,16 @@ _model       = None
 _model_lock  = _threading.Lock()
 _model_ready = _threading.Event()   # set once the model is fully loaded and usable
 
+# Dedicated pool for Whisper inference calls. Previously every STT call sat
+# on Python's single global default ThreadPoolExecutor alongside PowerShell
+# polling (system monitor, verifier, ps_session) and Kokoro TTS — on a slow
+# machine a backlog of any one of those could starve the others waiting for
+# a free worker thread. 2 workers lets the fast (tiny/base.en) and accurate
+# (small) models run without serializing behind each other, without letting
+# STT compete with unrelated lightweight background polling for the same pool.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+stt_executor = _ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper-stt")
+
 # ── Fast model (Hybrid STT) ───────────────────────────────────────────────────
 # base.en (~74M params) instead of tiny.en (~39M) — meaningfully better accuracy
 # on short commands routed here (audio <=1.2s in hybrid_stt_router.py), still
