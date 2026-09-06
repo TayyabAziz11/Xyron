@@ -168,9 +168,16 @@ class BrowserNavigator:
             return False
 
     async def wait_for_load(self) -> None:
-        """Wait for network idle + small JS-settle delay."""
+        """Wait for network idle + small JS-settle delay.
+
+        networkidle is best-effort: heavy SPAs (Google Flights, etc.)
+        NEVER go fully idle because of analytics/websocket polling, so
+        the wait always ran out at the old 15s cap before proceeding —
+        pure dead time. 4s keeps genuine idle detection for fast pages
+        while capping the penalty for never-idle pages.
+        """
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            await self.page.wait_for_load_state("networkidle", timeout=4_000)
         except PWTimeout:
             pass  # partial load is fine — page may have streamed enough
         await asyncio.sleep(0.5)

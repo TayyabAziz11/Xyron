@@ -162,6 +162,45 @@ _RULES: list[tuple[re.Pattern, str, str]] = [
      r"play \1 on youtube", "youtube_par_X_chalao"),
     (re.compile(r"\b(.+?)\s+youtube\s+par\s+chala[oa]?\b", re.I),
      r"play \1 on youtube", "X_youtube_par_chalao"),
+    # Songs: "X gana/gaana/geet/song chalao" — order matters (first match
+    # wins): pronoun-specific FIRST, then bare/no-name, then named — a
+    # named capture group like ".+?" would otherwise swallow "ye wala"/
+    # "koi" as if they were the song name.
+    # 1) Pronoun-referenced ("play this song" — no actual name given, so
+    #    there's nothing to search for; fall back to generic play/resume).
+    #    Anchored to the START of the phrase (^) so this can't fire as a
+    #    false-positive substring match inside a longer named request.
+    (re.compile(r"^(?:ye|yeh|is|wo|voh)(?:\s+\w+)?\s+(?:gana|gaane|gaana|geet|song)\s+chala[oa]?\b", re.I),
+     "play music", "pronoun_gana_chalao"),
+    # 2) Bare/no-name ("koi gana chalao" / "gana chalao" / "music chalao").
+    #    Also start-anchored — without ^ this matched as a substring of
+    #    "despacito gana chalao" (live-caught bug: produced "despacito play
+    #    music" instead of falling through to the named rule below).
+    (re.compile(r"^(?:koi\s+)?(?:gana|gaane|gaana|geet|song|music)\s+chala[oa]?\b", re.I),
+     "play music", "bare_gana_chalao"),
+    # 3) Named song ("despacito gana chalao" / "believer song chalao") —
+    #    routes through the same "play X on youtube" phrasing the two rules
+    #    above already use, since that's the reliably-working English form
+    #    for a named play request (see intent_router.py's search_youtube
+    #    patterns).
+    (re.compile(r"\b(.+?)\s+(?:gana|gaane|gaana|geet|song)\s+chala[oa]?\b", re.I),
+     r"play \1 on youtube", "X_gana_chalao"),
+    # Folders: "<name> naam ka/ki folder banao" / "<name> ka/ki folder banao"
+    # Pronoun-only captures (is/ye/yeh/wo/voh/koi naam ka folder banao — no
+    # actual name given) are excluded via lookahead so the command falls
+    # through unmatched instead of creating a folder literally named "is".
+    (re.compile(r"\b(?!(?:is|ye|yeh|wo|voh|koi)\s+naam\b)(.+?)\s+naam\s+(?:ka|ki|ke)\s+folder\s+bana[oa]?\b", re.I),
+     r"create folder named \1", "X_naam_ka_folder_banao"),
+    # Fallback WITHOUT "naam" ("test ka folder banao"). The (?<!naam)
+    # lookbehind stops this from picking up the slack when the "naam"
+    # variant above declined a pronoun-only match (live-caught bug: for
+    # "is naam ka folder banao", rule 1 correctly declines, but without
+    # this lookbehind this fallback's free-form ".+?" happily captured
+    # "is naam" whole — including the "naam" keyword rule 1 was scoped to
+    # own — producing "create folder named is naam" instead of also
+    # falling through unmatched).
+    (re.compile(r"\b(?!(?:is|ye|yeh|wo|voh|koi)\s+(?:ka|ki|ke)\s+folder\b)(.+?)(?<!naam)\s+(?:ka|ki|ke)\s+folder\s+bana[oa]?\b", re.I),
+     r"create folder named \1", "X_ka_folder_banao"),
     # Search: "X search karo" / "X ko search karo"
     (re.compile(r"\b(.+?)\s+(?:ko\s+)?search\s+kar[oa]?\b", re.I),
      r"search for \1", "X_search_karo"),
@@ -225,6 +264,15 @@ def normalize(transcript: str, lang: str) -> str:
     # ── Roman Urdu / Mixed / Hindi — regex rules ──────────────────────────────
     # Normalize "download, karo" → "download karo" so patterns match cleanly
     text = re.sub(r'\s*[,;]\s+kar', ' kar', text)
+    # Strip the Urdu object-marker particle "ko" right before a verb stem —
+    # it carries no meaning for English routing but was leaking into the
+    # captured object/app name (live-caught bug: "youtube ko kholo" ->
+    # "open youtube ko" -> open_application app_name="youtube ko" instead of
+    # "open youtube" -> app_name="youtube"). Applied before the rule loop so
+    # every existing "X kholo"/"X karo"/"X chalao" rule below benefits
+    # without needing per-rule "ko"-aware variants.
+    text = re.sub(r'\bko\s+(?=khol|band|bandh|search|download|install|uninstall|chala|bana)',
+                  '', text, flags=re.I)
     result = text
     for pattern, replacement, rule_name in _RULES:
         new_result = pattern.sub(replacement, result, count=1)

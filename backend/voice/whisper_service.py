@@ -5,9 +5,40 @@ Configuration (environment variables):
   WHISPER_MODEL                 Model size — default "small" (low-spec-friendly: fast on
                                 CPU, modest RAM). Higher-accuracy opt-in options for
                                 users with more RAM/GPU headroom:
-                                  medium          — noticeably more accurate than small
+                                  medium          — noticeably more accurate than small.
+                                                    Live-measured on this project's T1200
+                                                    laptop GPU (2026-08-21, 3 real Urdu
+                                                    clips, beam_size=3, VAD on, GPU
+                                                    confirmed 100% utilized/1800MHz
+                                                    throughout — not throttling): ~4.0s avg
+                                                    latency, near-exact Urdu accuracy. Best
+                                                    speed/accuracy balance found for weak
+                                                    mobile GPUs — current default.
                                   large-v3        — most accurate, heaviest (GPU recommended)
-                                  distil-large-v3 — near large-v3 accuracy, lighter/faster
+                                  large-v3-turbo  — large-v3's encoder (same multilingual/
+                                                    Urdu accuracy) with a pruned 4-layer
+                                                    decoder. On capable/desktop GPUs this is
+                                                    close to medium's speed; measured on
+                                                    this T1200 it was the SLOWEST real
+                                                    option (~6.8s avg, worse than medium's
+                                                    4.0s) — turbo keeps large-v3's full
+                                                    32-layer encoder, which is the
+                                                    expensive part on a weak GPU, so the
+                                                    "nearly as fast as medium" framing does
+                                                    not hold on low-end hardware. Higher
+                                                    accuracy than medium (2/3 exact vs 1/3
+                                                    exact on the same test), so still worth
+                                                    it if you value correctness over
+                                                    latency and have GPU headroom to spare.
+                                  distil-large-v3 — DO NOT USE for Urdu: live-tested and
+                                                    confirmed broken — hallucinates garbled
+                                                    English ("Karoom Koroa.", repeated-word
+                                                    loops) instead of transcribing Urdu
+                                                    audio at all. distil-whisper models are
+                                                    English-distilled, not real multilingual
+                                                    options, regardless of the "near
+                                                    large-v3 accuracy" framing that applies
+                                                    only to English.
                                 Invalid values fall back to "small" with a warning logged.
   WHISPER_LANGUAGE              ISO code ("en", "ur") or "auto" for multilingual.
                                 Default: "auto" — detects language per utterance.
@@ -32,11 +63,11 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# "small" stays the default for low-spec hardware; medium/large-v3/distil-large-v3
-# are opt-in higher-accuracy choices for users with more RAM/GPU headroom.
+# "small" stays the default for low-spec hardware; medium/large-v3/large-v3-turbo/
+# distil-large-v3 are opt-in higher-accuracy choices for users with more RAM/GPU headroom.
 _SUPPORTED_MODEL_SIZES = frozenset({
     "tiny", "tiny.en", "base", "base.en", "small", "small.en",
-    "medium", "medium.en", "large-v3", "distil-large-v3",
+    "medium", "medium.en", "large-v3", "large-v3-turbo", "turbo", "distil-large-v3",
 })
 _DEFAULT_MODEL_SIZE = "small"
 
@@ -73,21 +104,41 @@ _VOICE_INITIAL_PROMPT_UR = (
     "کھولو، بند کرو، اسکرین شاٹ لو، والیوم بڑھاؤ، والیوم گھٹاؤ، فولڈر، سیٹنگز۔ "
     "Open, close, screenshot, volume up, volume down, folder, settings, lock, shutdown."
 )
+# Roman Urdu (Urdu grammar written in Latin letters) — previously MISSING
+# entirely. Live-caught failure this closes: with only the English and
+# Urdu-SCRIPT prompts above primed, Whisper had zero prior for Roman Urdu
+# words at all and defaulted to English-sounding guesses for them —
+# "Kaisay ho Xyron" came out as "Casio Xyron.", "Setting ko kholo" came out
+# as "Settings Code Code." Neither mishearing has anything to do with
+# response-language routing; the decoder simply never had "kaisay", "kholo",
+# "karo", "mein", "ko" in its primed vocabulary to recognize them against.
+_VOICE_INITIAL_PROMPT_UR_ROMAN = (
+    "Voice assistant named Xyron. Roman Urdu commands: "
+    "Kaisay ho Xyron, kya haal hai, Assalam o alaikum. Chrome kholo, settings kholo, band karo, "
+    "isko kholo, ye kholo, folder kholo, download karo, install karo, "
+    "volume barhao, awaz kam karo, screenshot lo, Urdu mein baat karo, "
+    "English mein batao, mujhe dikhao, kya hai, kar do. "
+    "Gana rok do, agla gana, pichla gana, dobara chalao, "
+    "recycle bin khali karo, kachra saaf karo."
+)
 
 
 def _get_initial_prompt(lang: Optional[str]) -> str:
     """Return the right initial prompt based on resolved language.
 
-    lang=None  → auto-detect mode — bilingual prompt helps Whisper handle
-                 code-switching (Roman Urdu mixed with English).
-    lang='ur'  → Urdu-primary prompt.
+    lang=None  → auto-detect mode — trilingual prompt (EN + Urdu script +
+                 Roman Urdu) helps Whisper handle code-switching.
+    lang='ur'  → Urdu-primary prompt (script + Roman, since STT can't know
+                 in advance which script the user will actually use).
     lang='en'  → English-only prompt.
     """
     if lang == "ur":
-        return _VOICE_INITIAL_PROMPT_UR
+        return _VOICE_INITIAL_PROMPT_UR + " " + _VOICE_INITIAL_PROMPT_UR_ROMAN
     if lang is None:
-        # Bilingual: lets Whisper recognise both Urdu script and English commands
-        return _VOICE_INITIAL_PROMPT_EN + " " + _VOICE_INITIAL_PROMPT_UR
+        # Auto-detect: prime all three so code-switching in either direction
+        # (English->Urdu, Urdu script->Roman, etc.) has vocabulary to match.
+        return (_VOICE_INITIAL_PROMPT_EN + " " + _VOICE_INITIAL_PROMPT_UR
+                + " " + _VOICE_INITIAL_PROMPT_UR_ROMAN)
     return _VOICE_INITIAL_PROMPT_EN
 
 
@@ -104,6 +155,15 @@ def _get_initial_prompt(lang: Optional[str]) -> str:
 _STATIC_HOTWORDS = [
     "Xyron", "Chrome", "VS Code", "Notepad", "Calculator", "Explorer",
     "Settings", "Terminal", "Spotify", "Discord", "folder", "drive",
+    # Roman Urdu grammar/command words — previously absent, so short Roman
+    # Urdu commands had no word-level bias at all (see initial_prompt
+    # comment above for the live-caught mishearings this closes).
+    "kholo", "kaisay", "karo", "mein", "kya", "kho", "band", "barhao",
+    "dikhao", "batao", "kholein",
+    # Media pause/next/prev + recycle-bin empty — previously absent, so
+    # these words had no word-level decoder bias (see mixed_language_engine
+    # and intent_router additions that now route the resulting text).
+    "rok", "roko", "agla", "pichla", "khali", "saaf",
 ]
 _MAX_CONTEXT_HOTWORDS = 8
 
@@ -149,14 +209,16 @@ _CORRECTIONS: list[tuple[re.Pattern, str | object]] = [
     (re.compile(r'\b(?:in\s+)?indie\s+drive\b', re.I), 'in D drive'),
     (re.compile(r'\bin\s+dee\s+drive\b',      re.I), 'in D drive'),
     (re.compile(r'\bdeep\s+drive\b',          re.I), 'D drive'),
-    # Drive letter mishears
-    (re.compile(r'\bsee\s+drive\b',           re.I), 'C drive'),
-    (re.compile(r'\bsea\s+drive\b',           re.I), 'C drive'),
-    (re.compile(r'\bsi\s+drive\b',            re.I), 'C drive'),
-    (re.compile(r'\bthe\s+c\s+drive\b',       re.I), 'C drive'),
-    (re.compile(r'\bdee\s+drive\b',           re.I), 'D drive'),
-    (re.compile(r'\bee\s+drive\b',            re.I), 'E drive'),
-    (re.compile(r'\beff\s+drive\b',           re.I), 'F drive'),
+    # Drive letter mishears — comma-tolerant (real-mic Whisper inserts
+    # pause-punctuation between the letter word and "drive": the live
+    # transcript of "C drive kholo" was "Open, see, drive."). [,.]?\s*,?\s*
+    # absorbs the comma on either side; "cee"/"seed" are additional
+    # observed phonetic spellings of the letter C.
+    (re.compile(r'\b(?:see|sea|si|cee|seed)[,.]?\s*,?\s*drive\b', re.I), 'C drive'),
+    (re.compile(r'\bthe\s+c\s+drive\b',                          re.I), 'C drive'),
+    (re.compile(r'\bdee[,.]?\s*,?\s*drive\b',                    re.I), 'D drive'),
+    (re.compile(r'\bee[,.]?\s*,?\s*drive\b',                     re.I), 'E drive'),
+    (re.compile(r'\beff[,.]?\s*,?\s*drive\b',                    re.I), 'F drive'),
     # Inline "C:" or "C/" notation → spoken form
     (re.compile(r'\b([a-fA-F])\s*[:/]',    re.I),
      lambda m: f'{m.group(1).upper()} drive '),
@@ -249,11 +311,38 @@ _tiny_model_lock = _threading.Lock()
 # ── Hardware detection ────────────────────────────────────────────────────────
 
 def _detect_device() -> tuple[str, str]:
-    """Return (device, compute_type) for faster-whisper."""
+    """Return (device, compute_type) for faster-whisper.
+
+    On low-VRAM GPUs (≤4GB) uses int8_float16 instead of pure float16 for
+    EVERY model size — this halves the VRAM needed for the encoder while
+    keeping GPU acceleration. Pure float16 OOMs on a T1200 (4GB) when the
+    encoder + Kokoro/XTTS + Ollama are all resident.
+
+    Benchmarked 2026-08-24 on this project's T1200 (scripts/bench_stt_latency.py
+    + bench_stt_accuracy_parity.py): for the 'small' model on a 2s clip,
+    int8_float16 transcribed in 924ms vs float16's 2422ms (2.6x faster —
+    this was the root cause of the ~3s multilingual STT latency in the real
+    mic trace) while using 288MB VRAM instead of 640MB, and produced
+    identical transcripts on 14/15 real clips under production params (the
+    one divergence was a mumbled wake phrase both variants misheard).
+    Opt out with WHISPER_COMPUTE_TYPE=float16 if a future hardware/firmware
+    pair regresses on int8.
+    """
+    _override = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
     try:
         import torch
         if torch.cuda.is_available():
             gpu = torch.cuda.get_device_name(0)
+            vram_total = torch.cuda.get_device_properties(0).total_memory
+            _low_vram = vram_total <= 4 * 1024**3  # ≤4GB
+            if _override:
+                logger.info("[Whisper] GPU detected: %s — compute_type forced by WHISPER_COMPUTE_TYPE=%s",
+                            gpu, _override)
+                return "cuda", _override
+            if _low_vram:
+                logger.info("[Whisper] GPU detected: %s (%dMB) — low-VRAM, using int8_float16 (benchmarked 2.6x faster than float16 here)",
+                            gpu, vram_total // (1024*1024))
+                return "cuda", "int8_float16"
             logger.info("[Whisper] GPU detected: %s — using float16", gpu)
             return "cuda", "float16"
     except ImportError:
@@ -431,7 +520,7 @@ def transcribe_audio(
     Args:
         audio:    float32 numpy array
         language: ISO code | "auto" | None  (None → WHISPER_LANGUAGE env var)
-        fast:     True → beam_size=1, no VAD (40% faster, for real-time session path)
+        fast:     True → no VAD (skips our own separate VAD pass — see vad_filter below)
 
     Returns:
         {text, language, confidence, duration, segments}
@@ -439,10 +528,41 @@ def transcribe_audio(
     model = _get_model()
     lang = _resolve_lang(language)  # None → auto-detect (handles Urdu, English, mixed)
 
+    # Restrict Whisper's own language-ID to what this app can actually
+    # transcribe/respond in (en/ur) instead of trusting its full 99-language
+    # open-vocabulary guess — see _LANGUAGE_CANDIDATES docstring. Only in
+    # auto mode (lang is None); an explicit WHISPER_LANGUAGE override or a
+    # caller-supplied language still passes straight through unchanged.
+    # initial_prompt stays on the untouched `lang` (trilingual when auto) —
+    # this only narrows which language's tokenizer/output-script Whisper
+    # commits to, not the decoder's vocabulary bias.
+    #
+    # NOT gated on `fast` — that flag only means "skip transcribe()'s own
+    # internal VAD pass" (hybrid_stt_router already VAD-trimmed the audio
+    # itself before calling in), it says nothing about model size or
+    # accuracy. hybrid_stt_router's "accurate"/multilingual path — the ONE
+    # place auto-detect actually runs live — calls transcribe_audio with
+    # fast=True for exactly that VAD reason, so gating this on `not fast`
+    # silently skipped the restriction on every real multilingual call
+    # (live-caught 2026-08-24 testing against the actual voice pipeline,
+    # not just this function in isolation).
+    effective_lang = lang
+    if lang is None:
+        _restricted = _detect_restricted_language(model, audio)
+        if _restricted is not None:
+            effective_lang = _restricted
+
     segments_raw, info = model.transcribe(
         audio,
-        beam_size=1 if fast else 3,
-        language=lang,
+        # beam_size=1 (greedy) for both paths — live-measured 2026-08-21 on this
+        # project's T1200 GPU across 5 Urdu + 3 English real-speech test clips:
+        # beam_size 1 vs 2 vs 3 produced IDENTICAL transcription accuracy every
+        # time (same exact-match count, same specific errors), while beam_size=3
+        # cost ~1s more per call for zero accuracy benefit. Not a universal
+        # claim about beam search — just what this specific model/hardware pair
+        # showed; re-benchmark before changing on different hardware.
+        beam_size=1,
+        language=effective_lang,
         task="transcribe",            # Phase 2.4: always transcribe, never silently translate
         vad_filter=not fast,          # skip VAD in fast mode (we do our own)
         vad_parameters={"min_silence_duration_ms": 300},
@@ -509,6 +629,54 @@ def _resolve_lang(language: Optional[str]) -> Optional[str]:
     """Resolve language param to what faster-whisper expects (None = auto-detect)."""
     lang = language or _LANGUAGE
     return None if lang in (None, "auto") else lang
+
+
+# Languages this app actually has a working end-to-end path for: real STT
+# tuning (hotwords/initial_prompt, corrections) and real TTS (edge-tts
+# ur-PK-*Neural for Urdu; Kokoro for English). Whisper's own open-vocabulary
+# auto-detect (99 languages) is free to pick "hi" for Urdu speech — they're
+# the same spoken language (Hindustani) in different scripts/registers, and
+# acoustically near-indistinguishable on short/accented clips — and once it
+# commits to "hi" it transcribes in DEVANAGARI, which every downstream
+# Urdu-aware component (mixed_language_engine, intent_router's Roman-Urdu
+# regexes, the Urdu-script keyword lists) is blind to, since none of them
+# expect Devanagari. hi/ar responses can't even be spoken correctly today
+# regardless (XTTS's checkpoint is confirmed corrupted on this machine —
+# see xtts_service.py's module docstring — so hi/ar TTS silently falls back
+# to Kokoro's English voice reading foreign script). Live-caught 2026-08-24:
+# "Urdu mein baat karo" ("speak in Urdu") got auto-detected as "hi" and
+# transcribed into unusable Devanagari mush, which then fed a total
+# misunderstanding of the command downstream. Restricting Whisper's own
+# candidate set to what this app can actually understand AND speak closes
+# that failure mode at the source instead of trying to recover from it
+# after the fact.
+_LANGUAGE_CANDIDATES = frozenset({"en", "ur"})
+
+
+def _detect_restricted_language(model, audio: np.ndarray) -> Optional[str]:
+    """
+    Run Whisper's own language-ID pass, but only trust it to choose among
+    _LANGUAGE_CANDIDATES — never let it commit to a language this app has
+    no real transcription/response path for. Returns None (→ caller falls
+    back to full open-vocabulary auto-detect) if the probe itself fails;
+    never raises.
+    """
+    try:
+        _lang, _prob, all_probs = model.detect_language(audio=audio)
+    except Exception as exc:
+        logger.debug("[Whisper] restricted language-ID probe failed: %s", exc)
+        return None
+    for candidate_lang, candidate_prob in all_probs:
+        if candidate_lang in _LANGUAGE_CANDIDATES:
+            logger.info(
+                "[Whisper] restricted language-ID: %s (p=%.2f) — top overall was %s (p=%.2f)",
+                candidate_lang, candidate_prob, _lang, _prob,
+            )
+            return candidate_lang
+    # Neither candidate showed up in the ranked list at all (shouldn't
+    # happen — Whisper ranks every language it knows) — let the normal
+    # open auto-detect path handle it rather than guessing.
+    return None
 
 
 # ── Wake phrase verification ───────────────────────────────────────────────────

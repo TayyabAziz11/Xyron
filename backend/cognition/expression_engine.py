@@ -4,12 +4,15 @@ Expression engine — Phase 5 of emotional cognition (upgraded: cinematic delive
 Shapes AI responses with emotional style: cinematic openers, pacing, micro-reactions,
 and sentence rhythm. Applied post-generation before TTS.
 
+Supports English and Urdu/Roman Urdu expressions for all mood states.
+
 Rules:
   - Openers are cinematic — burst energy, not generic assistant-speak
   - Cooldown adapts to energy: high energy (≥0.85) → cooldown drops to 2 turns
   - Opener de-duplication: tracks last 10 used openers via thread-local deque
   - Micro-reactions only at energy > 0.85 with separate 6-turn cooldown
   - FOCUSED/CALM/ANALYTICAL states get no opener — minimize interruption
+  - Urdu expressions available for all mood states when language is Urdu
 """
 from __future__ import annotations
 
@@ -122,6 +125,113 @@ _OPENERS: dict[str, list[str]] = {
     "ANALYTICAL": [],   # no opener — precision mode
 }
 
+# ── Urdu/Roman Urdu cinematic openers — state-aware ───────────────────────
+
+_URDU_OPENERS: dict[str, list[str]] = {
+    "HYPED": [
+        "Arey wah!",
+        "Kamaal ho gaya!",
+        "Yeh hui na baat!",
+        "Bohat zabardast!",
+        "Oh bhai, yeh toh solid hai!",
+        "Ab maza aaya!",
+        "Chalo, yeh toh bari baat hai!",
+    ],
+    "EXCITED": [
+        "Yeh hui na baat!",
+        "Bohat acha!",
+        "Chalo phir!",
+        "Zabardast!",
+        "Maza aa gaya!",
+    ],
+    "hype": [
+        "Ab maza aayega!",
+        "Chalo shuru karte hain!",
+        "Yeh toh kamaal hai!",
+        "Bhai, ab chalein!",
+    ],
+    "excitement": [
+        "Bohat acha!",
+        "Yeh hui baat!",
+        "Zabardast!",
+    ],
+    "pride": [
+        "Ho gaya!",
+        "Done boss!",
+        "Clean kaam!",
+        "Theek se ho gaya!",
+    ],
+    "frustration": [
+        "Haan yaar... mujhe bhi yehi lagta.",
+        "Theek hai, ab sahi karte hain.",
+        "Samajh gaya.",
+        "Koi baat nahi, dekhte hain.",
+    ],
+    "stress": [
+        "Copy.",
+        "Ho raha hai.",
+        "Dekhta hun.",
+    ],
+    "humor": [
+        "Acha acha—",
+        "Theek hai bhai—",
+        "Sahi baat hai—",
+    ],
+    "DOMINANT": [
+        "Done.",
+        "Ho gaya.",
+        "Khatam.",
+        "Mukammal.",
+        "Lock.",
+    ],
+    "PLAYFUL": [
+        "Acha—",
+        "Theek hai—",
+        "Chalo—",
+    ],
+    "INTENSE": [
+        "Copy.",
+        "Ho raha hai.",
+        "Chalte hain.",
+    ],
+    "PROTECTIVE": [
+        "Main hun na.",
+        "Theek se fix karte hain.",
+        "Yahin hun.",
+        "Haan... samajh gaya.",
+        "Theek hai, ab sort karte hain.",
+    ],
+    "LATE_NIGHT": [
+        "Abhi bhi jaage ho.",
+        "Chalte rehte hain.",
+        "Raat ho gayi, par kaam chalu hai.",
+    ],
+    "LOCKED_IN": [],
+    "FOCUSED": [],
+    "CALM": [],
+    "ANALYTICAL": [],
+}
+
+# ── Urdu micro-reactions — tiny natural bursts at energy > 0.85 ──────────────
+
+_URDU_MICRO_REACTIONS: list[str] = [
+    "Ruko...",
+    "Arey wah!",
+    "Bhai, yeh bari baat hai!",
+    "Sach mein?",
+    "Nahi yaar!",
+    "Yeh toh zabardast hai!",
+    "Acha!",
+    "Hmm...",
+    "Bohat acha!",
+    "Aakhir kaar!",
+    "Interesting...",
+    "Acha, samajh aaya.",
+    "Yeh matter karta hai!",
+    "Zabardast!",
+    "Theek hai boss!",
+]
+
 # ── Micro-reactions — tiny natural bursts at energy > 0.85 ───────────────────
 
 _MICRO_REACTIONS: list[str] = [
@@ -188,6 +298,7 @@ class ExpressionEngine:
         energy:     float,
         turn_count: int,
         importance: float = 0.5,
+        lang:       str = "en",
     ) -> str:
         """
         Apply emotional shaping to a response string.
@@ -199,6 +310,8 @@ class ExpressionEngine:
             energy:     Emotion energy 0.0–1.0.
             turn_count: Current pipeline turn number (for cooldown tracking).
             importance: How strongly the emotion should influence output.
+            lang:       Response language code ("en", "ur", "ur_roman", "mixed").
+                       When non-English, uses Urdu openers and micro-reactions.
 
         Returns:
             Shaped response ready for TTS synthesis.
@@ -214,11 +327,14 @@ class ExpressionEngine:
         text = re.sub(r'#{1,6}\s+', '', text)
         text = re.sub(r'\s+', ' ', text).strip()
 
+        # Use Urdu openers when response language is Urdu-family
+        is_urdu = lang in ("ur", "ur_roman", "mixed")
+
         # Contextual opener
-        text = self._maybe_add_opener(text, mood_state, emotion, energy, turn_count, importance)
+        text = self._maybe_add_opener(text, mood_state, emotion, energy, turn_count, importance, is_urdu)
 
         # Pacing
-        text = self._apply_pacing(text, mood_state)
+        text = self._apply_pacing(text, mood_state, is_urdu)
 
         return text.strip()
 
@@ -227,10 +343,12 @@ class ExpressionEngine:
         mood_state: str,
         energy:     float,
         turn_count: int,
+        lang:       str = "en",
     ) -> Optional[str]:
         """
         Return a micro-reaction fragment for very high energy turns, or None.
         Cooldown-protected — won't fire more than once per 6 turns.
+        Uses Urdu reactions when lang is Urdu-family.
         """
         if energy < 0.85:
             return None
@@ -240,6 +358,8 @@ class ExpressionEngine:
         if turn_count - last < _MICRO_REACTION_COOLDOWN:
             return None
         _set_last_micro_turn(turn_count)
+        if lang in ("ur", "ur_roman", "mixed"):
+            return random.choice(_URDU_MICRO_REACTIONS)
         return random.choice(_MICRO_REACTIONS)
 
     # ── Private ───────────────────────────────────────────────────────────────
@@ -252,6 +372,7 @@ class ExpressionEngine:
         energy:     float,
         turn_count: int,
         importance: float,
+        is_urdu:    bool = False,
     ) -> str:
         # Adaptive cooldown: shorter for high-energy moments
         cooldown = _OPENER_COOLDOWN_HIGH_ENERGY if energy >= 0.85 else _OPENER_COOLDOWN_BASELINE
@@ -263,8 +384,15 @@ class ExpressionEngine:
         if energy < 0.50 or importance < 0.55:
             return text
 
-        # Pick opener source: mood state first, then emotion fallback
-        candidates = _OPENERS.get(mood_state) or _OPENERS.get(emotion, [])
+        # Pick opener source: Urdu or English, mood state first, then emotion fallback
+        if is_urdu:
+            candidates = _URDU_OPENERS.get(mood_state) or _URDU_OPENERS.get(emotion, [])
+        else:
+            candidates = _OPENERS.get(mood_state) or _OPENERS.get(emotion, [])
+
+        # If no Urdu opener available, skip (don't fall back to English for Urdu responses)
+        if is_urdu and not candidates:
+            return text
         if not candidates:
             return text
 
@@ -282,7 +410,7 @@ class ExpressionEngine:
         _set_last_opener_turn(turn_count)
         return f"{opener} {text}"
 
-    def _apply_pacing(self, text: str, mood_state: str) -> str:
+    def _apply_pacing(self, text: str, mood_state: str, is_urdu: bool = False) -> str:
         if mood_state == "DOMINANT":
             text = _PAUSE_AFTER.sub(
                 lambda m: m.group(1).upper() + "..." + (m.group(2) or ""), text
@@ -290,12 +418,14 @@ class ExpressionEngine:
             text = re.sub(r'\.{4,}', '...', text)
 
         elif mood_state in ("LOCKED_IN", "ANALYTICAL", "FOCUSED"):
-            if text and text[-1] not in ".!?":
-                text += "."
+            if text and text[-1] not in ".!?\u06D4":
+                urdu_chars = sum(1 for c in text if 0x0600 <= ord(c) <= 0x06FF)
+                text += "\u06D4" if urdu_chars > 2 else "."
 
         elif mood_state in ("CALM", "LATE_NIGHT", "PROTECTIVE"):
-            if text and text[-1] not in ".!?":
-                text += "."
+            if text and text[-1] not in ".!?\u06D4":
+                urdu_chars = sum(1 for c in text if 0x0600 <= ord(c) <= 0x06FF)
+                text += "\u06D4" if urdu_chars > 2 else "."
 
         elif mood_state == "HYPED":
             # High energy — strip trailing period to let exclamation carry it naturally

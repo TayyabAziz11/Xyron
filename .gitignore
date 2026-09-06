@@ -1,5 +1,4 @@
 # AI Operator — .gitignore
-
 # Python
 __pycache__/
 *.py[cod]
@@ -13,11 +12,14 @@ ENV/
 *.egg-info/
 dist/
 build/
-
 # Environment & secrets (never commit)
 .env
 .env.local
 .env.*
+.env.production
+!.env.example
+!.env.*.example
+!*.env.example
 .secrets/
 secrets/
 credentials/
@@ -28,7 +30,6 @@ token.json
 *.pem
 *.cert
 *.secret*
-
 # Node / Next.js
 node_modules/
 /node_modules
@@ -37,7 +38,6 @@ out/
 .vercel/
 npm-debug.log*
 yarn-debug.log*
-
 # Electron / Tauri build output — only binaries/build artifacts, NOT source code
 desktop/dist/
 desktop/out/
@@ -50,10 +50,8 @@ desktop-app/src-tauri/target/
 *.deb
 *.dmg
 *.AppImage
-
 # Shared package node_modules
 shared/node_modules/
-
 # Runtime logs and checkpoints
 backend/Logs/
 logs/
@@ -62,7 +60,6 @@ logs/
 ralph_loop.log
 **/ralph_loop.log
 backend/system_log.md
-
 # Runtime data (vector DB, brain state, fs index — rebuilt automatically)
 backend/data/chroma/
 backend/data/brain/
@@ -72,20 +69,27 @@ backend/data/fs/*.db-wal
 backend/tests/backend/data/fs/*.db
 backend/tests/backend/data/fs/*.db-shm
 backend/tests/backend/data/fs/*.db-wal
-
 # Audio test recordings (generated locally, not needed for dev)
 backend/data/rvc_tests/
 backend/data/voice_tests/
-
 # WhatsApp session (auth cookies — never commit)
 .secrets/whatsapp_session/
 .secrets/whatsapp_session_meta.json
-
+.secrets/whatsapp_openwa_session/
+# WhatsApp runtime state (real contact names/phone numbers/chat history — never commit)
+backend/data/whatsapp_context.json
+backend/data/whatsapp_identities.json
+backend/data/whatsapp_send_idempotency.db
+backend/data/_test_temp/
+# WhatsApp sidecar (Node) — deps + secrets, never commit
+backend/integrations/whatsapp/sidecar/node_modules/
+backend/integrations/whatsapp/sidecar/.env
+backend/integrations/whatsapp/sidecar/qr_current.png
+backend/integrations/whatsapp/sidecar/live_console.log
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
-
 # IDE / local tools
 .vscode/
 .idea/
@@ -94,19 +98,15 @@ desktop.ini
 *.swp
 *.swo
 *~
-
 # WSL / local runtime config (contains credentials)
 .wslrun
-
 # Unnecessary local assets
 Public/
-
 # Large model files (too big for GitHub — store separately)
 backend/voice/models/*.onnx
 backend/voice/models/*.bin
 dataset/
 dataset_processed/
-
 # Misc
 *.bak
 *.backup
@@ -115,3 +115,9 @@ output.txt
 tsconfig.tsbuildinfo
 tsconfig*.tsbuildinfo
 graphify-out/
+
+# managed by open-wa
+**.data.json
+**.node-persist**
+**_IGNORE_**
+# end managed by open-wa

@@ -33,6 +33,10 @@ _DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
 _URDU_SCRIPT_KWS: frozenset[str] = frozenset({
     "کھولو", "کھول", "بند", "ڈاؤن", "لوڈ", "انسٹال", "بتاؤ", "چلاؤ",
     "سیٹنگ", "وائی", "فائی", "کروم", "یوٹیوب", "آواز", "بڑھاؤ",
+    "دکھاؤ", "تلاش", "بھیجو", "پڑھو", "لکھو", "سمجھاؤ",
+    "رکو", "شروع", "مکمل", "تیار", "ہوگیا", "ٹھیک",
+    "شکریہ", "مہربانی", "ضرور", "بالکل",
+    "فائل", "فولڈر", "ای میل", "واٹس ایپ",
 })
 
 # Arabic-specific keywords (MSA / Gulf dialect patterns, NOT shared with Urdu)
@@ -45,10 +49,66 @@ _ARABIC_KWS: frozenset[str] = frozenset({
 # Keep only URDU-SPECIFIC grammar markers — NOT English loanwords like install/download,
 # to avoid inflating en_hits and mis-scoring "isko install karo" as mixed.
 _ROMAN_URDU_KWS: frozenset[str] = frozenset({
-    "kholo", "karo", "chalao", "band", "mujhe", "batao", "kya", "kaise",
-    "se", "mein", "hai", "kar", "de", "do", "raha", "hoon", "aur", "ya",
+    "kholo", "karo", "chalao", "mujhe", "batao", "kya", "kaise",
+    "se", "mein", "hai", "kar", "de", "raha", "hoon", "aur",
     "nahi", "bhi", "barhao", "kam", "isko", "yeh", "ye", "wala", "wali",
-    "bata", "chalo", "sun", "dikha", "khol", "bandh",
+    "bata", "chalo", "dikha", "khol", "bandh",
+    "hain", "tha", "thi", "ho", "hoga", "hogi",
+    "hun", "hoon", "hue", "huay",
+    "nahin", "nai",
+    "abhi", "kal", "aaj", "parso", "ab",
+    "theek", "achha", "accha", "shukriya", "meherbani",
+    "zaroor", "bilkul", "seedha", "sahi",
+    "pehle", "baad", "phir", "phirse",
+    "walay", "wale",
+    "pe", "ko", "ka", "ki", "ke",
+    "rahi", "rahe", "diya", "diye",
+    "zara", "thora", "thori", "zyada",
+    "sab", "kuch", "sirf", "bas",
+    "bohat", "bahut", "buhat", "boht",
+    "haan", "han", "ji", "jii",
+    "mujhe", "tujhe", "aap", "tum",
+    "yahan", "wahan", "idhar", "udhar",
+    "andar", "bahar", "upar", "neeche",
+    "paas", "aagay", "peechay",
+    "jaldi", "dheere", "ahista",
+    "lekin", "magar", "kyunke", "isliye",
+    "agar", "jab", "tab", "warna",
+    "matlab", "yani", "yaani",
+    "karo", "karna", "karein", "kijiye", "karlo", "kardo",
+    "batao", "batana", "batain",
+    "sunao", "suno", "dikhao", "dekho",
+    "rako", "ruko", "ruk",
+    "dhundo", "dhund", "talash",
+    "bhejo", "bhej",
+    "banao", "banado",
+    "samjho", "samjhao",
+    "pucho", "puch",
+    # Media/system control verbs previously missing (media pause/next/prev,
+    # recycle-bin empty) — added alongside the mixed_language_engine and
+    # intent_router rules that now handle these commands.
+    "rok", "roko", "rukjao",
+    "agla", "agli", "pichla", "pichli",
+    "khali", "saaf", "kachra", "kachray",
+    "wapis", "vapis",
+    # Common greetings/politeness — these carry no command meaning on their
+    # own but were absent from the Roman-Urdu vocabulary entirely, so a
+    # turn that opened with one (e.g. "Assalam o alaikum, Chrome kholo")
+    # only scored on "kholo" and never got credit for the greeting itself.
+    "salam", "assalam", "walaikum", "alvida",
+    "shaabash", "wah",
+})
+
+# English homographs that ALSO exist as Roman-Urdu words. These used to
+# live in _ROMAN_URDU_KWS, but a single hit was enough to flip a whole
+# turn non-English — live bug: a user speaking ONLY English ("Now can you
+# show me the available Wi-Fi network?") matched "the" → ur_roman → 2.3s
+# Ollama Urdu localization + Urdu Edge-TTS on speech that had zero Urdu
+# in it. Weak tokens NEVER trigger non-English detection on their own;
+# genuine Roman-Urdu commands always carry at least one strong marker
+# ("kholo", "karo", "nahin", "hai", "mein", ...) so nothing real is lost.
+_ROMAN_URDU_WEAK_KWS: frozenset[str] = frozenset({
+    "the", "do", "band", "sun", "mat", "na", "ya", "door",
 })
 
 # Roman Hindi words NOT found in Roman Urdu (to distinguish the two)
@@ -62,6 +122,14 @@ _EN_CMD_KWS: frozenset[str] = frozenset({
     "chrome", "youtube", "store", "settings", "wifi", "calculator",
     "volume", "screen", "microsoft", "instagram", "facebook", "notepad",
     "explorer", "vs", "code", "edge", "teams", "spotify",
+    "whatsapp", "email", "gmail", "linkedin", "twitter",
+    "file", "folder", "document", "presentation", "spreadsheet",
+    "delete", "copy", "paste", "rename", "move", "create",
+    "new", "save", "undo", "redo", "refresh", "update",
+    "google", "github", "docker", "terminal", "browser",
+    "music", "video", "photo", "camera", "screenshot",
+    "pending", "approved", "rejected", "unpaid", "paid",
+    "invoice", "order", "report", "dashboard", "analytics",
 })
 
 
@@ -111,11 +179,15 @@ def detect(transcript: str, stt_language: str | None = None) -> dict:
 
     # ── 3. Roman text — keyword matching ─────────────────────────────────────
     ru_hits = sum(1 for w in words if w in _ROMAN_URDU_KWS)
+    ru_weak_hits = sum(1 for w in words if w in _ROMAN_URDU_WEAK_KWS)
     rh_hits = sum(1 for w in words if w in _ROMAN_HINDI_ONLY_KWS)
     en_hits = sum(1 for w in words if w in _EN_CMD_KWS)
 
-    # Even 1 Roman Urdu grammar marker is a strong signal — short commands like
-    # "chrome kholo" or "band karo" only have 1–2 Urdu words.
+    # Even 1 STRONG Roman Urdu grammar marker is a strong signal — short
+    # commands like "chrome kholo" or "band karo" only have 1–2 Urdu words
+    # ("kholo"/"karo" are strong; the weak English-homograph tokens around
+    # them — "band", "the", "do"… — never count on their own, so a pure
+    # English sentence can't be flipped non-English by a homograph).
     if ru_hits >= 1:
         conf = 0.88 if ru_hits >= 2 else 0.78
         if en_hits >= 1:
@@ -138,7 +210,7 @@ def detect(transcript: str, stt_language: str | None = None) -> dict:
     # Whisper's shaky language guess when the transcript itself has no
     # English-command-word evidence contradicting it.
     stt = (stt_language or "en").lower()
-    if stt in ("ur", "hi", "ar") and ru_hits == 0 and rh_hits == 0 and en_hits == 0:
+    if stt in ("ur", "hi", "ar") and ru_hits == 0 and rh_hits == 0 and en_hits == 0 and ru_weak_hits == 0:
         _stt_map = {"ur": "ur", "hi": "hi", "ar": "ar"}
         return _emit(_stt_map[stt], 0.60, f"stt_reported={stt}")
 

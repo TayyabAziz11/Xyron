@@ -59,7 +59,13 @@ _WINFG_PS_CMD = (
     'Write-Output "TITLE:$($sb.ToString())|PROC:$($p.Name)|PID:$xpid"'
 )
 
-_CACHE_TTL = 2.0   # seconds — balance freshness vs PS round-trip overhead
+_CACHE_TTL = 3.5   # seconds — balance freshness vs PS round-trip overhead
+# Was 2.0s; a live-observed cold/near-cold PS Add-Type round-trip costs
+# ~300-500ms (window_context.py's own docstring above), and this gets
+# queried up to 4x per verify retry loop (verifier_v2.py) plus once per
+# "close/minimize/switch to" style command via context_resolver — a slightly
+# longer window trims redundant round-trips without materially harming the
+# freshness this cache exists for.
 
 
 class _WindowContextService:

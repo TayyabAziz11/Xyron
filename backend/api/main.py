@@ -11,6 +11,19 @@ import logging
 import sys
 from pathlib import Path
 
+# Windows' console defaults to the cp1252 codepage, which cannot encode most
+# emoji. Real WhatsApp message text/contact names routinely contain them
+# (Baileys integration logs message content directly) — without this, a
+# single emoji in a log line raises UnicodeEncodeError inside the logging
+# module's own emit(), which Python's logging swallows internally (prints
+# "--- Logging error ---" to stderr) but can still crash a plain caller
+# thread if the same string is also passed to print() elsewhere.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s",
@@ -30,6 +43,16 @@ from .config import settings
 if settings.onnx_provider and not _os.environ.get("ONNX_PROVIDER"):
     _os.environ["ONNX_PROVIDER"] = settings.onnx_provider
     logging.getLogger(__name__).info("[Config] ONNX_PROVIDER=%s", settings.onnx_provider)
+
+# Probe network reachability once before any HuggingFace-backed model loader
+# (SentenceTransformer for intent classification / semantic search / semantic
+# memory, Kokoro's hf_hub_download) gets imported below. If offline, this sets
+# HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE so those loaders fail fast against the
+# local cache instead of burning ~30s each in huggingface_hub's DNS retry
+# backoff — see api/services/network_state.py.
+from .services.network_state import apply_offline_env as _apply_offline_env
+if _apply_offline_env():
+    logging.getLogger(__name__).warning("[Config] network unreachable at startup — HF_HUB_OFFLINE=1 set")
 from .routers import health, commands, approvals, activity, integrations, workflows, events, voice, voice_ws, drafts, system, tasks, reminders, history, macros, notes, meeting, proactive, automation, memory, dataset, environment, cognition, voice_identity, dev, brain, takeover, dashboard
 from .routers import auth as auth_router
 from .routers import monitor as monitor_router
@@ -394,6 +417,18 @@ async def startup() -> None:
             proactive_service.start(_s.openai_api_key)
     except Exception as _exc:
         logger.warning("Background service startup failed: %s", _exc)
+
+    # WhatsApp incoming-message notifier — subscribes to the sidecar's live
+    # SSE message stream, records the sender as the active WhatsApp contact
+    # (so "message him ..." / "reply to him ..." resolve correctly), and
+    # voice-announces the message when a voice session is connected. Never
+    # replies on its own. Gated behind wa_incoming_announce_enabled and
+    # wa_sidecar_api_key.
+    try:
+        from .services.wa_incoming_notifier import wa_incoming_notifier
+        wa_incoming_notifier.start()
+    except Exception as _exc:
+        logger.warning("WhatsApp incoming-message notifier startup failed: %s", _exc)
 
     # Phase 9 — start Dev Observer background loop
     try:

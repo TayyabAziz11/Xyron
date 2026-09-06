@@ -1,0 +1,19 @@
+{
+  "categories": {
+    "Pictures":       [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".svg", ".tiff", ".tif", ".ico", ".raw"],
+    "Documents":      [".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".md", ".pages"],
+    "Spreadsheets":   [".xls", ".xlsx", ".csv", ".ods", ".numbers"],
+    "Presentations":  [".ppt", ".pptx", ".odp", ".key"],
+    "Videos":         [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"],
+    "Audio":          [".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma"],
+    "Archives":       [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".iso"],
+    "Installers":     [".exe", ".msi"],
+    "Code":           [".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".html", ".css", ".java", ".cpp", ".c", ".sh", ".ps1", ".ipynb"]
+  },
+  "other_folder": "Other",
+  "duplicates_folder": "Duplicates",
+  "screenshots_folder": "Screenshots",
+  "screenshot_name_patterns": ["screenshot", "screen shot", "screen_shot", "screen-shot"],
+  "ignore_filenames": ["desktop.ini", "thumbs.db", ".ds_store"],
+  "hash_size_cap_bytes": 314572800
+}

@@ -281,13 +281,18 @@ class BrowserWorkspace:
             logger.warning("[WINDOWS_CHROME_LAUNCH_FAILED] error=%r", str(exc)[:200])
             return False
 
-    async def _connect_with_retry(self, attempts: int = 4, delay_s: float = 2.0) -> bool:
+    async def _connect_with_retry(self, attempts: int = 6, delay_s: float = 1.0) -> bool:
         """Poll for CDP readiness instead of a single fixed sleep+attempt.
 
         A genuinely cold `chrome.exe` start (as opposed to reconnecting to
         an instance that's been running since an earlier session) can take
-        much longer than a single short delay to bind its debug listener
-        under WSL2/Windows process-launch overhead.
+        longer than a single short delay to bind its debug listener under
+        WSL2/Windows process-launch overhead.
+
+        Latency tuning: Chrome frequently binds its debug listener within
+        1–2s of launch, so short polling (1.0s) catches it much sooner
+        than the old 2.0s-first-sleep cadence without losing total
+        coverage (6 × 1.0s ≈ the old 4 × 2.0s window).
         """
         for attempt in range(1, attempts + 1):
             await asyncio.sleep(delay_s)
@@ -335,7 +340,7 @@ class BrowserWorkspace:
                 # to come up (a cold start can take much longer than a
                 # single fixed delay — see `_connect_with_retry`).
                 if await self._launch_windows_chrome():
-                    if await self._connect_with_retry(attempts=4, delay_s=2.0):
+                    if await self._connect_with_retry(attempts=6, delay_s=1.0):
                         self._control_mode = CONTROL_MODE_CDP
 
                 if self._page is None:
@@ -345,11 +350,26 @@ class BrowserWorkspace:
                     # also fails, the caller must run the elevated
                     # Environment Doctor repair (Part 3) rather than us
                     # silently degrading to an uncontrolled browser.
+                    #
+                    # Bounded failure policy (2026-09-04): this self-heal
+                    # tier's retry budget was attempts=6/delay_s=1.5 (up to
+                    # 9s poll + a fresh 15s launch wait + 1.5s presleep —
+                    # ~25.5s on TOP of tier 2's own ~21s worst case, ~46.5s
+                    # total before raising CDPUnavailableError). Now that
+                    # simple website opens never reach this function at all
+                    # (system_tools.py's _launch_app no longer routes
+                    # through browser_workspace for a plain "open X" — see
+                    # its own comment), this tier is reached ONLY by genuine
+                    # browser-automation commands, where an unbounded retry
+                    # storm is still bad UX. Tightened to attempts=3/
+                    # delay_s=1.0 (3s poll) + 1.0s presleep — a real second
+                    # chance at recovering a stale/broken profile, not a
+                    # second full 9s+ poll cycle stacked on the first.
                     logger.info("[CDP_SELF_HEAL_START] action=kill_stale_and_retry")
                     await self._kill_stale_xyron_chrome()
-                    await asyncio.sleep(2.5)
+                    await asyncio.sleep(1.0)
                     if await self._launch_windows_chrome():
-                        if await self._connect_with_retry(attempts=5, delay_s=2.5):
+                        if await self._connect_with_retry(attempts=3, delay_s=1.0):
                             self._control_mode = CONTROL_MODE_CDP
                             logger.info("[CDP_SELF_HEAL_SUCCESS] recovered_via=kill_stale_and_relaunch")
 

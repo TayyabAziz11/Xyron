@@ -49,7 +49,13 @@ _XTTS_MODEL = os.getenv("XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtt
 # XTTS language codes — Coqui's supported identifiers
 # See: https://coqui.ai/cpml.txt
 _LANG_MAP: dict[str, str] = {
-    "ur":       "ar",    # XTTS-v2 uses "ar" for Arabic script; covers Urdu text
+    # NOT native Urdu synthesis — XTTS-v2 has no Urdu language model. This
+    # borrows its Arabic phoneme set as the closest available approximation
+    # (shared script family) and is a known, documented limitation, not a
+    # claim of correctness. See section 14 of the multilingual plan — a
+    # genuine Urdu voice (e.g. an online neural TTS with real ur-PK voices)
+    # is future work, intentionally out of scope for this local-first phase.
+    "ur":       "ar",
     "ur_roman": "en",    # Roman Urdu — English phoneme model sounds natural
     "hi":       "hi",
     "ar":       "ar",
@@ -165,7 +171,15 @@ def _speaker_ref() -> Path | None:
 
 
 def _ensure_bg_load() -> None:
-    """Start XTTS model load in a background thread (idempotent)."""
+    """Start XTTS model load in a background thread (idempotent).
+
+    Routed through gpu_coordinator.defer_background_job so the actual model
+    load (torch model construction — CPU/GPU heavy) waits for any in-flight
+    voice-session STT/TTS to go idle first, rather than competing with it —
+    the same contention pattern that previously caused the 7-90s TTS lag
+    (see commit 6c04904). This only defers the LOAD; the thread itself
+    starts immediately and is a no-op cost until it actually begins loading.
+    """
     global _bg_load_started
     if _model_ready.is_set() or _model_tried:
         return
@@ -173,18 +187,39 @@ def _ensure_bg_load() -> None:
         if _bg_load_started:
             return
         _bg_load_started = True
-    t = threading.Thread(target=_load_model, daemon=True, name="xtts-auto-preload")
+
+    def _deferred_load() -> None:
+        try:
+            from api.services.gpu_coordinator import defer_background_job
+            defer_background_job("xtts_preload", timeout=30.0)
+        except Exception:
+            pass
+        _load_model()
+
+    t = threading.Thread(target=_deferred_load, daemon=True, name="xtts-auto-preload")
     t.start()
-    logger.info("[XTTS_BG_LOAD_STARTED] first multilingual request triggered background load")
+    logger.info("[XTTS_BG_LOAD_STARTED] background load triggered (gpu_coordinator-gated)")
+
+
+def is_ready() -> bool:
+    """Whether XTTS has finished loading and can synthesize right now."""
+    return _model_ready.is_set()
 
 
 def synthesize(text: str, lang: str) -> Optional[bytes]:
     """
     Synthesize speech using XTTS-v2.
 
-    If the model is not yet loaded (cold start), starts background loading and
-    returns None immediately so the caller can fall back to Kokoro English.
-    Once the model is loaded, subsequent calls use XTTS (~1–3s per synthesis).
+    If the model is not yet loaded (cold start), kicks off background loading
+    (idempotent — safe to call every turn) and returns None immediately so the
+    caller falls back to Kokoro English for THIS turn. Once loaded (typically
+    within the first few non-English turns of a session, sooner if
+    voice_ws.py's early trigger already started the load ahead of the first
+    TTS call — see [ML_LANG_DETECT] in voice_ws.py), subsequent calls use
+    XTTS. Previously this never called the loader at all outside the
+    MULTILINGUAL_TTS_PRELOAD=true startup path, so without that env var XTTS
+    never loaded for the life of the process — every non-English reply
+    silently used the Kokoro English voice, not just the first one.
 
     Args:
         text: text to speak
@@ -194,8 +229,13 @@ def synthesize(text: str, lang: str) -> Optional[bytes]:
         WAV bytes at 24000 Hz, or None if model unavailable.
     """
     if not _model_ready.is_set():
-        logger.info("[ML_TTS_COLD_START] lang=%s — model not ready, Kokoro fallback in use", lang)
-        return None  # Caller falls back to Kokoro; explicit preload required for XTTS
+        _ensure_bg_load()
+        logger.info(
+            "[ML_TTS_COLD_START] lang=%s — model not ready, Kokoro fallback in use for this turn "
+            "(degraded mode: ur/mixed spoken in the English voice until XTTS finishes loading)",
+            lang,
+        )
+        return None  # Caller falls back to Kokoro for this turn only
 
     logger.info("[ML_TTS_WARM_HIT] lang=%s", lang)
     logger.info("[XTTS_SYNTH_START] lang=%s text=%r", lang, text[:60])
@@ -205,6 +245,12 @@ def synthesize(text: str, lang: str) -> Optional[bytes]:
     if model is None:
         logger.warning("[XTTS_SYNTH_FAIL] model unavailable (not installed or load failed)")
         return None
+
+    try:
+        from voice.pronunciation_preprocessor import preprocess as _pp
+        text = _pp(text)
+    except Exception:
+        pass
 
     xtts_lang = _LANG_MAP.get(lang, "en")
     ref       = _speaker_ref()

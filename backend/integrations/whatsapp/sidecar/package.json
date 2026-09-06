@@ -1,0 +1,25 @@
+{
+  "name": "xyron-whatsapp-sidecar",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Baileys-based WhatsApp transport sidecar for Xyron. WebSocket protocol (no browser), Express REST + SSE events, bound to 127.0.0.1 only.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "dotenv": "^16.4.7",
+    "express": "4.22.2",
+    "mime-types": "3.0.2",
+    "pino": "9.6.0",
+    "qrcode-terminal": "0.12.0",
+    "sql.js": "^1.12.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "qrcode": "^1.5.4"
+  }
+}

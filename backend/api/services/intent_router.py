@@ -51,6 +51,7 @@ _TOOL_DESCS: dict[str, str] = {
     "get_battery_status":     "battery percentage charge charging remaining time power level how much battery left",
     "system_info":            "computer specs hardware cpu processor ram memory operating system version info",
     "system_health":          "cpu usage ram memory usage disk usage system performance health status live",
+    "system_health_check":    "full system health check battery level storage disk space running apps which app using most cpu memory resource hog complete system status report",
     "get_disk_usage":         "disk space storage how much space free drive usage remaining",
     "get_uptime":             "system uptime how long running since boot last restart",
     "get_running_apps":       "running applications processes apps open currently what is running background",
@@ -188,6 +189,75 @@ def _local_clock_route(text: str) -> "RouteResult | None":
     return None
 
 
+# ── Tier 0.5 — WhatsApp deterministic fast path (Phase 4) ────────────────────
+# Bypasses the LLM/semantic tier for confident WhatsApp commands. Never
+# resolves a contact over the network itself — only a cheap in-memory
+# identity-cache lookup (or the contextual-pronoun check, also in-memory) —
+# so this stays true to Tier 0's "no LLM, no internet, instant" contract.
+# See api/integrations/whatsapp/wa_intent.py's module docstring for the
+# anti-hijack design: an utterance without the literal word "whatsapp"
+# only commits to this route when contact_ref is already a known contact
+# or a contextual pronoun; otherwise it returns None and falls through to
+# Tier 2/3/LLM exactly as it would today.
+
+_WA_TOOL_FOR_ACTION = {
+    "send_text": "wa_send_text",
+    "send_file": "wa_send_file",
+    "show_chat": "wa_show_chat",
+    "get_messages": "wa_get_messages",
+    "reply": "wa_reply",
+}
+
+
+def _wa_intent_to_route(intent) -> "RouteResult | None":
+    from api.integrations.whatsapp.wa_context import is_contextual_contact_reference
+    from api.integrations.whatsapp.wa_identity import get_default_identity_store
+
+    ref = intent.contact_ref or ""
+    if intent.requires_cache_hit:
+        is_ctx = is_contextual_contact_reference(ref)
+        ident = None if is_ctx else get_default_identity_store().resolve_cached(ref)
+        if not is_ctx and ident is None:
+            return None
+
+    tool = _WA_TOOL_FOR_ACTION.get(intent.action)
+    if tool is None:
+        return None
+
+    if intent.action == "send_text":
+        params = {"contact": ref, "message": intent.message, "show_ui": intent.show_ui}
+    elif intent.action == "send_file":
+        params = {"contact": ref, "file_ref": intent.artifact_ref, "show_ui": intent.show_ui}
+    elif intent.action == "reply":
+        params = {"contact": ref, "message": intent.message, "show_ui": intent.show_ui}
+    elif intent.action == "show_chat":
+        params = {"contact": ref}
+    else:  # get_messages
+        params = {"contact": ref}
+
+    return RouteResult(tool, params, 0, intent.confidence)
+
+
+def _whatsapp_route(text: str) -> "RouteResult | None":
+    """Tier 0.5 — parse + (cheap) commit-check for WhatsApp commands."""
+    try:
+        from api.integrations.whatsapp.wa_intent import parse_wa_intent
+    except Exception:
+        return None
+    intent = parse_wa_intent(text)
+    if intent is None:
+        return None
+    try:
+        result = _wa_intent_to_route(intent)
+    except Exception:
+        logger.debug("[IntentRouter] WhatsApp tier failed", exc_info=True)
+        return None
+    if result:
+        logger.info("[IntentRouter] Tier0.5 whatsapp: %r -> %s params=%s conf=%.2f",
+                    text[:60], result.tool_name, result.params, result.confidence)
+    return result
+
+
 # Tools that should never be routed by the semantic classifier alone
 # (require explicit phrasing or confirmation — too dangerous to guess)
 _SAFE_GUARD_TOOLS = {
@@ -195,6 +265,12 @@ _SAFE_GUARD_TOOLS = {
     "send_email", "clear_temp_files", "empty_recycle_bin",
     "disable_startup_app",
 }
+
+# Same Arabic/Urdu/Persian Unicode block api.services.language_detector
+# already uses for script detection — mirrored here (not imported) to
+# avoid adding a cross-module import to this hot-path router for a single
+# regex. See _semantic_route()'s comment for why this gates Tier 3.
+_ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
 
 # Gate for Tier 2.5 (object_resolver) — only worth calling on utterances that
 # actually look like an open/navigate request.
@@ -212,11 +288,26 @@ def _params_for_object(tool: str, obj) -> dict:
             p["drive"] = obj.scope["drive"]
         return p
     if tool == "open_drive":
-        return {"drive": (obj.name or "").strip().upper()[:1]}
+        # The name should already be a bare letter after the shared phonetic
+        # layers (whisper _CORRECTIONS + normalizer._correct_drive_phonetics),
+        # but resolve() can still hand over residue like "seed" when an
+        # intermediate word broke the adjacency those patterns require —
+        # map the known homophones here as a last resort instead of silently
+        # taking the wrong first character ("seed" → "S").
+        _drive_letter = (obj.name or "").strip().upper()
+        if _drive_letter:
+            _first = _drive_letter.split()[0]
+            _drive_letter = {
+                "SEE": "C", "SEA": "C", "SI": "C", "CEE": "C", "SEED": "C",
+                "DEE": "D", "EE": "E", "EFF": "F",
+            }.get(_first, _first)
+        return {"drive": _drive_letter[:1]}
     if tool == "open_application":
         return {"app_name": obj.name}
     if tool == "open_url":
-        return {"url": obj.name} if obj.name.lower().startswith(("http://", "https://")) else {"query": obj.name}
+        # _exec_open_url reads "site" and resolves known names via its own
+        # _URL_MAP (youtube → youtube.com) or builds https://<site>.
+        return {"site": obj.name}
     if tool == "open_system_settings":
         return {"page": obj.name}
     return {"query": obj.name}
@@ -227,7 +318,7 @@ class IntentRouter:
     def __init__(self) -> None:
         self._cache: dict[str, RouteResult] = {}
         self._cache_lock = threading.Lock()
-        self._rules: list[tuple[re.Pattern, str, Callable]] = []
+        self._rules: list[tuple[re.Pattern, str, Callable, Optional[re.Pattern]]] = []
         self._model = None
         self._embeddings: dict[str, object] = {}
         self._np = None
@@ -244,8 +335,25 @@ class IntentRouter:
     # ────────────────────────────────────────────────────────────────────────
 
     def _build_rules(self) -> None:
-        def add(pattern: str, tool: str, fn: Callable = lambda m: {}):
-            self._rules.append((re.compile(pattern, re.IGNORECASE), tool, fn))
+        def add(pattern: str, tool: str, fn: Callable = lambda m: {}, reject_if: Optional[str] = None):
+            """reject_if: an optional regex (as a string) — if it matches
+            ANYWHERE in the full input text, this rule is skipped entirely
+            even though `pattern` matched, and matching continues to the
+            next rule. Exists for catch-all rules whose capture group can
+            legitimately match a SUBSTRING of a sentence whose overall
+            structure the rule was never meant to handle (see the
+            Urdu/colloquial app-launch rule below for the motivating case:
+            re.search retries at every start position, so a plain
+            in-pattern negative lookahead only blocks the specific
+            substring it's attached to — it can't reject the match on the
+            grounds that some OTHER, earlier part of the same sentence
+            makes the whole utterance not this rule's business.
+            reject_if checks the whole text once, independent of where the
+            candidate match starts."""
+            self._rules.append((
+                re.compile(pattern, re.IGNORECASE), tool, fn,
+                re.compile(reject_if, re.IGNORECASE) if reject_if else None,
+            ))
 
         # ── Volume ──────────────────────────────────────────────────────────
         add(r'\b(?:set|put|change)\s+(?:the\s+)?volume\s+(?:to\s+)?(\d+)',
@@ -281,6 +389,17 @@ class IntentRouter:
             lambda m: {"action": m.group(0).lower().strip()})
         add(r'\btoggle\s+(?:the\s+)?mute\b', "mute_unmute", lambda m: {"action": "toggle"})
 
+        # ── YouTube open+play compound (must precede Media controls) ──────
+        # "open YouTube and play any famous song" / "youtube ... play X" —
+        # previously the generic `play` pattern below matched first and these
+        # became media_control play_pause (live regression: nothing opened,
+        # reply was "Playing / paused."). Requires "youtube" in the utterance
+        # AND a "play" after it, so plain "play music" / "pause" still fall
+        # through to media_control; "play X on youtube" (play BEFORE youtube)
+        # doesn't match here and is handled by the search_youtube patterns.
+        add(r'\b(?:open\s+)?(?:youtube|yt)\b.{0,40}?\bplay\s+(.+?)[.!?\s]*$',
+            "search_youtube", lambda m: {"query": m.group(1).strip()})
+
         # ── Media controls ───────────────────────────────────────────────────
         # "play" — can be standalone; "resume" requires a media noun so that
         # document names like "resume" (CV) are not hijacked as playback commands.
@@ -302,6 +421,20 @@ class IntentRouter:
         add(r'\bstop\s+(?:music|song|audio|playback|playing)\b',
             "media_control", lambda m: {"action": "stop"})
 
+        # ── Roman Urdu media controls — noun-gated so bare "rok do" (used
+        # all over colloquial Urdu for "stop"/"pull over") never fires this
+        # as a media command. Direct regex here as a second line of defense
+        # alongside mixed_language_engine's own canonicalization of the
+        # same phrases, in case a turn reaches intent_router unnormalized.
+        add(r'\b(?:gana|song|music|playback|video)\s+(?:rok\s*do|roko|band\s+kar[oa]?|pause\s+kar[oa]?)\b',
+            "media_control", lambda m: {"action": "play_pause"})
+        add(r'\b(?:dobara|wapis|vapis)\s+chala[oa]?\b',
+            "media_control", lambda m: {"action": "play_pause"})
+        add(r'\b(?:agla|agli)\s+(?:gana|song|track|video)\b',
+            "media_control", lambda m: {"action": "next"})
+        add(r'\b(?:pichla|pichli)\s+(?:gana|song|track|video)\b',
+            "media_control", lambda m: {"action": "prev"})
+
         # ── Brightness ──────────────────────────────────────────────────────
         add(r'\b(?:set|put|change)\s+brightness\s+(?:to\s+)?(\d+)',
             "brightness_control", lambda m: {"action": "set", "level": int(m.group(1))})
@@ -321,7 +454,8 @@ class IntentRouter:
         # ── System info / health ─────────────────────────────────────────────
         add(r'\b(?:system\s+(?:info|information|specs?|details)|about\s+(?:my\s+)?(?:pc|computer|system))\b', "system_info")
         add(r'\b(?:cpu|processor|ram|memory|os|operating\s+system)\s+(?:info|specs?|details|version)\b', "system_info")
-        add(r'\b(?:system|pc)\s+(?:health|status|performance)\b', "system_health")
+        add(r'\b(?:system\s+health\s+check|full\s+system\s+check|complete\s+system\s+(?:check|report)|'
+            r'(?:system|pc)\s+(?:health|status|performance))\b', "system_health_check")
         add(r'\b(?:cpu|ram|memory|disk)\s+usage\b', "system_health")
         add(r'\b(?:how\s+much\s+)?disk\s+(?:space|usage|storage)\b', "get_disk_usage")
         add(r'\bhow\s+much\s+(?:space|storage)\b', "get_disk_usage")
@@ -335,7 +469,16 @@ class IntentRouter:
 
         # ── Screenshots ──────────────────────────────────────────────────────
         add(r'\b(?:take\s+(?:a\s+)?)?screenshot\b|\bcapture\s+(?:the\s+)?screen\b', "take_screenshot")
-        add(r'\bwhat.?s\s+(?:on|showing\s+on)\s+(?:my\s+)?screen\b|\bread\s+(?:the\s+)?screen\b', "read_screen")
+        # "what's on screen" (contraction) AND "what is on screen" (the
+        # form local_comprehension._synthesize_canonical's object_type=
+        # "screen" branch actually produces) — the old `what.?s` only
+        # matched the contracted apostrophe form, so a Qwen-synthesized
+        # "what is on my screen" (from Roman/Urdu-script "screen pe kya
+        # hai?") silently fell through to unmapped despite being
+        # synthesized correctly.
+        add(r'\bwhat.?s\s+(?:on|showing\s+on)\s+(?:my\s+)?screen\b|'
+            r'\bwhat\s+is\s+(?:on|showing\s+on)\s+(?:my\s+)?screen\b|'
+            r'\bread\s+(?:the\s+)?screen\b', "read_screen")
 
         # ── Drive letters (must be before open_application catch-all) ───────────
         # "open C drive", "open the D drive", "go to E drive", "open C:"
@@ -346,6 +489,20 @@ class IntentRouter:
         )
         add(
             r'\b(?:open|go\s+to|show|browse)\s+(?:the\s+)?([a-zA-Z]):\s*[\\\/]?\b',
+            "open_drive",
+            lambda m: {"drive": m.group(1).upper()},
+        )
+        # Bare "Z drive" / "the Z drive" with no leading verb — live-caught
+        # failure: this used to fall through Tier2/Tier4 entirely (no verb
+        # to match) and land on the general LLM fallback, which answered
+        # "what does the Z drive mean" instead of trying to open it and
+        # reporting whether it actually exists. Anchored to the WHOLE
+        # utterance so it can't swallow a drive letter mentioned inside a
+        # longer sentence ("explain what a hard drive is" must not match).
+        # Letter range excludes A and I on purpose — "I drive" / "a drive"
+        # are ordinary English (pronoun/article), not a drive letter.
+        add(
+            r'^\s*(?:the\s+)?([b-hj-zB-HJ-Z])\s+(?:drive|disk)\s*[.!?]*\s*$',
             "open_drive",
             lambda m: {"drive": m.group(1).upper()},
         )
@@ -630,10 +787,25 @@ class IntentRouter:
 
         # ── Urdu/colloquial app launch phrases ──────────────────────────────────
         # "chrome kholo", "settings kholo", "vs code chala", etc.
+        # Found via real-pipeline validation (2026-08-24): "Is repo ka
+        # README kholo." ("open this repo's README") matched this pattern
+        # DIRECTLY on the raw, un-canonicalized transcript — re.search
+        # tries every start position, so even excluding demonstrative
+        # words from the CAPTURED group (an earlier attempt) just let it
+        # re-anchor past them and capture "README" alone as the "app
+        # name," still wrong (README isn't an application). A demonstrative/
+        # relative pronoun ("is/us/ye/wo/jo" = "this/that/which") ANYWHERE
+        # in the sentence is a structural signal of a compositional/
+        # relative-clause command ("this repo's X", "the one that...") —
+        # never present in a real "chrome kholo"-style app launch — so
+        # reject_if checks the WHOLE text once, independent of which
+        # substring the capture group matched, and defers to Qwen (Tier 4)
+        # instead of guessing.
         add(
             r'\b(\w[\w\s]{1,30}?)\s+(?:kholo|khol\s+do|chala(?:o)?|open\s+kar(?:o)?|start\s+kar(?:o)?|launch\s+kar(?:o)?)\b',
             "open_application",
             lambda m: {"app_name": m.group(1).strip()},
+            reject_if=r'\b(?:is|us|ye|yeh|wo|woh|jo|iska|uska|jiska|jiski|jinka)\b|اس|یہ|وہ|جو|ان',
         )
         # "wifi on karo", "wifi off karo"
         add(r'\bwifi\s+on\s+(?:karo|kar|kro)\b', "open_wifi_panel")
@@ -674,6 +846,33 @@ class IntentRouter:
             r'\byoutube\s+(?:par|pr)\s+(.+?)(?:\s+(?:chalao|chlao|chalo))?[\s.,!?]*$',
             "search_youtube",
             lambda m: {"query": m.group(1).strip().rstrip(".,!?").strip()},
+        )
+        # ── Windows Update (must precede the search_web fallbacks below) ────
+        # The generic "X updates/info → search_web" fallback just below
+        # otherwise shadows "open windows update(s)" (first-match wins): the
+        # dedicated Pattern A/B for the update page are registered ~150 lines
+        # later and never get a chance. Same shape as Pattern B.
+        add(
+            r'\b(?:open|show|check|go\s+to|access|launch)\s+(?:my\s+)?windows?\s+updates?\b',
+            "open_system_settings",
+            lambda m: {"page": "update"},
+        )
+        # "search for X" / "search X" / "google X" — found missing entirely
+        # during real-pipeline validation: local_comprehension's own
+        # canonical synthesis for a web search produces exactly this shape
+        # ("search for Pakistan weather"), and it silently depended on
+        # Tier 3's semantic classifier (slow to load, not always ready) to
+        # ever route anywhere. This is common and unambiguous enough to be
+        # deterministic rather than left to a probabilistic fallback tier.
+        add(
+            r'^search\s+(?:for\s+|the\s+web\s+for\s+)?(.+?)[.,!?\s]*$',
+            "search_web",
+            lambda m: {"query": m.group(1).strip().rstrip(".,!?")},
+        )
+        add(
+            r'^google\s+(.+?)[.,!?\s]*$',
+            "search_web",
+            lambda m: {"query": m.group(1).strip().rstrip(".,!?")},
         )
         # "X dikhao" / "X show" — Urdu "show me X" → search (no youtube context = web search)
         add(
@@ -756,6 +955,48 @@ class IntentRouter:
         add(r'\b(?:get\s+me\s+ready\s+to\s+(?:work|code|dev)|open\s+my\s+work\s+apps|'
             r'prepare\s+my\s+(?:work|dev(?:eloper)?)\s+(?:setup|environment|env))\b',
             "run_workflow", lambda m: {"name": "work_mode"})
+
+        # ── Organize files → organize_files tool ─────────────────────────────
+        # Requires an explicit location noun or "files" right after the verb so
+        # generic uses of "clean"/"sort"/"tidy" (e.g. "clean my keyboard") don't
+        # misfire — organize_files itself always confirms before moving anything.
+        add(
+            r'\b(?:organi[sz]e|clean(?:\s*up)?|tidy(?:\s*up)?|sort(?:\s*out)?)\s+'
+            r'(?:my\s+|the\s+)?(?P<loc>desktop|downloads?|documents?|pictures?)\b',
+            "organize_files",
+            lambda m: {"path": m.group("loc")},
+        )
+        add(
+            r'\b(?:organi[sz]e|clean(?:\s*up)?|tidy(?:\s*up)?|sort(?:\s*out)?)\s+'
+            r'(?:my\s+|the\s+)?files\b',
+            "organize_files",
+        )
+        add(
+            r'\bundo\s+(?:the\s+|last\s+|my\s+)?(?:desktop\s+|file\s+)?organi[sz](?:e|ing|ation|ed)\b',
+            "undo_organize_files",
+        )
+        # Broader natural phrasings for "put it back the way it was" — none
+        # of these are destructive (undo_organize_files just no-ops with
+        # "nothing to undo" if there's no recent organize run), so it's safe
+        # to be generous here. This also matters for safety: a vague phrase
+        # like "return them to their original form" must be caught here,
+        # at Tier2, before it can ever fall through to the unrelated
+        # "delete the folder" memory-pronoun path (see feedback_delete_safety_pattern).
+        add(r'\bput\s+(?:everything|them|it|things|my\s+files|the\s+files)\s+back\b', "undo_organize_files")
+        add(
+            r'\breturn\s+(?:everything|them|it|things)?\s*(?:back\s+)?to\s+(?:their|its|the)?\s*original\b',
+            "undo_organize_files",
+        )
+        add(r'\bback\s+to\s+(?:the\s+)?original\b', "undo_organize_files")
+        add(r'\brestore\s+(?:the\s+)?(?:original|desktop|downloads|documents|pictures|files)\b', "undo_organize_files")
+        # "return it back on" / "return back all things" — colloquial/STT-garbled
+        # variants without "to original", both word orders.
+        add(
+            r'\breturn\s+(?:back\s+(?:all\s+)?(?:things|everything|them|it)|'
+            r'(?:them|it|things|everything)\s+back)\b',
+            "undo_organize_files",
+        )
+        add(r'\b(?:undo|reverse|revert)\s+(?:that|it|this)\b', "undo_organize_files")
 
         # ── Windows Settings deep-link resolver ──────────────────────────────
         # MUST precede the open_application catch-all.
@@ -905,17 +1146,62 @@ class IntentRouter:
         )
         logger.debug("[FOLDER_INTENT_DETECTED] pattern=open_name_folder registered")
 
-        add(r'\b(?:open|launch|start|run|fire\s+up|pull\s+up)\s+(.+)',
+        # Pre-existing English gap (not Urdu-specific — found while wiring
+        # Roman-Urdu pronoun normalization through this same pipeline):
+        # "close it"/"kill it"/"open the first one" used to fall all the way
+        # down to the bare catch-alls below, which captured the pronoun
+        # itself as the literal app name ("close it" -> kill_app
+        # app_name="it") — Tier 2.5's object_resolver/context_stack
+        # pronoun resolution never got a chance to run because these two
+        # regexes matched first and unconditionally. "open"/"the first one"
+        # is excluded here so it falls through to Tier 2.5 (which already
+        # resolves pronouns/ordinals via ContextStack — see object_resolver.py).
+        _PRONOUN_OR_ORDINAL = (
+            r'it|this|that|them|these|those|'
+            r'the\s+(?:first|second|third|fourth|next|previous|same|other)\s*(?:one)?'
+        )
+
+        def _resolve_close_pronoun(m: re.Match) -> dict:
+            """'close it'/'kill it'/'close the first one' — resolve the
+            pronoun via ContextStack (same resolver object_resolver.py
+            uses for the "open" case) instead of leaving it unresolved.
+            object_resolver.py itself can't be reused directly here: it
+            hardcodes action="open" (it only ever answers "open X"), so a
+            close/kill verb needs its own small resolution using the same
+            underlying ContextStack the open path already relies on —
+            no new context-tracking system, just the existing one read
+            for a verb object_resolver doesn't cover."""
+            raw = m.group(1).strip().rstrip(".,!?")
+            try:
+                from api.services.context_stack import context_stack as _cs
+                entity = _cs.resolve(m.group(0))
+                if entity is not None and entity.type == "app":
+                    return {"app_name": entity.value}
+            except Exception:
+                pass
+            return {"app_name": raw}
+
+        add(r'\b(?:close|quit|exit|kill)\s+(?!window|tab)(' + _PRONOUN_OR_ORDINAL + r')\b',
+            "kill_app", _resolve_close_pronoun)
+
+        # ── Open file — MUST precede the generic "open X" catch-all just
+        # below: pre-existing English bug (not Urdu-specific — found while
+        # tracing why Qwen's own "open file <name>" canonical synthesis
+        # misrouted). First-match-wins in this Tier-2 list, and the
+        # generic catch-all's `.+` matches ANYTHING after "open ", so
+        # "open file report.txt" was captured whole as a literal
+        # application name ("file report.txt") and the more specific
+        # open_file rule below never got a chance to run at all.
+        add(r'\b(?:open|show)\s+(?:the\s+)?(?:file|document|pdf)\s+(.+)',
+            "open_file",
+            lambda m: {"path": m.group(1).strip().rstrip(".,!?")})
+
+        add(r'\b(?:open|launch|start|run|fire\s+up|pull\s+up)\s+(?!' + _PRONOUN_OR_ORDINAL + r')(.+)',
             "open_application",
             _clean_app_name)
         add(r'\b(?:close|quit|exit|kill)\s+(?!window|tab)(.+)',
             "kill_app",
             lambda m: {"app_name": m.group(1).strip().rstrip(".,!?")})
-
-        # ── Open file ────────────────────────────────────────────────────────
-        add(r'\b(?:open|show)\s+(?:the\s+)?(?:file|document|pdf)\s+(.+)',
-            "open_file",
-            lambda m: {"path": m.group(1).strip().rstrip(".,!?")})
 
         # ── Apps / processes ─────────────────────────────────────────────────
         add(r'\bwhat\s+(?:apps?|programs?|applications?)\s+(?:are\s+)?(?:running|open|active)\b', "get_running_apps")
@@ -939,6 +1225,9 @@ class IntentRouter:
         add(r'\bclear\s+temp\b|\bdelete\s+temp(?:orary)?\s+files?\b', "clear_temp_files")
         add(r'\bdisk\s+cleanup\b|\brun\s+(?:a\s+)?cleanup\b', "run_disk_cleanup")
         add(r'\bempty\s+(?:the\s+)?(?:recycle\s+bin|trash)\b|\bclear\s+(?:the\s+)?trash\b', "empty_recycle_bin")
+        # Roman Urdu: "recycle bin khali karo", "kachra saaf karo", "trash clear karo"
+        add(r'\b(?:recycle\s*bin|kachra|kachray|trash)\s+(?:khali\s+kar[oa]?|saaf\s+kar[oa]?|clear\s+kar[oa]?)\b',
+            "empty_recycle_bin")
         add(r'\b(?:startup|boot)\s+(?:apps?|programs?|applications?)\b|\bwhat\s+(?:starts?|runs?)\s+on\s+(?:startup|boot)\b', "get_startup_apps")
         add(r'\bcheck\s+(?:for\s+)?(?:windows\s+)?updates?\b', "check_windows_updates")
 
@@ -996,6 +1285,11 @@ class IntentRouter:
             try:
                 model = SentenceTransformer("all-MiniLM-L6-v2", device=_device, local_files_only=True)
             except Exception:
+                from api.services.network_state import apply_offline_env as _apply_offline_env_ir
+                if _apply_offline_env_ir(force_recheck=True):
+                    logger.warning("[IntentRouter] local cache miss and network unreachable — "
+                                    "Tier 3 classifier disabled for this process")
+                    raise
                 logger.warning("[IntentRouter] local cache miss — attempting download (set LOCAL_ONLY_MODE=1 to suppress)")
                 model = SentenceTransformer("all-MiniLM-L6-v2", device=_device)
             names = list(_TOOL_DESCS.keys())
@@ -1019,6 +1313,26 @@ class IntentRouter:
 
     def _semantic_route(self, text: str) -> RouteResult:
         if not self._classifier_ready:
+            return RouteResult(None, {}, 4, 0.0)
+        # Found via real-pipeline validation (2026-08-24): raw Urdu-script
+        # text ("آواز تھوڑی کم کرو۔" — "reduce the volume a bit") was
+        # confidently (but wrongly) routed to brightness_control by this
+        # tier. Root cause: the classifier model is all-MiniLM-L6-v2,
+        # trained on English only (see the model-load comment a few lines
+        # below) — it has no real semantic understanding of Arabic-script
+        # text, so its embedding for Urdu script is closer to noise than
+        # meaning, yet still produces a confident-looking nearest-neighbor
+        # score. Worse, that false-confident match short-circuits BEFORE
+        # local_comprehension's Qwen tier ever runs (orchestrator only
+        # tries Qwen when intent_router found nothing >= 0.55) — the one
+        # tier actually built and tested for Urdu-script semantics. Skip
+        # this tier outright for Arabic-script text so it falls straight
+        # through to Qwen instead of pre-empting it with a wrong guess.
+        # Roman Urdu/mixed text is NOT skipped here — mixed_language_engine
+        # (Tier 1) already converts what it can to English before this
+        # tier ever sees it, and untranslated Roman Urdu is at least valid
+        # Latin-alphabet text the same embedding space partially covers.
+        if _ARABIC_SCRIPT_RE.search(text):
             return RouteResult(None, {}, 4, 0.0)
         try:
             np = self._np
@@ -1047,12 +1361,28 @@ class IntentRouter:
         Route a user utterance to a tool.
         Returns RouteResult with tool_name=None if no confident match (Tier 4).
         """
+        # Phonetic drive-letter guard (real-mic Urdu test Issue 2A): route()
+        # may receive text that bypasses the voice normalizer (direct callers,
+        # canonical rewrites), so apply the shared context-scoped correction
+        # here too — idempotent when the normalizer already ran. "open see
+        # drive" → "open c drive" so the drive rules below match it instead
+        # of the open_application catch-all.
+        try:
+            from api.services.normalizer import _correct_drive_phonetics
+            text = _correct_drive_phonetics(text)
+        except Exception:
+            pass
         key = text.lower().strip()
 
         # Tier 0 — local clock (no LLM, no internet, instant)
         _local = _local_clock_route(key)
         if _local:
             return _local
+
+        # Tier 0.5 — WhatsApp deterministic fast path (Phase 4)
+        _wa = _whatsapp_route(text)
+        if _wa:
+            return _wa
 
         # Tier 1 — exact cache
         with self._cache_lock:
@@ -1062,13 +1392,82 @@ class IntentRouter:
                 return RouteResult(c.tool_name, c.params, 1, 1.0)
 
         # Tier 2 — regex
-        for pattern, tool, params_fn in self._rules:
+        for pattern, tool, params_fn, reject_if in self._rules:
             m = pattern.search(text)
+            if m and reject_if and reject_if.search(text):
+                continue
             if m:
                 try:
                     params = params_fn(m)
                 except Exception:
                     params = {}
+                # ── Object-type-aware re-route (real-mic Urdu test 2B/6) ────
+                # The generic "open X" catch-all must not swallow objects
+                # whose TYPE object_resolver can prove — live failure: "Seed
+                # drive kholo" → "open Seed drive" hit the catch-all and
+                # executed open_application even though object_resolver
+                # reported type=drive conf=0.95. Object evidence outranks
+                # the catch-all here, the same invariant
+                # _exec_open_application already enforces for folder/file
+                # types. settings_page/control_panel deliberately stay on
+                # open_application — that IS the ms-settings:/known-map
+                # launch path the verifier understands.
+                if tool == "open_application":
+                    try:
+                        from api.services.object_resolver import (
+                            resolve as _t2_obj_resolve,
+                            tool_for as _t2_obj_tool_for,
+                        )
+                        _t2_obj = _t2_obj_resolve(text)
+                        _t2_type = _t2_obj.object_type
+                        if (
+                            _t2_obj.confidence >= 0.6
+                            and _t2_obj.name
+                            and _t2_type in (
+                                "drive", "folder", "file", "document",
+                                "project", "workspace", "repository",
+                                "website", "browser_tab",
+                            )
+                        ):
+                            if _t2_type in ("website", "browser_tab"):
+                                # Known browser-shortcut sites keep the
+                                # open_application path — it routes through
+                                # _APP_MAP into browser_workspace, the shared
+                                # CDP tab every follow-up command reuses.
+                                # Only sites with no app-map entry go to the
+                                # generic open_url tool.
+                                _t2_keep_app = False
+                                try:
+                                    from api.tools.system_tools import (
+                                        _APP_MAP as _t2_app_map,
+                                        _normalise_app as _t2_norm,
+                                    )
+                                    _t2_keep_app = _t2_norm(_t2_obj.name) in _t2_app_map
+                                except Exception:
+                                    pass
+                                if _t2_keep_app:
+                                    params = {"app_name": _t2_obj.name}
+                                    logger.info(
+                                        "[IntentRouter] Tier2 website keeps open_application "
+                                        "(browser_workspace path): %r", text[:60],
+                                    )
+                                else:
+                                    tool = "open_url"
+                                    params = _params_for_object(tool, _t2_obj)
+                                    logger.info(
+                                        "[IntentRouter] Tier2 object re-route: %r → open_url (type=%s conf=%.2f)",
+                                        text[:60], _t2_type, _t2_obj.confidence,
+                                    )
+                            else:
+                                tool = _t2_obj_tool_for(_t2_type)
+                                params = _params_for_object(tool, _t2_obj)
+                                logger.info(
+                                    "[IntentRouter] Tier2 object re-route: %r → %s (type=%s conf=%.2f)",
+                                    text[:60], tool, _t2_type, _t2_obj.confidence,
+                                )
+                    except Exception:
+                        logger.debug("[IntentRouter] Tier2 object re-route check failed",
+                                     exc_info=True)
                 result = RouteResult(tool, params, 2, 1.0)
                 with self._cache_lock:
                     self._cache[key] = result

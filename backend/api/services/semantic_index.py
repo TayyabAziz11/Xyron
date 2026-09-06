@@ -78,6 +78,11 @@ class SemanticIndex:
                 try:
                     model = SentenceTransformer(_MODEL_NAME, device=device, local_files_only=True)
                 except Exception:
+                    from api.services.network_state import apply_offline_env as _apply_offline_env_si
+                    if _apply_offline_env_si(force_recheck=True):
+                        logger.warning("[SEMANTIC_INDEX] local cache miss and network unreachable — "
+                                        "semantic search disabled for this process")
+                        raise
                     model = SentenceTransformer(_MODEL_NAME, device=device)
 
                 base = faiss.IndexFlatIP(EMBED_DIM)

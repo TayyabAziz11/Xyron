@@ -112,6 +112,17 @@ export function useWakeWord(onActivate: () => void, enabled = true) {
                   ws.send(JSON.stringify({ type: 'reset_cooldown' }))
                 }
               }, 4_000)
+            } else if (msg.type === 'wake_rejected') {
+              // Backend heard something OWW flagged, but its Whisper
+              // double-check couldn't confirm a wake name — backend already
+              // resets its own cooldown for this case, so the very next
+              // attempt is heard immediately. No client-side gate to clear
+              // here (wakeCooldown was never set for this branch), this is
+              // just visibility so a mis-heard first attempt isn't a total
+              // mystery in the console.
+              console.log(`[WAKE_REJECTED] transcript=${msg.transcript ?? ''} — listening again`)
+            } else if (msg.type === 'wake_not_ready') {
+              console.log('[WAKE_NOT_READY] Whisper still warming up — try again in a moment')
             }
           } catch { /* ignore */ }
         }

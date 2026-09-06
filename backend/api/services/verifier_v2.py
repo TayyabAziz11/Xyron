@@ -80,6 +80,16 @@ _APP_VERIFY_TABLE: dict[str, dict] = {
     "terminal":            {"procs": ["windowsterminal"], "titles": ["terminal"]},
     # Task Manager
     "task manager":        {"procs": ["taskmgr"],         "titles": ["task manager"]},
+    # Windows Settings — launched via the ms-settings: URI (open_application
+    # "settings" / open_system_settings). The dedicated process is
+    # SystemSettings.exe; ApplicationFrameHost is deliberately NOT listed
+    # because it hosts every UWP app and would verify "settings" as open
+    # whenever ANY UWP app (Calculator, Store, ...) is running. Real-mic
+    # Urdu test Issue 5: this entry used to be missing, so _lookup_app's
+    # generic fallback expected a process literally named "settings" and
+    # every successful ms-settings: launch failed verification.
+    "settings":            {"procs": ["systemsettings"],  "titles": ["settings"]},
+    "windows settings":    {"procs": ["systemsettings"],  "titles": ["settings"]},
 }
 
 # PowerShell script: Get-Process only (no Add-Type compilation — fast, ~350ms)
@@ -200,12 +210,26 @@ def verify(
     if tool_name == "open_application":
         return _verify_app_launch(tool_name, params, result_data, t0)
 
-    if tool_name in ("open_directory", "open_drive", "smart_open"):
+    if tool_name in ("open_directory", "open_drive", "smart_open", "create_folder"):
         # Object-type-specific verification (Part 7): a folder/drive open
         # must be confirmed via Explorer's actual path, never via an
         # app-launch heuristic. smart_open can also resolve to a *file* —
         # detected below and delegated to path-exists (v1), since Explorer
         # isn't necessarily involved in opening a file.
+        #
+        # create_folder added 2026-08-24: it had no verifier_v2 handler at
+        # all, so every call fell through to the old _v1_verify, which
+        # checks params["path"] (the raw location the caller asked to
+        # create the folder IN — e.g. "C:\\", not the new folder itself)
+        # via a bare os.path.exists() with no WSL-path translation. On this
+        # WSL2 backend os.path.exists("C:\\") is always False (it's not a
+        # real Linux path), so every create_folder call was reported as
+        # VERIFY_FAIL regardless of whether the folder was actually
+        # created. _exec_create_folder's ToolResult already carries the
+        # real new-folder path in action_path/data["path"] (e.g.
+        # "C:\\neya", not just the parent) — reusing _verify_folder_open
+        # here checks that path, through the same _win_to_wsl_path
+        # translation every other folder tool already relies on.
         resolved_path = (result_data.get("path") or result_data.get("action_path") or
                          params.get("path") or params.get("query") or "")
         looks_like_file = (
