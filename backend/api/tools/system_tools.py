@@ -452,6 +452,91 @@ def _bring_to_front(app_key: str, delay: float = 1.5) -> None:
     threading.Thread(target=_do_focus, daemon=True).start()
 
 
+# Task Manager tab shortcuts (Ctrl+<n>): 1=Processes 2=Performance.
+_TASK_MANAGER_TABS: Dict[str, int] = {"processes": 1, "performance": 2}
+
+# Win32 P/Invoke shim used to force real foreground focus onto a background
+# window before sending it keystrokes. `WScript.Shell.AppActivate` (COM) was
+# tried first and silently returns False here — Windows' foreground-lock
+# timeout blocks an unrelated background process from stealing focus once the
+# new-window launch grace period has passed, so SendKeys was typing into
+# whatever else had focus instead. Directly calling SetForegroundWindow after
+# AttachThreadInput (the standard workaround) reliably lands focus on the
+# target window — confirmed live: GetForegroundWindow() after this call
+# returns the exact target HWND. UI Automation (AutomationElement.FromHandle)
+# was also tried to select the nav item by name instead of a keystroke, but it
+# hangs for 15-20s against the modern WinUI3 Task Manager — a known bad
+# interaction between the legacy UIA client and WinUI3 automation providers —
+# so it's avoided entirely.
+_FOCUS_SHIM_CS = (
+    "using System;using System.Runtime.InteropServices;using System.Text;"
+    "public class XyronFG {"
+    "[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();"
+    "[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);"
+    "[DllImport(\"kernel32.dll\")] public static extern uint GetCurrentThreadId();"
+    "[DllImport(\"user32.dll\")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);"
+    "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);"
+    "[DllImport(\"user32.dll\")] public static extern bool BringWindowToTop(IntPtr hWnd);"
+    "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);"
+    # EnumWindows support for multi-window Chrome discovery
+    "[DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);"
+    "public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);"
+    "[DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);"
+    "[DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr hWnd);"
+    "[DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);"
+    "[DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);"
+    "[DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);"
+    "}"
+)
+
+
+def _switch_task_manager_tab_async(tab: str, delay: float) -> None:
+    """Background thread: force-focus Task Manager and press Ctrl+<n> to jump
+    to a tab ~delay seconds from now.
+
+    Used to keep Task Manager showing the section a spoken health-check report
+    is currently narrating (Performance while talking CPU/RAM/disk, Processes
+    while talking about which app is using the most resources).
+    """
+    key_num = _TASK_MANAGER_TABS.get(tab)
+    if not key_num or not (_ON_WSL or _ON_WINDOWS):
+        return
+
+    def _do_switch() -> None:
+        import time
+        time.sleep(delay)
+        ps_cmd = (
+            "if (-not ([System.Management.Automation.PSTypeName]'XyronFG').Type) { "
+            f"Add-Type -TypeDefinition '{_FOCUS_SHIM_CS}' "
+            "}; "
+            "$proc = Get-Process -Name Taskmgr -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; "
+            "if ($proc) { "
+            "  $target = $proc.MainWindowHandle; "
+            "  $curTid = [XyronFG]::GetCurrentThreadId(); "
+            "  $fgWin  = [XyronFG]::GetForegroundWindow(); "
+            "  $dummy  = 0; "
+            "  $fgTid  = [XyronFG]::GetWindowThreadProcessId($fgWin, [ref]$dummy); "
+            "  [XyronFG]::AttachThreadInput($curTid, $fgTid, $true)  | Out-Null; "
+            "  [XyronFG]::ShowWindow($target, 9) | Out-Null; "
+            "  [XyronFG]::SetForegroundWindow($target) | Out-Null; "
+            "  [XyronFG]::BringWindowToTop($target) | Out-Null; "
+            "  [XyronFG]::AttachThreadInput($curTid, $fgTid, $false) | Out-Null; "
+            "  Start-Sleep -Milliseconds 200; "
+            "  $w = New-Object -COM WScript.Shell; "
+            f"  $w.SendKeys('^{key_num}'); "
+            "  Write-Output 'TAB_SWITCHED' "
+            "} else { Write-Output 'PROC_NOT_FOUND' }"
+        )
+        try:
+            ok, out = _ps(ps_cmd, timeout=8)
+            logger.info("[TASK_MANAGER_TAB_SWITCH] tab=%s ok=%s out=%r", tab, ok, (out or "").strip())
+        except Exception as exc:
+            logger.debug("_switch_task_manager_tab_async(%r) failed: %s", tab, exc)
+
+    threading.Thread(target=_do_switch, daemon=True).start()
+
+
 def _launch_app(app_name: str) -> tuple[bool, str]:
     key      = _normalise_app(app_name)
     platform = "wsl" if _ON_WSL else ("win32" if _ON_WINDOWS else "linux")
@@ -494,40 +579,39 @@ def _launch_app(app_name: str) -> tuple[bool, str]:
     if not cmd:
         return False, f"'{app_name}' is not available on this platform."
 
-    # Browser-shortcut entries (youtube, gmail, github, chatgpt, google) used
-    # to open via a plain OS `start <url>` into the user's own DEFAULT
-    # browser/profile — completely disconnected from browser_workspace, the
-    # dedicated CDP-controlled Chrome (its own C:\XyronBrowserProfile) that
-    # search_youtube/play_youtube_video/browser_* tools all share. Live bug:
-    # "open youtube" landed in the user's normal Chrome, then "play this
-    # song" opened a SECOND, separate Chrome window/profile via
-    # browser_workspace — two disconnected browsers, not "a new tab" but a
-    # genuinely different browser instance. Fixed by routing these entries
-    # through browser_workspace FIRST, so the very first "open youtube"
-    # already lands in the one persistent tab every later voice follow-up
-    # reuses. Falls back to the native open below if browser control isn't
-    # reachable, so the command still succeeds either way.
-    _web_url = cmd if (cmd.startswith("http://") or cmd.startswith("https://")) else ""
-    if _web_url:
-        try:
-            from api.tools.browser_tools import _get_page
-            from api.services.main_loop import run_coro_from_thread
-
-            page = _get_page()
-
-            async def _goto():
-                await page.goto(_web_url, wait_until="domcontentloaded", timeout=15000)
-
-            run_coro_from_thread(_goto(), timeout=20.0)
-            logger.info("Launched: %s → %s (browser_workspace)", app_name, _web_url)
-            _bring_to_front(key)
-            return True, f"Launched {app_name}"
-        except Exception as _bw_exc:
-            logger.warning(
-                "[BROWSER_WORKSPACE_OPEN_FAILED] app=%r url=%s error=%s — falling back to native open",
-                app_name, _web_url, _bw_exc,
-            )
-
+    # Browser-shortcut entries (youtube, gmail, github, chatgpt, google) —
+    # SIMPLE WEBSITE LAUNCH, not browser automation. This used to route
+    # through browser_workspace (the dedicated CDP-controlled Chrome, its
+    # own C:\XyronBrowserProfile) FIRST, to keep tab continuity with a
+    # LATER automation follow-up ("play this song" reusing the same tab
+    # "open youtube" landed in). That fix traded a real, live-measured
+    # latency regression for it: browser_workspace.get_or_create_page()'s
+    # full connect/launch/self-heal retry sequence (reconnect attempt →
+    # launch Chrome, up to 15s → poll up to 6x1s → kill-stale-and-relaunch,
+    # up to another ~15s+9s) blocked a plain "open YouTube" for ~20s on a
+    # cold/ECONNREFUSED CDP bridge before this same code's own exception
+    # handler fell back to the native open below anyway — the native open
+    # was always the thing that actually worked, just 20s late (live-
+    # caught 2026-09-04 backend log).
+    #
+    # Fix: a simple website open never attempts CDP at all — zero CDP
+    # calls, dispatches in the low hundreds of ms via the native `start
+    # <url>` open just below, same as it always has for every OTHER known
+    # website/URI in _APP_MAP. `start <url>` opens in the user's actual
+    # default browser, reusing an existing window/tab if one is already
+    # running — not a second browser instance.
+    #
+    # Known accepted tradeoff (not a regression this function can fix in
+    # isolation): a command that genuinely needs Xyron's controlled browser
+    # ("search YouTube for X", "click the second result") still goes
+    # through browser_tools.py -> browser_workspace, which pays its OWN
+    # (now more tightly bounded — see get_or_create_page's docstring)
+    # connect cost at THAT point, in a possibly different browser window
+    # than this simple open just used. Reconnecting tab continuity between
+    # "open X" and a later automation command is a separate, deliberately
+    # out-of-scope concern from "make a simple website open fast" — see
+    # CLAUDE.md's Urdu-fast-path session notes for the same
+    # separate-concerns principle applied to intent routing.
     try:
         _is_uri = cmd.startswith("ms-settings:") or cmd.startswith("http://") or cmd.startswith("https://")
         if _ON_WSL:
@@ -910,9 +994,40 @@ def _exec_open_application(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolR
 
     # Legacy fallback: hardcoded _APP_MAP + Start Menu index + PowerShell
     ok, msg = _launch_app(app_name)
-    if ok:
+    _target_known = bool(_map_cmd)  # resolved to a real _APP_MAP entry
+    if ok and _target_known:
         _store_last_action(ctx, "open_application", params, app_name)
-    return ToolResult(success=ok, text=msg, spoken=msg, action_app=app_name if ok else None)
+        return ToolResult(success=True, text=msg, spoken=msg, action_app=app_name)
+    if ok:
+        # ── Honest success semantics (real-mic Urdu test Issue 1C) ────────────
+        # Blind cmd/start launch of an UNKNOWN target. `start` returns
+        # immediately even when Windows cannot resolve the name, so
+        # success=True here was a lie — the live failure was "barhao"
+        # (a tiny.en mishearing) reported as a successful app launch and
+        # pushed into ContextStack/ActivityMemory as if it were real.
+        # Report the structured launch facts instead; success stays False
+        # so the success-gated context/memory hooks in voice_ws never
+        # record a fake app. Verifier/async flows see the same honesty.
+        logger.info("[LAUNCH_UNVERIFIED] app=%r — blind fallback fired, launch not confirmed",
+                    app_name)
+        return ToolResult(
+            success=False,
+            text=msg,
+            spoken=f"I tried opening {app_name}, but I couldn't confirm it opened.",
+            data={
+                "launch_requested": True,
+                "launch_started":   True,
+                "verified_open":    False,
+                "target_known":     False,
+            },
+        )
+    return ToolResult(success=False, text=msg, spoken=msg, action_app=None,
+                      data={
+                          "launch_requested": True,
+                          "launch_started":   False,
+                          "verified_open":    False,
+                          "target_known":     _target_known,
+                      })
 
 
 def _exec_search_files(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
@@ -1262,6 +1377,151 @@ def _exec_system_health(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResu
     )
 
 
+# ── system_health_check (connected workflow: battery + disk + processes) ─────
+
+def _exec_system_health_check(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
+    try:
+        import psutil
+    except ImportError:
+        return ToolResult(
+            success=False, text="psutil not available.",
+            spoken="I need psutil to run a health check. Run: pip install psutil",
+            error="psutil missing",
+        )
+    import time as _time
+
+    lines: list[str] = []
+    spoken_parts: list[str] = []
+    warnings: list[str] = []
+    data: Dict[str, Any] = {}
+
+    # ── Open Task Manager so the numbers are visible, not just spoken ────────
+    # Fired first (before the slower per-process sampling below) so the window
+    # has time to render while the rest of the report is being gathered.
+    opened_task_manager = False
+    try:
+        _tm_result = _exec_open_application({"app_name": "task manager"}, ctx)
+        opened_task_manager = bool(_tm_result.success)
+    except Exception:
+        pass
+    data["opened_task_manager"] = opened_task_manager
+    # Land on Performance first — that's what the report narrates first
+    # (CPU / RAM / disk), before it moves on to per-app usage.
+    _TM_TAB_SWITCH_BASE_DELAY = 1.3   # time for the window to open + come to front
+    _TM_SPEECH_CHARS_PER_SEC  = 15.0  # rough spoken-word pace, used to time the 2nd switch
+    if opened_task_manager:
+        _switch_task_manager_tab_async("performance", _TM_TAB_SWITCH_BASE_DELAY)
+
+    # ── Battery ────────────────────────────────────────────────────────────
+    battery = _exec_get_battery_status({}, ctx)
+    if battery.success and battery.data:
+        pct = battery.data.get("percent")
+        charging = bool(battery.data.get("charging"))
+        lines.append(f"Battery: {pct}% ({'charging' if charging else 'on battery'})")
+        spoken_parts.append(f"battery is at {pct:.0f}%" + (" and charging" if charging else ""))
+        data["battery"] = battery.data
+        if pct is not None and pct <= 15 and not charging:
+            warnings.append(f"battery is low at {pct:.0f}%")
+    else:
+        data["battery"] = None
+
+    # ── CPU & RAM ──────────────────────────────────────────────────────────
+    cpu_pct = psutil.cpu_percent(interval=0.5)
+    vm = psutil.virtual_memory()
+    GiB = 1024 ** 3
+    ram_pct, ram_used, ram_tot = vm.percent, vm.used / GiB, vm.total / GiB
+    lines.append(f"CPU: {cpu_pct:.0f}%")
+    lines.append(f"RAM: {ram_pct:.0f}% ({ram_used:.1f}/{ram_tot:.1f} GB)")
+    spoken_parts.append(f"CPU at {cpu_pct:.0f}%, RAM at {ram_pct:.0f}%")
+    data["cpu_pct"] = cpu_pct
+    data["ram"] = {"pct": round(ram_pct, 1), "used_gb": round(ram_used, 1), "total_gb": round(ram_tot, 1)}
+    if cpu_pct >= 90:
+        warnings.append("CPU usage is very high")
+    if ram_pct >= 90:
+        warnings.append("RAM usage is very high")
+
+    # ── Storage / drives ───────────────────────────────────────────────────
+    drives_data: list[dict] = []
+    for drive_label, fs_path in _get_all_windows_drives():
+        try:
+            total, used, free, pct = _drive_usage_gb(fs_path)
+            drives_data.append({"name": drive_label, "total_gb": total, "used_gb": used,
+                                "free_gb": free, "pct_used": pct})
+            lines.append(f"Drive {drive_label}: {pct:.0f}% used, {free:.1f} GB free of {total:.1f} GB")
+            if pct >= 90:
+                warnings.append(f"{drive_label} drive is at {pct:.0f}% — running low on space")
+        except Exception:
+            pass
+    data["drives"] = drives_data
+    if drives_data:
+        spoken_parts.append("storage — " + "; ".join(
+            f"{d['name']} {d['pct_used']:.0f}% full" for d in drives_data[:3]))
+
+    # ── Running apps + top CPU/RAM processes (two-pass sample for real %) ──
+    top_cpu: list[dict] = []
+    top_ram: list[dict] = []
+    running_count = 0
+    try:
+        procs = list(psutil.process_iter(["pid", "name"]))
+        running_count = len(procs)
+        for p in procs:
+            try:
+                p.cpu_percent(None)  # prime the sampler
+            except Exception:
+                pass
+        _time.sleep(0.3)
+        samples: list[dict] = []
+        for p in procs:
+            try:
+                samples.append({
+                    "name": p.info.get("name") or "?",
+                    "pid": p.pid,
+                    "cpu_pct": round(p.cpu_percent(None), 1),
+                    "mem_mb": round(p.memory_info().rss / 1024 / 1024, 1),
+                })
+            except Exception:
+                pass
+        top_cpu = sorted(samples, key=lambda x: x["cpu_pct"], reverse=True)[:5]
+        top_ram = sorted(samples, key=lambda x: x["mem_mb"], reverse=True)[:5]
+    except Exception:
+        pass
+
+    data["running_process_count"] = running_count
+    data["top_cpu_processes"] = top_cpu
+    data["top_ram_processes"] = top_ram
+    lines.append(f"Processes running: {running_count}")
+
+    # Everything appended to spoken_parts above this line is the "performance"
+    # narration (battery/CPU/RAM/storage); switch Task Manager to Processes
+    # right as the report starts talking about which app is using resources.
+    _apps_narration_start = len(spoken_parts)
+
+    if top_cpu and top_cpu[0]["cpu_pct"] >= 1:
+        lines.append("Top CPU: " + ", ".join(f"{p['name']} {p['cpu_pct']:.0f}%" for p in top_cpu))
+        spoken_parts.append(f"heaviest CPU user is {top_cpu[0]['name']} at {top_cpu[0]['cpu_pct']:.0f}%")
+    if top_ram:
+        lines.append("Top RAM: " + ", ".join(f"{p['name']} {p['mem_mb']:.0f}MB" for p in top_ram))
+        spoken_parts.append(f"{top_ram[0]['name']} is using the most RAM at {top_ram[0]['mem_mb']:.0f} megabytes")
+
+    if opened_task_manager and len(spoken_parts) > _apps_narration_start:
+        _perf_text = "System health check — " + "; ".join(spoken_parts[:_apps_narration_start]) + ";"
+        _apps_tab_delay = _TM_TAB_SWITCH_BASE_DELAY + len(_perf_text) / _TM_SPEECH_CHARS_PER_SEC
+        _switch_task_manager_tab_async("processes", _apps_tab_delay)
+
+    # ── Compose spoken summary ────────────────────────────────────────────
+    spoken = "System health check — " + "; ".join(spoken_parts) + "."
+    spoken += (" Heads up: " + "; ".join(warnings) + ".") if warnings else " Everything looks healthy."
+    if opened_task_manager:
+        spoken += " I've opened Task Manager so you can see it too."
+        lines.append("Opened: Task Manager")
+    data["warnings"] = warnings
+
+    _store_last_action(ctx, "system_health_check", params, spoken)
+
+    return ToolResult(success=True, text="\n".join(lines), spoken=spoken, data=data,
+                      action_app="Task Manager" if opened_task_manager else None)
+
+
 # ── open_drive ────────────────────────────────────────────────────────────────
 
 def _exec_open_drive(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
@@ -1279,7 +1539,7 @@ def _exec_open_drive(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
     fs = _fs_path(win_path)
     if not fs.exists():
         return ToolResult(success=False, text=f"Drive {letter}: not found.",
-                          spoken=f"{letter} drive doesn't exist or isn't mounted.")
+                          spoken=f"{letter} drive not found — it doesn't exist on your computer.")
 
     ok, msg = _open_in_explorer(win_path)
     if ok:
@@ -1671,6 +1931,23 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
         return ToolResult(success=False, text=f"Blocked: {win_path}",
                           spoken="That path is restricted. I won't delete it.", error="Blocked")
 
+    # Never delete a special folder itself (Desktop, Documents, Downloads,
+    # Pictures, Videos, Music, the user's home, or a drive root) — only
+    # named things inside them. This is the last line of defense against a
+    # bad path resolution (e.g. a stale/ambiguous pronoun reference like
+    # "delete the folder" resolving to a bare location name) wiping an
+    # entire special folder instead of a specific file or subfolder.
+    _protected = {v.rstrip("\\").lower() for v in _get_win_special().values() if v}
+    _norm_check = win_path.rstrip("\\").lower()
+    if _norm_check in _protected or re.match(r'^[a-z]:$', _norm_check):
+        return ToolResult(
+            success=False,
+            text=f"Refused: {win_path} is a protected folder, not a file inside it.",
+            spoken="I won't delete that — it's one of your main folders, not something inside it. "
+                   "Tell me the specific file or subfolder you want removed.",
+            error="Protected path",
+        )
+
     fs = _fs_path(win_path)
     logger.info("[delete_file] raw=%r  win_path=%r  fs=%r  fs.exists=%s",
                 raw, win_path, str(fs), fs.exists())
@@ -1748,6 +2025,24 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
                               spoken=f"I couldn't find '{raw}'. Does it exist?")
 
     wsl_path = safe_path(str(fs))
+
+    # Prefer the Windows Recycle Bin over a permanent delete — a wrong
+    # target (bad path resolution, misheard command, stale memory
+    # reference) stays recoverable instead of being gone for good. Pure
+    # Linux (no Recycle Bin concept) falls back to a direct delete.
+    if _ON_WSL or _ON_WINDOWS:
+        ok, err = _recycle_delete(win_path)
+        if not ok:
+            return ToolResult(success=False, text=f"Delete failed: {err}",
+                              spoken=f"Couldn't delete {fs.name}.", error=err)
+        if os.path.exists(wsl_path):
+            return ToolResult(success=False, text=f"Delete failed — still exists: {wsl_path}",
+                              spoken=f"Couldn't delete {fs.name}, it still exists.",
+                              error="path still exists after delete")
+        return ToolResult(success=True, text=f"Moved to Recycle Bin: {win_path}",
+                          spoken=f"Deleted {fs.name} — it's in the Recycle Bin if you need it back.",
+                          data={"path": win_path, "deleted": True, "recoverable": True})
+
     try:
         if fs.is_dir():
             shutil.rmtree(wsl_path)
@@ -1765,6 +2060,46 @@ def _exec_delete_file(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult
         return ToolResult(success=False, text="Permission denied.", spoken="I don't have permission to delete that.")
     except Exception as exc:
         return ToolResult(success=False, text=str(exc), spoken="Couldn't delete the file.", error=str(exc))
+
+
+_DELETE_RECYCLE_PS1_TMPL = r"""
+Add-Type -AssemblyName Microsoft.VisualBasic
+$target = "WIN_TARGET_PATH"
+try {
+    if (Test-Path -LiteralPath $target -PathType Container) {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    } else {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    }
+    Write-Output "OK"
+} catch {
+    Write-Output ("ERR:" + $_.Exception.Message)
+}
+"""
+
+
+def _recycle_delete(win_path: str) -> tuple[bool, str]:
+    """Send a file/folder to the Windows Recycle Bin via PowerShell's
+    Microsoft.VisualBasic.FileIO.FileSystem — recoverable, unlike rmtree/remove."""
+    ps_exe = _find_powershell()
+    if not ps_exe:
+        return False, "powershell.exe not found"
+    ps1_path = "/mnt/c/Windows/Temp/_xyron_recycle_delete.ps1"
+    win_script_path = "C:\\Windows\\Temp\\_xyron_recycle_delete.ps1"
+    escaped = win_path.replace("`", "``").replace('"', '`"')
+    script = _DELETE_RECYCLE_PS1_TMPL.replace("WIN_TARGET_PATH", escaped)
+    try:
+        Path(ps1_path).write_text(script)
+        r = subprocess.run(
+            [ps_exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", win_script_path],
+            capture_output=True, text=True, timeout=30, errors="ignore",
+        )
+        out = (r.stdout or "").strip()
+        if out.startswith("OK"):
+            return True, ""
+        return False, out or (r.stderr or "unknown error").strip()
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ── Context helper ────────────────────────────────────────────────────────────
@@ -2343,6 +2678,29 @@ registry.register(
         },
     },
     executor=_exec_system_health,
+    risk="low",
+    category="system",
+)
+
+registry.register(
+    name="system_health_check",
+    definition={
+        "type": "function",
+        "function": {
+            "name": "system_health_check",
+            "description": (
+                "Run a full connected system health check in one pass: battery level, "
+                "live CPU and RAM usage, storage/disk space on every drive, how many "
+                "processes are running, and which apps are using the most CPU and RAM. "
+                "Also opens Task Manager so the results are visible on screen, not just "
+                "spoken. Use for: 'system health check', 'check my system health', 'how "
+                "is my computer doing', 'full system check', 'check battery storage and "
+                "running apps', 'is anything hogging resources'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    executor=_exec_system_health_check,
     risk="low",
     category="system",
 )
@@ -3337,12 +3695,23 @@ _MEDIA_VK: dict[str, int] = {
     "stop":       0xB2,
 }
 
-_MEDIA_LABELS: dict[str, str] = {
-    "play_pause": "Playing / paused.",
-    "next":       "Skipped to next track.",
-    "prev":       "Went back to previous track.",
-    "stop":       "Playback stopped.",
+# Human-sounding per-action replies come from conversational_replies
+# (varied, anti-repeat) — the old single-string map ("Playing / paused.")
+# read as a debug string when spoken.
+_MEDIA_FALLBACK_LABELS: dict[str, str] = {
+    "play_pause": "There you go, playback toggled.",
+    "next":       "Skipped ahead, next one's up.",
+    "prev":       "Back one track, there you go.",
+    "stop":       "Stopped the playback.",
 }
+
+
+def _media_spoken(action: str) -> str:
+    try:
+        from api.services.conversational_replies import media_reply
+        return media_reply(action)
+    except Exception:
+        return _MEDIA_FALLBACK_LABELS.get(action, "Done.")
 
 
 def _send_media_key(action: str) -> bool:
@@ -3398,7 +3767,7 @@ def _exec_media_control(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResu
                           spoken="I don't know that media command.")
 
     ok = _send_media_key(action)
-    spoken = _MEDIA_LABELS.get(action, "Done.")
+    spoken = _media_spoken(action)
     if ok:
         return ToolResult(success=True, text=spoken, spoken=spoken, data={"action": action})
     return ToolResult(success=False, text="Media key failed.",

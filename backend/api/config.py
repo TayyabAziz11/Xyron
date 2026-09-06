@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
     onnx_provider: str = ""          # e.g. "CUDAExecutionProvider" — empty = let kokoro_onnx decide
+    # Temporary: current OpenAI account has no credits. Reserve the OpenAI
+    # call path for Urdu responses/understanding only (its actual live use
+    # right now) and route every other language straight to local Ollama —
+    # skips the guaranteed-429 round trip (and its 429→backoff latency)
+    # instead of discovering the failure on every non-Urdu turn. Flip to
+    # false once billing is restored to go back to OpenAI-first for all
+    # languages.
+    openai_urdu_only: bool = True
 
     # RVC voice conversion
     enable_rvc: bool = False
@@ -66,6 +74,13 @@ class Settings(BaseSettings):
     rvc_device: str = "auto"         # "cuda", "cpu", or "auto"
     rvc_max_latency_ms: int = 250
     rvc_lightweight: bool = False    # force lightweight tier, skip full RVC
+
+    # WhatsApp — open-wa sidecar (outbound transport, backend/integrations/whatsapp/sidecar)
+    wa_sidecar_host: str = "127.0.0.1"   # never 0.0.0.0 — see sidecar README
+    wa_sidecar_port: int = 8734
+    wa_sidecar_api_key: str = ""         # shared secret between Python transport and Node sidecar
+    wa_sidecar_timeout_s: float = 20.0
+    wa_incoming_announce_enabled: bool = True   # voice-announce incoming WhatsApp messages (see wa_incoming_notifier.py)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -98,6 +113,11 @@ class Settings(BaseSettings):
     @property
     def mcp_servers_dir(self) -> Path:
         return self.repo_root / "backend" / "mcp_servers"
+
+    @property
+    def whatsapp_openwa_session_dir(self) -> Path:
+        """Separate from the Playwright client's .secrets/whatsapp_session/ — different engine, different auth state."""
+        return self.secrets_dir / "whatsapp_openwa_session"
 
 
 settings = Settings()

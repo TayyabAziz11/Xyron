@@ -54,6 +54,23 @@ from starlette.websockets import WebSocketState
 
 logger = logging.getLogger(__name__)
 
+# ── Tier 0d pending-confirmation yes/no matching ──────────────────────────────
+# Module-level (not a local inside ws_session) so tests can import the exact
+# patterns actually used in production instead of duplicating and risking
+# drift. Behavior is unchanged from when these were compiled inline —
+# extraction only, no pattern edits beyond adding "send it" for Phase 5
+# (voice WhatsApp send confirmations: "Send 'X' to Tayyab?" / "send it").
+_CONFIRM_YES_RE = re.compile(
+    r'\b(yes|yeah|yep|yup|sure|go ahead|do it|send it|confirm|install it|'
+    r'proceed|ok|okay|please|affirmative|absolutely)\b',
+    re.IGNORECASE,
+)
+_CONFIRM_NO_RE = re.compile(
+    r'\b(no|nope|cancel|stop|don\'?t|never mind|nevermind|abort|'
+    r'reject|skip|forget it|actually no)\b',
+    re.IGNORECASE,
+)
+
 # Phase 5.3: content-free filler spoken the instant speech is finalized —
 # requires no transcript, no classification. Kept deliberately generic so
 # it's honest regardless of what the command turns out to be.
@@ -317,6 +334,25 @@ async def ws_wake(websocket: WebSocket) -> None:
                             "reason=whisper_no_match audio_duration_s=%.2f",
                             model_name, confidence, transcript[:60], _clip_duration_s,
                         )
+                        # OWW's own _COOLDOWN_S (2s) debounce starts the instant
+                        # detect_frame() fires — i.e. BEFORE this Whisper
+                        # double-check even runs. So a genuine "Hey Xyron" that
+                        # Whisper simply mis-transcribes still burns the full
+                        # 2s cooldown, silently swallowing an immediate correct
+                        # repeat too (WAKE_REJECTED_DEBOUNCE, no signal to the
+                        # user either) — the exact "have to say it 2-3 times"
+                        # pattern. Only a real confirmed wake should start the
+                        # cooldown; a rejected verification should let the very
+                        # next attempt through immediately.
+                        _wws.reset_cooldown()
+                        # Tell the frontend so it isn't left with dead air —
+                        # previously this branch gave zero signal at all.
+                        await _send(websocket, {
+                            "type":       "wake_rejected",
+                            "model":      model_name,
+                            "transcript": transcript[:60],
+                            "ts":         int(time.time() * 1000),
+                        })
                         continue
 
                     logger.info("[WakeWord] WAKE_ACCEPTED")
@@ -445,22 +481,60 @@ _CORRECTION_CONF_THRESHOLD = -0.35  # only correct transcripts STT itself is uns
 _CORRECTION_TIMEOUT_S      = 2.0
 
 
-def _needs_semantic_correction(transcript: str, confidence: float) -> bool:
+def _needs_semantic_correction(transcript: str, confidence: float, stt_language: str = "") -> bool:
     from voice.hybrid_stt_router import _SIMPLE_VOCAB
     norm = transcript.lower().strip().rstrip(".!?,")
     if norm in _SIMPLE_VOCAB:
         return False
+    # ── Hard rule: if STT itself says this is NOT English, never correct ──
+    # The local LLM (qwen2.5:1.5b) cannot handle Urdu/Hindi/mixed input
+    # and TRANSLATES it to English garbage instead of fixing phonetic
+    # errors (e.g. "C drive ko kholo" → "C drive open"). Whisper's own
+    # language ID is reliable — if it says "hi" or "ur" or "mixed", the
+    # audio is not English and correction will only translate, not fix.
+    _stt_lang_lower = (stt_language or "").lower().strip()
+    if _stt_lang_lower and _stt_lang_lower not in ("en", "english", ""):
+        return False
+    # Skip correction for Urdu/Roman Urdu — the local LLM (qwen2.5:1.5b)
+    # cannot handle Urdu and TRANSLATES it to English garbage instead of
+    # correcting phonetic errors (e.g. "Kholo, khe re, kam karo, settings
+    # kholo" → "Open, close, do some work, settings open"). Until a model
+    # that properly understands Roman Urdu is available, correction does
+    # more harm than good for non-English transcripts.
+    _urdu_chars = sum(1 for c in transcript if 0x0600 <= ord(c) <= 0x06FF)
+    if _urdu_chars > 2:
+        return False  # Urdu script — never send to Ollama
+    # Quick Roman Urdu check — if 20%+ of words are common Urdu vocabulary,
+    # skip correction to prevent translation. We include ALL vocabulary
+    # sets (verbs, pronouns, commands, questions, common words like
+    # "nahi"/"ko"/"se", and connectors like "aur"/"ya") because even a
+    # few Urdu particles in a mixed sentence mean the qwen model will
+    # translate instead of correct. Also strip trailing punctuation from
+    # each word so "nahi," matches "nahi".
+    from cognition.language_detector import (
+        _ROMAN_VERBS, _ROMAN_PRONOUNS, _ROMAN_COMMANDS, _ROMAN_QUESTION,
+        _ROMAN_COMMON, _ROMAN_CONNECTORS,
+    )
+    _words = norm.split()
+    if _words:
+        _urdu_vocab = (
+            _ROMAN_VERBS | _ROMAN_PRONOUNS | _ROMAN_COMMANDS | _ROMAN_QUESTION
+            | _ROMAN_COMMON | _ROMAN_CONNECTORS
+        )
+        _hits = sum(1 for w in _words if w.rstrip(",.!?;'") in _urdu_vocab)
+        if _hits / len(_words) >= 0.20:
+            return False
     return confidence < _CORRECTION_CONF_THRESHOLD
 
 
-async def _correct_transcript_semantic(transcript: str, confidence: float) -> str:
+async def _correct_transcript_semantic(transcript: str, confidence: float, stt_language: str = "") -> str:
     """
     Best-effort GPT-4o-mini pass that fixes likely Whisper misrecognitions
     using recent app/folder/file context, before intent matching runs.
     Returns the original transcript unchanged on any failure/timeout or when
     correction isn't warranted.
     """
-    if not transcript or not _needs_semantic_correction(transcript, confidence):
+    if not transcript or not _needs_semantic_correction(transcript, confidence, stt_language):
         return transcript
 
     try:
@@ -479,6 +553,20 @@ async def _correct_transcript_semantic(transcript: str, confidence: float) -> st
             "keep the same intent and wording otherwise. If the transcript already looks "
             "correct, return it unchanged. Reply with ONLY the corrected transcript, no "
             "quotes, no explanation.\n"
+            "The user may be speaking English, Roman Urdu, Urdu script, Hindi/Devanagari "
+            "transliteration of Urdu, or a mix of these — this is normal and NOT an error "
+            "to fix. Correct only clear phonetic mis-hearings (e.g. wrong word for a "
+            "similar-sounding one) in whichever language/script the transcript is already "
+            "in. NEVER translate, paraphrase, or rewrite the transcript into a different "
+            "language than what's given — that is not a transcription correction, even for "
+            "a single word. Do not swap a correctly-heard Roman Urdu/Urdu word for its "
+            "English meaning (e.g. 'kholo' must stay 'kholo', never become 'open'; 'karo' "
+            "must stay 'karo', never become 'do') — that is translation, not correction, "
+            "and is forbidden even when the rest of the transcript already looks correct. "
+            "For example, 'Urdu mein baat karo' or 'Urdu में बात करो' must stay exactly "
+            "that meaning and wording, never become an unrelated English sentence, and "
+            "'Chrome kholo' is ALREADY correct and must be returned completely unchanged, "
+            "not as 'Chrome open'.\n"
             f"{_context_line}\n"
             f"Transcript: {transcript}"
         )
@@ -540,8 +628,33 @@ def _pick_greeting_text(tod: str, name: str) -> str:
 # Session constants
 SESSION_TIMEOUT  = 45.0       # seconds of silence before session auto-ends
 
-# TTS chunking: split response at sentence boundaries, max N chars per chunk
-_TTS_MAX_CHARS   = 80
+# TTS chunking: split response at sentence boundaries, max N chars per chunk.
+# Raised 80 → 160 (perf fix): short two-sentence replies (~84 chars) used to
+# split into 2 chunks = 2 Kokoro synths + 2 RVC passes (~2.7s measured);
+# one synthesis pass for replies this size is strictly faster and the
+# streaming benefit of chunking only matters for genuinely long responses.
+_TTS_MAX_CHARS   = 160
+
+# Punctuation the Kokoro phonemizer mishandles (em-dash triggers
+# "words count mismatch" warnings and awkward pauses; curly quotes leak
+# into phonemes). Normalize to speech-friendly equivalents once, here, so
+# every TTS path (English Kokoro + multilingual) benefits.
+_SPEECH_PUNCTUATION_MAP = str.maketrans({
+    "\u2014": ",",   # em dash
+    "\u2013": ",",   # en dash
+    "\u2018": "'",   # left single quote
+    "\u2019": "'",   # right single quote / apostrophe
+    "\u201c": '"',   # left double quote
+    "\u201d": '"',   # right double quote
+    "\u2026": "...", # ellipsis
+})
+
+
+def _normalize_speech_punctuation(text: str) -> str:
+    """Convert smart punctuation to TTS-friendly equivalents."""
+    # " — " / " – " should read as a comma join, not " , "
+    text = re.sub(r'\s*[\u2014\u2013]\s*', ', ', text)
+    return text.translate(_SPEECH_PUNCTUATION_MAP)
 
 
 def _normalize_clock_for_tts(text: str) -> str:
@@ -596,6 +709,7 @@ def _split_for_tts(text: str) -> list[str]:
     Split response into TTS-sized chunks at sentence boundaries.
     Short text stays as one chunk for lower latency.
     """
+    text = _normalize_speech_punctuation(text)
     if len(text) <= _TTS_MAX_CHARS:
         return [text]
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
@@ -802,6 +916,7 @@ async def ws_session(websocket: WebSocket) -> None:
         "pending_video_candidates":   None,   # set after an ambiguous/search-intent search_youtube result
         "pending_open_after_install": None,   # set after install_store_app_exec succeeds
         "ml_detected_lang":           _cfg_lang_hint or "en",  # pre-seed from config; else "en"
+        "ml_detected_lang_conf":      1.0 if (_cfg_lang_hint and _cfg_lang_hint not in ("en",)) else 0.0,
         "ml_resp_lang":               "en",   # language to use for TTS response
     }
     if _cfg_lang_hint and _cfg_lang_hint not in ("en",):
@@ -901,20 +1016,30 @@ async def ws_session(websocket: WebSocket) -> None:
 
     # ── Task 6: Stuck-speaking watchdog ───────────────────────────────────────
     # Recovery net for exactly the failure mode behind the keepalive-timeout
-    # incident: speaking=True with no audio ever sent and no progress. The
+    # incident: speaking=true with no audio ever sent and no progress. The
     # greeting path above already guards itself with a strict timeout and a
     # try/finally, but this is defense-in-depth for any other TTS call site
     # in this session that gets stuck. Gated on "no audio sent at all" (not
     # on elapsed time alone) so it never interrupts a legitimately long
     # response that IS actively streaming audio.
+    #
+    # Urdu fix: only starts tracking when _tts_state["watchdog_armed"] is True
+    # — previously tracked from VAD end (is_speaking=True at L5001), which
+    # included the entire STT+intelligence pipeline (~14s for first Urdu
+    # command) and falsely triggered the stuck threshold. Now armed only
+    # when TTS synthesis actually begins.
     _STUCK_THRESHOLD_S = 12.0
-
+    
     async def _stuck_speaking_watchdog() -> None:
         nonlocal is_speaking
         stuck_since: Optional[float] = None
         while websocket.client_state == WebSocketState.CONNECTED:
             await asyncio.sleep(2.0)
-            if is_speaking and not _tts_state.get("audio_sent", False):
+            # Only track when TTS is actively synthesizing — the old check
+            # (is_speaking and not audio_sent) also fired during the STT +
+            # intent pipeline where is_speaking=True but no TTS has started.
+            _armed = _tts_state.get("watchdog_armed", False)
+            if is_speaking and _armed and not _tts_state.get("audio_sent", False):
                 if stuck_since is None:
                     stuck_since = time.time()
                     continue
@@ -933,6 +1058,7 @@ async def ws_session(websocket: WebSocket) -> None:
                     logger.info("[TTS_TASK_CANCELLED] reason=stuck_watchdog session_instance_id=%s",
                                 session_instance_id)
                     is_speaking = False
+                    _tts_state["watchdog_armed"] = False
                     stuck_since = None
                     if websocket.client_state == WebSocketState.CONNECTED:
                         # Previously this recovery was silent — the user hears
@@ -942,8 +1068,17 @@ async def ws_session(websocket: WebSocket) -> None:
                         # the app having gone completely unresponsive. Speak
                         # a short apology so there's audible confirmation
                         # something happened and what to do next.
+                        # Language-aware: match the session's response language.
                         try:
-                            _stuck_text = "Sorry, that took too long — please try again."
+                            _resp_lang = _session_state.get("ml_resp_lang", "en")
+                            _stuck_map = {
+                                "ur":       "معذرت، تھوڑی دیر ہو گئی — دوبارہ کہیں۔",
+                                "ur_roman": "Maafi, thori der ho gayi — dobara kahein.",
+                                "hi":       "माफ़ करें, थोड़ी देर हो गई — दोबारा कहें।",
+                                "ar":       "عذراً، استغرق وقتاً طويلاً — حاول مرة أخرى.",
+                                "mixed":    "Maafi, thori der ho gayi — dobara kahein.",
+                            }
+                            _stuck_text = _stuck_map.get(_resp_lang, "Sorry, that took too long — please try again.")
                             await _send(websocket, {"type": "response", "text": _stuck_text, "chunk": 1})
                             await _tts_with_fallback(_stuck_text)
                         except Exception as _stuck_exc:
@@ -952,54 +1087,96 @@ async def ws_session(websocket: WebSocket) -> None:
                     logger.info("[VOICE_STATE_RECOVERED] from=speaking to=listening")
             else:
                 stuck_since = None
-
+    
     _stuck_watchdog_task = asyncio.create_task(_stuck_speaking_watchdog())
 
     # ── Multilingual TTS helper — XTTS-v2 for non-English responses ─────────
 
     async def _tts_ml(text: str, lang: str) -> bool:
-        """Synthesize text using multilingual TTS (XTTS-v2).
-        Falls back to Kokoro English if XTTS is unavailable or synthesis fails.
-        Sends a single audio frame (XTTS is not chunked like Kokoro).
+        """Synthesize text using multilingual TTS (Edge-TTS for Urdu family).
+
+        Streams audio chunk-by-chunk — splits text at sentence boundaries
+        (same _split_for_tts the English Kokoro path uses) and synthesizes
+        each chunk separately, sending each as its own WebSocket audio
+        frame. This means the frontend can start playing the first sentence
+        while later sentences are still being synthesized, cutting perceived
+        latency dramatically for longer responses. Short acks (1 sentence,
+        <= 80 chars) stay as a single chunk with no overhead.
+
+        Falls back to Kokoro English if the ML engine is unavailable.
         """
         _tts_state["audio_sent"] = False
+        _tts_state["watchdog_armed"] = True  # arm stuck watchdog only during active TTS
         _tts_playback_done_event.clear()
         _ml_t0 = time.time()
         logger.info("[TTS_ML_ENTER] lang=%s chars=%d", lang, len(text))
-        wav = None
-        try:
-            from voice.tts_router import synthesize as _route_synth
-            wav = await asyncio.wait_for(
-                asyncio.to_thread(_route_synth, text, lang, voice),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[XTTS_FALLBACK_TO_TEXT] lang=%s error=30s_timeout", lang)
-        except Exception as _ml_exc:
-            logger.error("[XTTS_FALLBACK_TO_TEXT] lang=%s error=%s", lang, _ml_exc)
 
-        if not wav:
-            # Both XTTS and Kokoro fallback within tts_router already attempted;
-            # if still None, there is no audio — signal no audio sent and return.
-            logger.warning("[XTTS_FALLBACK_TO_TEXT] lang=%s no audio produced", lang)
-            _tts_playback_done_event.set()
-            return False
+        # ── Split text into sentence-sized chunks for streaming ──────────────
+        # Same splitting logic as the English Kokoro path — this is what
+        # enables streaming: the first chunk is synthesized and sent before
+        # later chunks even start synthesizing.
+        chunks = _split_for_tts(text)
+        n = len(chunks)
+        _any_sent = False
 
-        sent = await _send(websocket, {
-            "type":  "audio",
-            "data":  base64.b64encode(wav).decode(),
-            "chunk": 1,
-            "total": 1,
-            "final": True,
-            "text":  text,
-        })
-        if sent:
-            _tts_state["audio_sent"] = True
-            logger.info("[TTS_ML_DONE] lang=%s ms=%.0f bytes=%d",
-                        lang, (time.time() - _ml_t0) * 1000, len(wav))
-        else:
-            _tts_playback_done_event.set()
+        for i, chunk in enumerate(chunks, 1):
+            wav = None
+            try:
+                from voice.tts_router import synthesize as _route_synth
+                wav = await asyncio.wait_for(
+                    asyncio.to_thread(_route_synth, chunk, lang, voice),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error("[TTS_ML_CHUNK_FAIL] lang=%s chunk=%d/%d reason=30s_timeout",
+                             lang, i, n)
+            except Exception as _ml_exc:
+                logger.error("[TTS_ML_CHUNK_FAIL] lang=%s chunk=%d/%d error=%s",
+                             lang, i, n, _ml_exc)
+            finally:
+                _tts_state["watchdog_armed"] = False
 
+            if not wav:
+                # If this is the first chunk and synthesis failed, there's no
+                # audio at all. If it's a later chunk, we already sent earlier
+                # audio — just end the stream gracefully.
+                logger.warning("[TTS_ML_NO_AUDIO] lang=%s chunk=%d/%d", lang, i, n)
+                if not _any_sent:
+                    _tts_playback_done_event.set()
+                    return False
+                # Already sent some audio — send final flag and exit
+                _tts_state["audio_sent"] = True
+                _tts_playback_done_event.set()
+                return True
+
+            sent = await _send(websocket, {
+                "type":  "audio",
+                "data":  base64.b64encode(wav).decode(),
+                "chunk": i,
+                "total": n,
+                "final": (i == n),
+                "text":  chunk,
+            })
+            if sent:
+                _any_sent = True
+                _tts_state["audio_sent"] = True
+                logger.info("[TTS_ML_CHUNK] lang=%s chunk=%d/%d ms=%.0f bytes=%d",
+                            lang, i, n, (time.time() - _ml_t0) * 1000, len(wav))
+            else:
+                # Send failed — connection probably dropped
+                logger.info("[TTS_ML_EXIT] ms=%.0f chunks=%d reason=send_failed",
+                            (time.time() - _ml_t0) * 1000, i)
+                _tts_playback_done_event.set()
+                return False
+
+            if websocket.client_state != WebSocketState.CONNECTED:
+                logger.info("[TTS_ML_EXIT] ms=%.0f chunks=%d reason=disconnected",
+                            (time.time() - _ml_t0) * 1000, i)
+                _tts_playback_done_event.set()
+                return False
+
+        logger.info("[TTS_ML_DONE] lang=%s ms=%.0f chunks=%d audio_sent=%s",
+                    lang, (time.time() - _ml_t0) * 1000, n, _tts_state["audio_sent"])
         if not _tts_state["audio_sent"]:
             _tts_playback_done_event.set()
         return False
@@ -1072,7 +1249,7 @@ async def ws_session(websocket: WebSocket) -> None:
 
     async def _tts_sequential(
         text: str, _voice_override: str | None = None, _speed_override: float | None = None,
-        _is_immediate_ack: bool = False,
+        _is_immediate_ack: bool = False, _skip_localize: bool = False,
     ) -> bool:
         """Synthesize `text` chunk-by-chunk and stream to client. Interruption disabled."""
         # Phase 5.3: every call except the immediate-ack's own waits for that
@@ -1092,18 +1269,32 @@ async def ws_session(websocket: WebSocket) -> None:
         # ── Multilingual routing: delegate to XTTS if response language is non-English ──
         _resp_lang = _session_state.get("ml_resp_lang", "en")
         if _resp_lang != "en":
-            # Localize English response text to the target language before speaking
-            try:
-                from api.services.response_localizer import localize_response as _loc_fn
-                _loc = _loc_fn(text, _resp_lang)
-                if _loc:
-                    logger.info("[RESP_LOCALIZED_FOR_TTS] %r → %r", text[:40], _loc[:40])
-                    text = _loc
-            except Exception:
-                pass
+            # Localize English response text to the target language before
+            # speaking. Try natural qwen generation first (varied, conversational),
+            # fall back to template-based localization if qwen is unavailable.
+            #
+            # _skip_localize bypasses this entirely for callers that already
+            # built the exact target-language text themselves (e.g. the
+            # hardcoded per-language _lang_switch_ack_map). Bug this fixes
+            # (live-caught 2026-08-24): re-running an already-Urdu string
+            # through localize_with_fallback tells qwen "translate this
+            # English text" with Urdu input — the model doesn't recognize
+            # it as already-translated, so it hallucinates an unrelated
+            # reply instead of passing it through ("ٹھیک ہے، اب اردو میں
+            # بات کرتا ہوں۔" → "آپ کی سوال رہے ہیں؟", a non-sequitur).
+            if not _skip_localize:
+                try:
+                    from api.services.urdu_ack_generator import localize_with_fallback as _loc_fn_async
+                    _loc = await _loc_fn_async(text, _resp_lang)
+                    if _loc and _loc != text:
+                        logger.info("[RESP_LOCALIZED_FOR_TTS] %r → %r", text[:40], _loc[:40])
+                        text = _loc
+                except Exception:
+                    pass
             return await _tts_ml(text, _resp_lang)
         # ── English Kokoro path (unchanged) ──────────────────────────────────────────────
         _tts_state["audio_sent"] = False
+        _tts_state["watchdog_armed"] = True  # arm stuck watchdog for English TTS
         _tts_playback_done_event.clear()  # playback is now pending
         _v = _voice_override or voice
         _tts_t0 = time.time()
@@ -1129,27 +1320,30 @@ async def ws_session(websocket: WebSocket) -> None:
                                 (time.time() - _tts_t0) * 1000, i, _tts_state["audio_sent"])
                     if not _tts_state["audio_sent"]:
                         _tts_playback_done_event.set()  # no audio sent → no tts_done will arrive
+                    _tts_state["watchdog_armed"] = False
                     return False
             if websocket.client_state != WebSocketState.CONNECTED:
                 logger.info("[TTS_STATE_EXIT] ms=%.0f chunks=%d reason=disconnected audio_sent=%s",
                             (time.time() - _tts_t0) * 1000, i, _tts_state["audio_sent"])
                 if not _tts_state["audio_sent"]:
                     _tts_playback_done_event.set()
+                _tts_state["watchdog_armed"] = False
                 return False
         logger.info("[TTS_STATE_EXIT] ms=%.0f chunks=%d audio_sent=%s",
                     (time.time() - _tts_t0) * 1000, n, _tts_state["audio_sent"])
         if not _tts_state["audio_sent"]:
             _tts_playback_done_event.set()  # synthesis produced no audio → no tts_done will arrive
+        _tts_state["watchdog_armed"] = False
         return False
 
-    async def _tts_with_fallback(text: str) -> bool:
+    async def _tts_with_fallback(text: str, _skip_localize: bool = False) -> bool:
         """_tts_sequential with one retry on a fallback voice if no audio was sent."""
-        _interrupted = await _tts_sequential(text)
+        _interrupted = await _tts_sequential(text, _skip_localize=_skip_localize)
         if not _tts_state["audio_sent"]:
             _fb = "alloy" if voice != "alloy" else "nova"
             logger.warning("[TTS_FALLBACK_ATTEMPT] primary_voice=%s no_audio — retrying with fallback_voice=%s text=%r",
                            voice, _fb, text[:40])
-            _interrupted = await _tts_sequential(text, _fb)
+            _interrupted = await _tts_sequential(text, _fb, _skip_localize=_skip_localize)
             if _tts_state["audio_sent"]:
                 logger.info("[TTS_FALLBACK_SUCCESS] fallback_voice=%s", _fb)
             else:
@@ -1159,6 +1353,40 @@ async def ws_session(websocket: WebSocket) -> None:
     # Started once per WS connection, now that _tts_with_fallback exists in
     # this closure — drains _narration_queue for the life of the session.
     _narration_task = asyncio.create_task(_narration_speaker_loop())
+
+    # ── WhatsApp incoming-message announcements ────────────────────────────
+    # A background thread (wa_incoming_notifier.py, on the Baileys SSE
+    # consumer's OWN thread — not this event loop) hands off announcements
+    # via voice_announcer.announce(), which does loop.call_soon_threadsafe
+    # onto this queue. Drained here, same collapse-if-busy pattern as
+    # narration: an incoming WhatsApp message should never interrupt the
+    # user mid-command, so if TTS is already speaking, skip it rather than
+    # queue up stale announcements to read out later.
+    _wa_announce_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+
+    async def _wa_announce_loop() -> None:
+        while True:
+            payload = await _wa_announce_queue.get()
+            try:
+                text = payload.get("text") or ""
+                if not text:
+                    continue
+                if is_speaking:
+                    logger.info("[WA_ANNOUNCE_SKIPPED] reason=already_speaking text=%r", text[:80])
+                    continue
+                logger.info("[WA_ANNOUNCE] text=%r", text[:200])
+                await _tts_with_fallback(text)
+            except Exception as exc:
+                logger.debug("[WA_ANNOUNCE] speak error (ignored): %r", exc)
+            finally:
+                _wa_announce_queue.task_done()
+
+    _wa_announce_task = asyncio.create_task(_wa_announce_loop())
+    try:
+        from api.services import voice_announcer as _voice_announcer
+        _voice_announcer.register(asyncio.get_event_loop(), _wa_announce_queue)
+    except Exception:
+        logger.debug("[WA_ANNOUNCE] voice_announcer registration failed", exc_info=True)
 
     async def _tts_await_playback(text: str) -> bool:
         """_tts_with_fallback + blocks until client signals tts_done (showcase sequencing).
@@ -1176,193 +1404,40 @@ async def ws_session(websocket: WebSocket) -> None:
                 _tts_playback_done_event.set()  # reset for next step
         return _interrupted
 
-    # Human-readable names for settings pages used in ACK text
-    _SETTINGS_PAGE_NAMES: dict[str, str] = {
-        "wifi":            "Wi-Fi",
-        "network":         "Network",
-        "bluetooth":       "Bluetooth",
-        "display":         "Display",
-        "sound":           "Sound",
-        "privacy":         "Privacy",
-        "apps":            "Apps",
-        "update":          "Windows Update",
-        "power":           "Power",
-        "storage":         "Storage",
-        "accounts":        "Accounts",
-        "time":            "Date and Time",
-        "language":        "Language",
-        "accessibility":   "Accessibility",
-        "notifications":   "Notifications",
-        "personalization": "Personalization",
-        "themes":          "Themes",
-        "taskbar":         "Taskbar",
-        "startup":         "Startup Apps",
-        "mouse":           "Mouse",
-        "keyboard":        "Keyboard",
-        "camera":          "Camera",
-        "home":            "Settings",
-    }
+    # Human-sounding, emotion-aware ack/completion replies now live in
+    # api.services.conversational_replies (shared pools + anti-repeat).
+    # Settings page display names moved there with them.
+    from api.services.conversational_replies import (
+        SETTINGS_PAGE_NAMES as _SETTINGS_PAGE_NAMES,
+        pick_ack as _reply_pick_ack,
+        pick_completion as _reply_pick_completion,
+    )
 
-    # Last ack variant spoken per tool — avoids reading back the identical
-    # line two commands in a row for the same tool (e.g. "Opening Settings."
-    # every single time "open settings" is said).
-    _last_ack_variant: dict[str, str] = {}
-
-    def _pick_ack_variant(tool_name: str, variants: list[str]) -> str:
-        last = _last_ack_variant.get(tool_name)
-        choices = [v for v in variants if v != last] or variants
-        text = random.choice(choices)
-        _last_ack_variant[tool_name] = text
-        return text
-
-    def _build_ack_text(tool_name: str, tool_params: dict) -> str:
+    def _build_ack_text(tool_name: str, tool_params: dict,
+                        emotion: str | None = None) -> str:
         """Return a command-aware acknowledgement phrase for the given tool —
-        one concise, natural-sounding variant, never the exact same wording
-        as the last time this tool fired."""
-        if tool_name == "open_application":
-            app = (tool_params.get("app") or tool_params.get("app_name") or
-                   tool_params.get("name") or "").strip()
-            name = app.title() if app else "it"
-            text = _pick_ack_variant(tool_name, [
-                f"Opening {name}.", f"Opening {name} now.", f"Launching {name}.",
-            ])
-        elif tool_name == "open_system_settings":
-            page = (tool_params.get("page") or "").strip().lower()
-            nice = _SETTINGS_PAGE_NAMES.get(page, page.replace("-", " ").replace("_", " ").title())
-            if nice and page != "home":
-                text = _pick_ack_variant(tool_name, [
-                    f"Opening {nice} Settings.", f"Opening your {nice} settings.", f"Pulling up {nice} settings.",
-                ])
-            else:
-                text = _pick_ack_variant(tool_name, [
-                    "Opening Settings.", "Opening Settings now.", "Pulling up Settings.",
-                ])
-        elif tool_name == "open_drive":
-            drive = (tool_params.get("drive") or "").upper().replace("DRIVE", "").strip()
-            name = f"{drive} drive" if drive else "drive"
-            text = _pick_ack_variant(tool_name, [
-                f"Opening your {name}.", f"Opening the {name}.", f"Opening {name} now.",
-            ])
-        elif tool_name in ("open_directory", "smart_open"):
-            raw = (tool_params.get("query") or tool_params.get("path") or "").strip()
-            name = Path(raw).name if ("/" in raw or "\\" in raw) else raw
-            name = name.title() if name else "it"
-            text = _pick_ack_variant(tool_name, [
-                f"Opening {name}.", f"Opening {name} now.", f"Pulling up {name}.",
-            ])
-        elif tool_name == "search_youtube":
-            q = (tool_params.get("query") or "").strip()
-            name = q[:35].title() if q else None
-            text = _pick_ack_variant(tool_name, [
-                f"Playing {name}." if name else "Opening YouTube.",
-                f"Playing {name} now." if name else "Pulling up YouTube.",
-            ])
-        elif tool_name == "search_web":
-            text = _pick_ack_variant(tool_name, [
-                "Searching the web.", "Let me search that.", "Searching now.",
-            ])
-        elif tool_name == "open_url":
-            text = _pick_ack_variant(tool_name, [
-                "Opening it.", "Opening that now.", "Pulling it up.",
-            ])
-        elif tool_name == "play_media_file":
-            q = (tool_params.get("query") or "").strip()
-            name = q[:35] if q else "it"
-            text = _pick_ack_variant(tool_name, [
-                f"Playing {name}.", f"Playing {name} now.",
-            ])
-        elif tool_name == "install_store_app":
-            app = (tool_params.get("app_name") or "").strip()
-            name = app.title() if app else None
-            text = _pick_ack_variant(tool_name, [
-                f"Searching for {name} in the Store." if name else "Searching the Store.",
-                f"Looking up {name} in the Store." if name else "Checking the Store.",
-            ])
-        else:
-            text = _pick_ack_variant(tool_name, ["On it.", "Right away.", "Working on it now."])
-        logger.info("[COMMAND_ACK_SELECTED] tool=%s params=%s text=%r", tool_name, tool_params, text)
+        natural spoken variants chosen from emotion-tagged pools in
+        conversational_replies, toned to how the user sounds this turn
+        (upbeat / warm / neutral / reassuring), never repeating the exact
+        same wording as the last time this slot fired."""
+        text = _reply_pick_ack(tool_name, tool_params, emotion)
+        logger.info("[COMMAND_ACK_SELECTED] tool=%s params=%s emotion=%s text=%r",
+                    tool_name, tool_params, emotion or "none", text)
         return text
 
-    def _build_completion_text(tool_name: str, tool_params: dict) -> str:
+    def _build_completion_text(tool_name: str, tool_params: dict,
+                               emotion: str | None = None) -> str:
         """
         UX polish (Part 3): completion speech narrates what already
         happened, in past tense — never "Opening X." after the action is
         already done. Covers every tool (per user feedback: silence on
         success read as broken, so nothing goes fully silent anymore).
+        Variants are emotion-toned (conversational_replies); the
+        context-aware YouTube mood question is preserved there.
         """
-        if tool_name == "open_application":
-            app = (tool_params.get("app") or tool_params.get("app_name") or
-                   tool_params.get("name") or "").strip()
-            name = app.title() if app else "it"
-            # Context-aware completion (user feedback): "open youtube" is
-            # ALWAYS routed to open_application (app_name="youtube") by
-            # intent_router — live-verified there is no Tier2 path to
-            # open_url for a bare site name — so this is the actual branch
-            # that needs the mood question, not open_url below (which is
-            # effectively unreachable for bare "open <site>" commands).
-            if app.strip().lower() == "youtube":
-                text = _pick_ack_variant(f"{tool_name}_done", [
-                    "YouTube's up — what are you in the mood to watch?",
-                    "There's YouTube. Want a recommendation, or looking for something specific?",
-                ])
-            else:
-                text = _pick_ack_variant(f"{tool_name}_done", [
-                    f"{name} is open.", f"{name} opened.", f"There's {name}.",
-                ])
-        elif tool_name == "open_system_settings":
-            page = (tool_params.get("page") or "").strip().lower()
-            nice = _SETTINGS_PAGE_NAMES.get(page, page.replace("-", " ").replace("_", " ").title())
-            if nice and page != "home":
-                text = _pick_ack_variant(f"{tool_name}_done", [
-                    f"{nice} settings is open.", f"You're in {nice} settings.",
-                ])
-            else:
-                text = _pick_ack_variant(f"{tool_name}_done", ["Settings is open.", "There's Settings."])
-        elif tool_name == "open_drive":
-            drive = (tool_params.get("drive") or "").upper().replace("DRIVE", "").strip()
-            name = f"{drive} drive" if drive else "drive"
-            text = _pick_ack_variant(f"{tool_name}_done", [f"{name} is open.", f"There's your {name}."])
-        elif tool_name in ("open_directory", "smart_open"):
-            raw = (tool_params.get("query") or tool_params.get("path") or "").strip()
-            name = Path(raw).name if ("/" in raw or "\\" in raw) else raw
-            name = name.title() if name else "it"
-            text = _pick_ack_variant(f"{tool_name}_done", [f"{name} opened.", f"There's {name}."])
-        elif tool_name == "search_youtube":
-            q = (tool_params.get("query") or "").strip()
-            name = q[:35].title() if q else None
-            text = _pick_ack_variant(f"{tool_name}_done", [
-                f"Playing {name}." if name else "Playing it now.",
-                f"{name} is playing." if name else "It's playing.",
-            ])
-        elif tool_name == "search_web":
-            text = _pick_ack_variant(f"{tool_name}_done", [
-                "Here's what I found.", "Search results are up.", "Done searching.",
-            ])
-        elif tool_name == "open_url":
-            # Context-aware completion (user feedback): a bare "open
-            # YouTube" (no video/query — that's search_youtube's job) is
-            # the one case where asking about mood/intent is actually
-            # useful, unlike e.g. "open GitHub" where there's nothing
-            # meaningful to ask.
-            _site = (tool_params.get("site") or "").strip().lower()
-            if _site == "youtube" or "youtube.com" in _site:
-                text = _pick_ack_variant(f"{tool_name}_done", [
-                    "YouTube's up — what are you in the mood to watch?",
-                    "There's YouTube. Want a recommendation, or looking for something specific?",
-                ])
-            else:
-                text = _pick_ack_variant(f"{tool_name}_done", ["It's open.", "Page is up.", "Done."])
-        elif tool_name == "play_media_file":
-            q = (tool_params.get("query") or "").strip()
-            name = q[:35] if q else "it"
-            text = _pick_ack_variant(f"{tool_name}_done", [f"Playing {name}.", f"{name} is playing."])
-        elif tool_name == "install_store_app":
-            app = (tool_params.get("app_name") or "").strip()
-            name = app.title() if app else "it"
-            text = _pick_ack_variant(f"{tool_name}_done", [f"Found {name} in the Store.", "Found it in the Store."])
-        else:
-            text = _pick_ack_variant(f"{tool_name}_done", ["Done.", "All set."])
-        logger.info("[COMPLETION_TEXT_SELECTED] tool=%s text=%r", tool_name, text)
+        text = _reply_pick_completion(tool_name, tool_params, emotion)
+        logger.info("[COMPLETION_TEXT_SELECTED] tool=%s emotion=%s text=%r",
+                    tool_name, emotion or "none", text)
         return text
 
     # ── Tool execution helper ─────────────────────────────────────────────────
@@ -1372,13 +1447,32 @@ async def ws_session(websocket: WebSocket) -> None:
     # stashes its measured duration here so the TOOL branch below can read
     # the real number instead of a wall-clock delta that also captures the
     # ack-synthesis block.
-    _last_tool_exec_ms = {"ms": 0.0}
+    #
+    # Cross-turn contamination fix (2026-09-05, live-caught): these used to
+    # be flat single-slot dicts ({"ms": ...}, {"ok": ...}) shared across the
+    # WHOLE WebSocket connection — every turn's process_utterance() call
+    # writes through the SAME _run_tool closure. voice_ws.py's own staleness
+    # guards (my_turn/current_turn_id) prove overlapping turns ARE a real,
+    # anticipated scenario, not a hypothetical: a slow tool call from turn N
+    # (e.g. "open YouTube" blocked ~20s in CDP retries — see
+    # browser_workspace.py's bounded-retry fix, same investigation) can
+    # still be in flight when turn N+1 (e.g. "open Settings", <20ms) starts,
+    # runs to completion, and reads this shared state — then turn N's
+    # long-delayed write finally lands and clobbers it with turn N's OWN
+    # number just before turn N+1's V_LATENCY summary log fires. Live
+    # symptom: a Settings turn's own [PERF_TOOL] line correctly showed
+    # ms=11, but that SAME turn's later [V_LATENCY] line reported
+    # tool_ms=20833 — the youtube turn's number, mislabeled. Now keyed by
+    # trace_id (each turn's own, distinct — see process_utterance's
+    # _trace_id) instead of a flat key, so two turns's numbers can never
+    # collide; .pop() on read keeps the dict from growing unbounded.
+    _last_tool_exec_ms: dict[str, float] = {}
     # Part 4 polish: lets the TOOL branch decide silence-on-success without
     # _run_tool needing to change its (str) return-value contract used by
     # every other caller (memory_ref path, MULTI_STEP, confirmation flows).
-    _last_tool_success = {"ok": True}
+    _last_tool_success: dict[str, bool] = {}
 
-    async def _run_tool(tool_name: str, tool_params: dict, goal: str = "") -> str:
+    async def _run_tool(tool_name: str, tool_params: dict, goal: str = "", trace_id: str = "") -> str:
         # Operator mode is disabled — route directly to registered tools only
         logger.info("[DIRECT_TOOL_EXECUTION] tool=%s", tool_name)
 
@@ -1390,13 +1484,31 @@ async def ws_session(websocket: WebSocket) -> None:
             _aw = await asyncio.to_thread(_wctx.get_active_window)
         except Exception:
             _aw = None
-        _ctx = {"openai_key": _cfg.openai_api_key, "active_window": _aw}
-        # ── Trace instrumentation ─────────────────────────────────────────────
-        try:
-            _ts, _ = _tracer()
-            _t_id = _ts.current_trace_id() or "?"
-        except Exception:
-            _t_id, _ts = "?", None
+        _ctx = {
+            "openai_key":    _cfg.openai_api_key,
+            "active_window": _aw,
+            "response_lang": _session_state.get("ml_resp_lang", "en"),
+        }
+        # ── Trace instrumentation ───────────────────────────────────────────
+        # Prefer the CALLER's own trace_id (the turn that actually invoked
+        # this tool) over the global "current trace" pointer — that global
+        # is process-wide/connection-wide and gets reassigned by whichever
+        # turn's process_utterance() called tracer().start() MOST RECENTLY,
+        # which is not necessarily THIS call's turn under overlapping turns
+        # (see this function's _last_tool_exec_ms comment above for the
+        # exact live symptom this caused: a tool's own [TOOL_START]/
+        # [PERF_TOOL] lines could be stamped with a DIFFERENT turn's trace
+        # ID than the one that actually invoked it). Falls back to the
+        # global lookup only for the handful of legacy call sites that
+        # don't yet pass trace_id — never worse than the old behavior.
+        if trace_id:
+            _t_id, _ts = trace_id, None
+        else:
+            try:
+                _ts, _ = _tracer()
+                _t_id = _ts.current_trace_id() or "?"
+            except Exception:
+                _t_id, _ts = "?", None
         _safe_p = {k: v for k, v in tool_params.items() if k != "openai_key"}
         logger.info("[TRACE %s] [TOOL_START] tool=%s params=%s", _t_id, tool_name, _safe_p)
         # Phase 4.11 Part 8: same canonical progress-event family the
@@ -1404,20 +1516,34 @@ async def ws_session(websocket: WebSocket) -> None:
         # settings") get equally specific status instead of an implicit
         # "Listening" the whole time — traceable in logs even without a
         # wired frontend consumer.
-        logger.info("[PROGRESS_EVENT_CREATED] tool=%s label=%r", tool_name, f"Opening {tool_name.replace('_', ' ')}")
+        # Real-mic Urdu test Issue 7: the label used to be derived from the
+        # raw tool name ("Opening open application") — it must come from
+        # the SAME semantic action/object title activity_events computes,
+        # so logs and frontend always read "Opening Settings" / "Opening C
+        # Drive" etc.
         try:
             from api.services.activity_events import emit_activity as _emit_act, title_for as _act_title
             _act_stage, _act_title_started = _act_title(tool_name, tool_params, "started")
+            logger.info("[PROGRESS_EVENT_CREATED] tool=%s label=%r", tool_name, _act_title_started)
             await _emit_act(websocket, _send, trace_id=_t_id, stage=_act_stage, status="started",
                             title=_act_title_started, tool=tool_name)
         except Exception:
-            pass
+            logger.info("[PROGRESS_EVENT_CREATED] tool=%s label=%r", tool_name, "Working on it")
         _tool_t0 = time.time()
         result = await asyncio.to_thread(_registry.execute, tool_name, tool_params, _ctx)
         _tool_ms = (time.time() - _tool_t0) * 1000
-        _last_tool_exec_ms["ms"] = _tool_ms
-        _last_tool_success["ok"] = result.success
+        _last_tool_exec_ms[_t_id] = _tool_ms
+        _last_tool_success[_t_id] = result.success
         logger.info("[PERF_TOOL] tool=%s ms=%.0f success=%s", tool_name, _tool_ms, result.success)
+        # Generic fine-grained breakdown — any tool may populate
+        # data["latency_ms"] with its own sub-stage timings (Phase 4's
+        # WhatsApp tools do: contact_resolution_ms/planning_ms/transport_ms
+        # etc.). Not WhatsApp-specific: this just surfaces whatever a tool
+        # already measured, for any tool that provides it.
+        _sub_lat = (result.data or {}).get("latency_ms")
+        if isinstance(_sub_lat, dict) and _sub_lat:
+            logger.info("[PERF_TOOL_DETAIL] tool=%s %s", tool_name,
+                        " ".join(f"{k}={v}" for k, v in _sub_lat.items()))
         try:
             from api.services.activity_events import emit_activity as _emit_act2, title_for as _act_title2
             _act_stage2, _act_title_done = _act_title2(
@@ -1519,6 +1645,7 @@ async def ws_session(websocket: WebSocket) -> None:
                 "tool":   result.data.get("tool", ""),
                 "params": result.data.get("params", {}),
                 "prompt": result.data.get("prompt", "Should I proceed? Say yes or no."),
+                "created_at": time.time(),
             }
             logger.info("[CONFIRMATION_PENDING] tool=%s prompt=%r",
                         result.data.get("tool"), result.data.get("prompt", "")[:60])
@@ -1582,6 +1709,19 @@ async def ws_session(websocket: WebSocket) -> None:
                 ))
             except Exception:
                 pass
+            # ── Activity memory — persistent cross-session recall log ─────────
+            # Songs played / folders opened / apps launched land in
+            # ~/.xyron/activity_memory.jsonl so "what songs did you play
+            # yesterday" survives restarts (session-scoped context_stack and
+            # activity_timeline can't answer that). File append is off-loop.
+            try:
+                from api.services.activity_memory import activity_memory as _amem_r
+                _rdata_am = result.data or {}
+                asyncio.create_task(asyncio.to_thread(
+                    _amem_r.record_from_tool, tool_name, tool_params, _rdata_am
+                ))
+            except Exception:
+                pass
 
         # ── Open-after-install offer — store pending state so Tier 0d2 can act ─
         if result.success and (result.data or {}).get("open_offer"):
@@ -1608,9 +1748,10 @@ async def ws_session(websocket: WebSocket) -> None:
         logger.info("[TTS_STARTED] streaming LLM+TTS pipeline")
         full_text  = ""
         interrupted = False
+        _resp_lang_stream = _session_state.get("ml_resp_lang", "en")
         try:
             async for sentence, wav, chunk_idx, is_final in stream_response_with_tts(
-                transcript, history, voice=voice, speed=speed
+                transcript, history, voice=voice, speed=speed, response_lang=_resp_lang_stream
             ):
                 full_text += sentence + " "
                 await _send(websocket, {"type": "response", "text": sentence, "chunk": chunk_idx})
@@ -1627,11 +1768,23 @@ async def ws_session(websocket: WebSocket) -> None:
                     break
         except Exception as exc:
             logger.warning("[WS/session] LLM stream error: %s", exc)
-            fallback = "I ran into an issue. Please try again."
+            from api.services.failure_messages import offline_fallback as _offline_fallback_llm
+            fallback = _offline_fallback_llm()
             await _send(websocket, {"type": "response", "text": fallback, "chunk": 1})
             await _tts_sequential(fallback)
             full_text = fallback
-        return full_text.strip(), interrupted
+        full_text = full_text.strip()
+        if not full_text and not interrupted:
+            # stream_response_with_tts completed with no exception but yielded
+            # nothing (e.g. both OpenAI and the Ollama rescue failed before
+            # queuing anything) — without this, the turn ends in total
+            # silence: no exception for the except-branch above to catch,
+            # nothing spoken, nothing shown.
+            from api.services.failure_messages import offline_fallback as _offline_fallback_llm2
+            full_text = _offline_fallback_llm2()
+            await _send(websocket, {"type": "response", "text": full_text, "chunk": 1})
+            await _tts_sequential(full_text)
+        return full_text, interrupted
 
     # ── Utterance processor ───────────────────────────────────────────────────
 
@@ -1979,6 +2132,15 @@ async def ws_session(websocket: WebSocket) -> None:
                 _trace.error_type = "STT_FAILURE"
                 _trace.error_detail = str(exc)
             await _send(websocket, {"type": "error", "message": "STT failed"})
+            # Previously silent beyond the raw error frame — timeout and
+            # hallucination-rejection above both speak something, this
+            # generic-exception branch didn't. Say what happened instead of
+            # leaving a voice-only user with dead air.
+            is_speaking = True
+            from api.services.failure_messages import stt_failure as _stt_failure_msg
+            _stt_fail_text = _stt_failure_msg()
+            await _send(websocket, {"type": "response", "text": _stt_fail_text, "chunk": 1})
+            await _tts_with_fallback(_stt_fail_text)
             is_speaking = False
             await _send(websocket, {"type": "listening"})
             return
@@ -2110,11 +2272,29 @@ async def ws_session(websocket: WebSocket) -> None:
         # immediately below. Only fires on low-confidence STT results (see
         # _needs_semantic_correction); fails open to the original transcript.
         _corrected_transcript = await _correct_transcript_semantic(
-            transcript, result.get("confidence", -999.0)
+            transcript, result.get("confidence", -999.0),
+            result.get("language", ""),
         )
         if _corrected_transcript != transcript:
             transcript = _corrected_transcript
             result["text"] = transcript
+
+        # Captured HERE — after phonetic/semantic correction but BEFORE the
+        # intelligence pipeline (a few blocks below) overwrites `transcript`
+        # with its mixed_language_engine canonical English rewrite (e.g.
+        # "Chrome kholo" -> "open Chrome "). This used to be captured after
+        # that rewrite (see the old comment further down, now moved here with
+        # it), which meant a Roman-Urdu/Urdu turn's language got detected
+        # from its ENGLISH canonical form, not what the user actually said —
+        # live-caught bug: after "Chrome kholo" got canonicalized to "open
+        # Chrome ", ml_detected_lang was set to "en" for the SESSION, which
+        # made hybrid_stt_router.py drop out of multilingual-accurate STT
+        # routing on the very next turn and send genuine Roman Urdu audio
+        # ("Settings ko kholo") to the English-only tiny.en fast model,
+        # producing garbage ("Settings code be called though.") that then
+        # skipped both retry-to-accurate and semantic correction because
+        # tiny.en was confident about its own wrong answer.
+        _original_transcript = transcript
 
         # ── Phase 4.14 Part 3: Parallel pipeline — fast-path agent dispatch ───
         # A confident "book a flight/hotel/ticket" match is unambiguous enough
@@ -2203,6 +2383,7 @@ async def ws_session(websocket: WebSocket) -> None:
                 session_state=_session_state,
                 secondary_result=_stt_secondary,
                 audio_dur_ms=_audio_dur_ms,
+                trace_id=_trace_id,
             )
             if _intel_result and _intel_result.winner_text:
                 if _intel_result.corrected:
@@ -2235,6 +2416,9 @@ async def ws_session(websocket: WebSocket) -> None:
         # Runs before English normalizer.
         # Non-English input → transcript converted to English for intent routing.
         # Response language stored in _session_state["ml_resp_lang"] for TTS.
+        # _original_transcript (used below for language detection + memory)
+        # was captured earlier, right after semantic correction — see that
+        # capture point for why.
         try:
             import os as _ml_os
             from api.services.language_detector import detect as _lang_detect
@@ -2244,30 +2428,124 @@ async def ws_session(websocket: WebSocket) -> None:
                 select_response_language as _select_resp_lang,
             )
             _raw_stt_lang = (result.get("language") or "en") if isinstance(result, dict) else "en"
-            _lang_info    = _lang_detect(transcript, _raw_stt_lang)
+            # Detect on _original_transcript (pre-intel-pipeline-canonicalization),
+            # NOT `transcript` — by this point `transcript` may already be the
+            # mixed_language_engine's English canonical rewrite (e.g. "Chrome
+            # kholo" -> "open Chrome "), which would make a genuine Roman-Urdu
+            # turn detect as "en" and corrupt ml_detected_lang for the *next*
+            # turn's STT routing decision (see _original_transcript's capture
+            # comment above for the live-caught failure this fixes).
+            _lang_info    = _lang_detect(_original_transcript, _raw_stt_lang)
             _detected_ml  = _lang_info["lang"]
             _session_state["ml_detected_lang"] = _detected_ml
+            # Persist the detection CONFIDENCE too — hybrid_stt_router only
+            # honors ml_detected_lang for next-turn STT routing when the
+            # detection was confident. Live bug this closes: one shaky
+            # keyword mis-detection (pure English flagged ur_roman at 0.60-
+            # class confidence) forced every following turn onto the slow
+            # multilingual "accurate" Whisper model (~3s vs ~0.8s).
+            _session_state["ml_detected_lang_conf"] = _lang_info.get("confidence", 0.0)
+            # First hi/ar turn this session → kick off XTTS's background load
+            # now, in parallel with routing/tool-execution, instead of
+            # waiting for the TTS call to discover it's cold. Idempotent and
+            # gpu_coordinator-gated (see xtts_service._ensure_bg_load) — cheap
+            # to call every turn once already loading/loaded.
+            #
+            # Gated to (hi, ar) specifically, NOT "any non-English" — voice/
+            # tts_router.py routes ur/ur_roman/mixed to Edge-TTS exclusively
+            # (_EDGE_TTS_LANGS), never to XTTS. Every Urdu-family session was
+            # previously triggering a real background load attempt (a
+            # gpu_coordinator wait up to 30s, contending with concurrent
+            # Whisper/TTS GPU work — visible as [GPU_JOB_WAIT] timing out
+            # "after 30s — proceeding anyway" in production logs) for a model
+            # that language would never actually use, on top of XTTS having a
+            # separately confirmed permanently corrupted checkpoint on this
+            # machine (see xtts_service.py's module docstring) that makes the
+            # load fail regardless.
+            if _detected_ml in ("hi", "ar") and not _session_state.get("_xtts_warm_triggered"):
+                _session_state["_xtts_warm_triggered"] = True
+                try:
+                    from voice.xtts_service import _ensure_bg_load as _xtts_warm
+                    _xtts_warm()
+                except Exception:
+                    pass
+            # Same pattern for the local Qwen semantic-comprehension model
+            # (Tier 4 of orchestrator._route_intent, non-English only) — see
+            # local_comprehension.py's "Timeout / warm-keep" docstring
+            # section for the measured cold-load cost (11.6-15.7s) this
+            # closes. Fires once per session on the first non-English turn,
+            # in the background, gpu_coordinator-gated exactly like XTTS's
+            # own preload — never blocks this turn's response.
+            if _detected_ml != "en" and not _session_state.get("_qwen_warm_triggered"):
+                _session_state["_qwen_warm_triggered"] = True
+                try:
+                    from api.services.local_comprehension import ensure_warm as _qwen_warm
+                    _qwen_warm(reason=f"first_non_english_turn_lang={_detected_ml}")
+                except Exception:
+                    pass
             # Check if user is setting a language preference ("always reply in Urdu" etc.)
-            _check_lang_pref(transcript, _session_id)
+            _lang_pref_mode = _check_lang_pref(transcript, _session_id)
             # Choose TTS output language
             _resp_lang_mode = _ml_os.getenv("RESPONSE_LANGUAGE_MODE", "auto")
-            _ml_resp = _select_resp_lang(_detected_ml, _session_id, _resp_lang_mode, _lang_info["confidence"])
+            _ml_resp = _select_resp_lang(
+                _detected_ml, _session_id, _resp_lang_mode, _lang_info["confidence"],
+                word_count=len(_original_transcript.split()),
+                stt_confidence=(result.get("confidence") if isinstance(result, dict) else None),
+            )
             _session_state["ml_resp_lang"] = _ml_resp
+
+            # An explicit language-switch command ("Urdu mein baat karo",
+            # "reply in English") is fully handled right here by
+            # _check_lang_pref above — the turn IS the command, there is
+            # nothing left to route. Live-caught bug this closes: this used
+            # to fall through into intent_router/orchestrator like any other
+            # utterance, which had no tool for "talk in Urdu" and handed it
+            # to the local Qwen fallback, which guessed search_files and
+            # burned ~14s searching for a file literally named "urdu mein
+            # baat karo, یار." before failing — the language switch itself
+            # worked, but the user got a bogus "no files found" error
+            # instead of any acknowledgement.
+            if _lang_pref_mode:
+                logger.info("[LANG_SWITCH_ACK] mode=%s resp_lang=%s — short-circuiting routing", _lang_pref_mode, _ml_resp)
+                _lang_switch_ack_map = {
+                    "en":       "Okay, switching to English.",
+                    "ur":       "ٹھیک ہے، اب اردو میں بات کرتا ہوں۔",
+                    "ur_roman": "Theek hai, ab Urdu mein baat karta hoon.",
+                    "hi":       "ठीक है, अब हिंदी में बात करता हूँ।",
+                    "ar":       "حسناً، سأتحدث بالعربية الآن.",
+                }
+                _lang_ack_text = _lang_switch_ack_map.get(_ml_resp, _lang_switch_ack_map["en"])
+                await _send(websocket, {"type": "transcript", "text": transcript, "final": True})
+                await _send(websocket, {"type": "response", "text": _lang_ack_text, "chunk": 1})
+                memory.add_user(_original_transcript)
+                memory.add_assistant(_lang_ack_text)
+                is_speaking = True
+                # _skip_localize=True: _lang_ack_text is already the exact
+                # target-language string from _lang_switch_ack_map above —
+                # re-running it through localize_with_fallback (which treats
+                # its input as English needing translation) hallucinates an
+                # unrelated reply instead of passing it through.
+                await _tts_with_fallback(_lang_ack_text, _skip_localize=True)
+                is_speaking = False
+                await _send(websocket, {"type": "listening"})
+                return
+
             # Normalize non-English command to English for intent routing
             if _detected_ml not in ("en",):
                 _ml_en_cmd = _ml_normalize(transcript, _detected_ml)
                 if _ml_en_cmd and _ml_en_cmd.strip() and _ml_en_cmd != transcript:
-                    logger.info("[ML_NORMALIZE_INPUT→OUTPUT] %r → %r",
-                                transcript[:60], _ml_en_cmd[:60])
+                    logger.info("[TRACE %s] [ML_NORMALIZE_INPUT→OUTPUT] %r → %r",
+                                _trace_id, transcript[:60], _ml_en_cmd[:60])
                     transcript = _ml_en_cmd
             logger.info(
-                "[STT_LANG_ROUTE] mode=%s reason=lang_%s resp_lang=%s",
+                "[TRACE %s] [STT_LANG_ROUTE] mode=%s reason=lang_%s resp_lang=%s",
+                _trace_id,
                 "multilingual" if _detected_ml != "en" else "english_fast",
                 _detected_ml, _ml_resp,
             )
             logger.info(
-                "[STT_MULTILINGUAL_RESULT] lang=%s transcript=%r ms=%.0f",
-                _detected_ml, transcript[:60], _lat.get("stt", 0),
+                "[TRACE %s] [STT_MULTILINGUAL_RESULT] lang=%s transcript=%r ms=%.0f",
+                _trace_id, _detected_ml, transcript[:60], _lat.get("stt", 0),
             )
         except Exception as _ml_exc:
             logger.debug("[ML_LANG_DETECT] skipped: %s", _ml_exc)
@@ -2304,7 +2582,11 @@ async def ws_session(websocket: WebSocket) -> None:
         _cp("transcript_sent")
         await _send(websocket, {"type": "transcript", "text": transcript, "final": True})
         logger.info("[WS/session] transcript: %r", transcript)
-        memory.add_user(transcript)
+        # Conversation memory keeps what the user actually said (original
+        # language), not the English canonical command routing uses below —
+        # see _original_transcript capture above.
+        memory.add_user(_original_transcript)
+        _session_state["last_original_transcript"] = _original_transcript
         logger.info("[VOICE_TRACE] stage=stt transcript=%r", transcript[:80])
         logger.info(
             "[BRAIN_PIPELINE] stage=normalized input=%r turn=%d",
@@ -2315,17 +2597,22 @@ async def ws_session(websocket: WebSocket) -> None:
         # Fires when a prior tool returned error="confirm_required" (e.g. install_store_app).
         # Must run before Tier 0 clock so "yes" / "no" answers the pending action.
         _pending = _session_state.get("pending_confirmation")
+        if _pending is not None:
+            # Bounded expiry — matches the sibling pending-state pattern
+            # already used for _pending_open_after_install / _pending_store /
+            # _pending_video (all 300s). This one previously had none: a
+            # stale confirm_required (e.g. "send 'X' to Tayyab?" from
+            # minutes ago) would sit forever and could otherwise be
+            # accidentally approved by an unrelated later "yes". Dismiss and
+            # fall through to normal routing rather than re-prompting a
+            # question the user has moved on from.
+            if (time.time() - _pending.get("created_at", 0)) > 300:
+                logger.info("[CONFIRMATION_EXPIRED] tool=%s", _pending.get("tool"))
+                _session_state["pending_confirmation"] = None
+                _pending = None
         if _pending:
-            _YES_RE = re.compile(
-                r'\b(yes|yeah|yep|yup|sure|go ahead|do it|confirm|install it|'
-                r'proceed|ok|okay|please|affirmative|absolutely)\b',
-                re.IGNORECASE,
-            )
-            _NO_RE = re.compile(
-                r'\b(no|nope|cancel|stop|don\'?t|never mind|nevermind|abort|'
-                r'reject|skip|forget it|actually no)\b',
-                re.IGNORECASE,
-            )
+            _YES_RE = _CONFIRM_YES_RE
+            _NO_RE = _CONFIRM_NO_RE
             if _YES_RE.search(transcript):
                 logger.info("[CONFIRMATION_ACCEPTED] tool=%s", _pending["tool"])
                 _session_state["pending_confirmation"] = None
@@ -2337,10 +2624,10 @@ async def ws_session(websocket: WebSocket) -> None:
                 for _pre_tool, _pre_params in _pending.get("pre_actions", []):
                     try:
                         logger.info("[CONFIRMATION_PRE_ACTION] tool=%s params=%s", _pre_tool, _pre_params)
-                        await _run_tool(_pre_tool, _pre_params, goal=transcript)
+                        await _run_tool(_pre_tool, _pre_params, goal=transcript, trace_id=_trace_id)
                     except Exception as _pre_exc:
                         logger.warning("[CONFIRMATION_PRE_ACTION_FAILED] tool=%s error=%s", _pre_tool, _pre_exc)
-                _conf_resp = await _run_tool(_pending["tool"], _pending["params"], goal=transcript)
+                _conf_resp = await _run_tool(_pending["tool"], _pending["params"], goal=transcript, trace_id=_trace_id)
                 memory.add_assistant(_conf_resp, tool_name=_pending["tool"])
                 last_response_text = _conf_resp
                 last_activity_t    = time.time()
@@ -2505,7 +2792,7 @@ async def ws_session(websocket: WebSocket) -> None:
                 logger.info("[STORE_OPEN_FOLLOWUP_RESOLVED] app=%r transcript=%r",
                             _oai_app, transcript[:60])
                 _session_state["pending_open_after_install"] = None
-                await _run_tool("open_application", {"app_name": _oai_app}, goal=transcript)
+                await _run_tool("open_application", {"app_name": _oai_app}, goal=transcript, trace_id=_trace_id)
                 _open_spoken = f"Opening {_oai_app}."
                 logger.info("[STORE_OPEN_AFTER_INSTALL] app=%r", _oai_app)
                 memory.add_assistant(_open_spoken, tool_name="open_application")
@@ -2668,6 +2955,7 @@ async def ws_session(websocket: WebSocket) -> None:
                                        "my automation browser so I can interact with it. "
                                        "Would you like me to continue?"),
                             "pre_actions": [("browser_navigate", {"url": _cur_url})],
+                            "created_at": time.time(),
                         }
                         logger.info("[CONFIRMATION_PENDING] tool=%s prompt=web_control_fallback", _fur.tool_name)
                         _wc_prompt = _session_state["pending_confirmation"]["prompt"]
@@ -2695,7 +2983,7 @@ async def ws_session(websocket: WebSocket) -> None:
                     await _tts_with_fallback(_ack_text)
                     # Do NOT send done/listening — install is still running
                 _fur_tool_t0 = time.time()
-                _fur_resp = await _run_tool(_fur.tool_name, _fur.tool_params, goal=transcript)
+                _fur_resp = await _run_tool(_fur.tool_name, _fur.tool_params, goal=transcript, trace_id=_trace_id)
                 _lat["tool"] = (time.time() - _fur_tool_t0) * 1000
                 # If the tool set a pending confirmation, _run_tool returns the prompt text.
                 # Continue to TTS whether it's a confirmation prompt or a real response.
@@ -2748,6 +3036,52 @@ async def ws_session(websocket: WebSocket) -> None:
                 transcript = _fur.resolved
         except Exception as _fur_exc:
             logger.debug("[FOLLOWUP_RESOLVER] skipped: %s", _fur_exc)
+
+        # ── Tier 0m: Activity memory recall — cross-session questions ─────────
+        # "what is my most recent folder?", "what was I working on yesterday?",
+        # "what songs did you play today?", "play the same songs you played
+        # yesterday" — answered from activity_memory's persistent JSONL log,
+        # never the LLM. Must run before intent routing ("play the same songs"
+        # would otherwise hit the media_control play_pause regex) and answers
+        # past-tense variants Tier 0x's present-tense screen query misses.
+        try:
+            from api.services.activity_memory import activity_memory as _amem_q
+            _recall = _amem_q.handle_query(transcript)
+        except Exception as _am_exc:
+            _recall = None
+            logger.debug("[ACTIVITY_RECALL] skipped: %s", _am_exc)
+        if _recall and _recall.get("response"):
+            _rec_play = _recall.get("play")
+            if _rec_play and _rec_play.get("url"):
+                # Replay the remembered video right away so the music starts
+                # while Xyron speaks the ack — same ordering as Tier 0f4.
+                try:
+                    await _run_tool("play_youtube_video", {
+                        "url":   _rec_play["url"],
+                        "title": _rec_play.get("title", ""),
+                    }, goal=transcript, trace_id=_trace_id)
+                except Exception as _rec_play_exc:
+                    logger.warning("[ACTIVITY_RECALL_REPLAY_FAILED] %s", _rec_play_exc)
+            _rec_resp = _recall["response"]
+            logger.info("[ACTIVITY_RECALL_RESPONSE] action=%s response=%r",
+                        _recall.get("action"), _rec_resp[:90])
+            memory.add_assistant(_rec_resp, tool_name="activity_memory_recall")
+            last_response_text = _rec_resp
+            last_activity_t    = time.time()
+            await _send(websocket, {"type": "response", "text": _rec_resp, "chunk": 1})
+            _interrupted = await _tts_with_fallback(_rec_resp)
+            if not _interrupted:
+                if _tts_state["audio_sent"]:
+                    logger.info("[SPEAKING_FLAG_SET] is_speaking=True route=activity_recall")
+                    await _send(websocket, {"type": "done"})
+                    asyncio.create_task(_spawn_tts_watchdog("activity_recall"))
+                else:
+                    is_speaking = False
+                    await _send(websocket, {"type": "listening"})
+            else:
+                is_speaking = False
+                await _send(websocket, {"type": "listening"})
+            return
 
         # ── Tier 0x: Screen awareness — "what am I looking at?" / "what app?" ─
         # Answers questions about the current desktop context without LLM.
@@ -3258,7 +3592,7 @@ async def ws_session(websocket: WebSocket) -> None:
                             _ord_resp = await _run_tool("install_store_app", {
                                 "app_name": _s_sel["name"],
                                 "source":   _s_sel.get("source", "msstore"),
-                            }, goal=transcript)
+                            }, goal=transcript, trace_id=_trace_id)
                             memory.add_assistant(_ord_resp, tool_name="install_store_app")
                             last_response_text = _ord_resp
                             last_activity_t    = time.time()
@@ -3377,7 +3711,7 @@ async def ws_session(websocket: WebSocket) -> None:
                         _v_resp = await _run_tool("play_youtube_video", {
                             "url":   _v_sel["url"],
                             "title": _v_sel["title"],
-                        }, goal=transcript)
+                        }, goal=transcript, trace_id=_trace_id)
                         memory.add_assistant(_v_resp, tool_name="play_youtube_video")
                         last_response_text = _v_resp
                         last_activity_t    = time.time()
@@ -3388,6 +3722,94 @@ async def ws_session(websocket: WebSocket) -> None:
                                 logger.info("[SPEAKING_FLAG_SET] is_speaking=True route=youtube_ordinal")
                                 await _send(websocket, {"type": "done"})
                                 asyncio.create_task(_spawn_tts_watchdog("youtube_ordinal"))
+                            else:
+                                is_speaking = False
+                                await _send(websocket, {"type": "listening"})
+                        else:
+                            is_speaking = False
+                            await _send(websocket, {"type": "listening"})
+                        return
+
+                # ── Title-based selection: "play love me like you do" ─────────
+                # STT-noise tolerant (Whisper mishears the leading verb, e.g.
+                # "play" → "Learn") — pure matching lives in video_selection.py.
+                # Live bug: this utterance matched no ordinal/this-one pattern,
+                # fell to Tier4 (0.32 < 0.65) and the LLM answered with babble.
+                _vt_match_fn = None
+                _vt_anap_fn  = None
+                try:
+                    from api.services.video_selection import (
+                        match_candidate as _vt_match_fn,
+                        is_anaphoric_play as _vt_anap_fn,
+                    )
+                except Exception as _vt_imp_exc:
+                    logger.debug("[YOUTUBE_TITLE_MATCH] import skipped: %s", _vt_imp_exc)
+
+                _vt_sel = None
+                if _vt_match_fn:
+                    try:
+                        _vt_sel = _vt_match_fn(transcript, _pending_video.get("candidates", []))
+                    except Exception as _vt_exc:
+                        logger.debug("[YOUTUBE_TITLE_MATCH] skipped: %s", _vt_exc)
+
+                if _vt_sel:
+                    _v_sel = _vt_sel["candidate"]
+                    logger.info("[YOUTUBE_SELECTION_TITLE_MATCH] idx=%d score=%.2f title=%r",
+                                _vt_sel["index"], _vt_sel["score"], _v_sel["title"])
+                    _session_state["pending_video_candidates"] = None
+                    _v_resp = await _run_tool("play_youtube_video", {
+                        "url":   _v_sel["url"],
+                        "title": _v_sel["title"],
+                    }, goal=transcript, trace_id=_trace_id)
+                    memory.add_assistant(_v_resp, tool_name="play_youtube_video")
+                    last_response_text = _v_resp
+                    last_activity_t    = time.time()
+                    await _send(websocket, {"type": "response", "text": _v_resp, "chunk": 1})
+                    _interrupted = await _tts_with_fallback(_v_resp)
+                    if not _interrupted:
+                        if _tts_state["audio_sent"]:
+                            logger.info("[SPEAKING_FLAG_SET] is_speaking=True route=youtube_title")
+                            await _send(websocket, {"type": "done"})
+                            asyncio.create_task(_spawn_tts_watchdog("youtube_title"))
+                        else:
+                            is_speaking = False
+                            await _send(websocket, {"type": "listening"})
+                    else:
+                        is_speaking = False
+                        await _send(websocket, {"type": "listening"})
+                    return
+
+                # ── Anaphoric: "play the song" / "play it" — no title given ───
+                # The user refers to media by noun, not name. The disambiguation
+                # list came from an ambiguous source query, so replay that query
+                # with intent=play (autoplay top result) instead of guessing a
+                # candidate — and it must fire BEFORE intent_router's
+                # media_control regex would turn it into a play/pause toggle
+                # (live bug: "No, I say play the song." toggled playback).
+                if _vt_anap_fn and _pending_video.get("source_query"):
+                    try:
+                        _vt_is_anap = _vt_anap_fn(transcript)
+                    except Exception:
+                        _vt_is_anap = False
+                    if _vt_is_anap:
+                        logger.info("[YOUTUBE_SELECTION_ANAPHORIC] source_query=%r",
+                                    _pending_video.get("source_query"))
+                        _anap_q = _pending_video["source_query"]
+                        _session_state["pending_video_candidates"] = None
+                        _v_resp = await _run_tool("search_youtube", {
+                            "query":  _anap_q,
+                            "intent": "play",
+                        }, goal=transcript, trace_id=_trace_id)
+                        memory.add_assistant(_v_resp, tool_name="search_youtube")
+                        last_response_text = _v_resp
+                        last_activity_t    = time.time()
+                        await _send(websocket, {"type": "response", "text": _v_resp, "chunk": 1})
+                        _interrupted = await _tts_with_fallback(_v_resp)
+                        if not _interrupted:
+                            if _tts_state["audio_sent"]:
+                                logger.info("[SPEAKING_FLAG_SET] is_speaking=True route=youtube_anaphoric")
+                                await _send(websocket, {"type": "done"})
+                                asyncio.create_task(_spawn_tts_watchdog("youtube_anaphoric"))
                             else:
                                 is_speaking = False
                                 await _send(websocket, {"type": "listening"})
@@ -3420,7 +3842,7 @@ async def ws_session(websocket: WebSocket) -> None:
                     _s_resp = await _run_tool("install_store_app", {
                         "app_name": _s_app,
                         "source":   "msstore",
-                    }, goal=transcript)
+                    }, goal=transcript, trace_id=_trace_id)
                     from api.services.store_agent import set_store_state as _sa_set_state
                     from api.services.store_agent import StoreInstallState as _SIS
                     _sa_set_state(_session_state, _SIS.WAITING_INSTALL)
@@ -4006,7 +4428,11 @@ async def ws_session(websocket: WebSocket) -> None:
         logger.info("[TURN_START] turn=%d routing transcript=%r", my_turn, transcript[:60])
         _intent_t0 = time.time()
         logger.info("[INTENT_START] turn=%d", my_turn)
-        decision = await _orch.decide(transcript, memory.history_for_llm())
+        decision = await _orch.decide(
+            transcript, memory.history_for_llm(),
+            detected_language=_session_state.get("ml_detected_lang", "en"),
+            trace_id=_trace_id,
+        )
         _router_ms = (time.time() - _intent_t0) * 1000
         _lat["router"] = _router_ms
         logger.info("[INTENT_END] turn=%d ms=%.0f", my_turn, _router_ms)
@@ -4083,28 +4509,33 @@ async def ws_session(websocket: WebSocket) -> None:
             tool = decision.tool_name
             try:
                 if tool == "delete_file":
-                    from api.tools import registry as _registry
+                    # Never delete on a bare pronoun reference without asking —
+                    # this used to execute instantly (params carried a hardcoded
+                    # "confirmed": True) against whatever context_memory last
+                    # remembered, including a bare location name. Route through
+                    # the same confirm_required/pending_confirmation gate every
+                    # other risky tool call uses instead.
                     paths = decision.tool_params.get("paths", [])
                     logger.info("[MEMORY_USED] delete_ref paths=%s", paths)
-                    deleted, failed = [], []
-                    for p in paths:
-                        try:
-                            r = await asyncio.to_thread(
-                                _registry.execute,
-                                "delete_file", {"path": p, "confirmed": True}, {},
-                            )
-                            (deleted if r.success else failed).append(p)
-                        except Exception:
-                            failed.append(p)
-                    if deleted and not failed:
-                        response_text = f"Deleted {len(deleted)} item{'s' if len(deleted) > 1 else ''}."
-                    elif deleted:
-                        response_text = f"Deleted {len(deleted)}, but {len(failed)} failed."
+                    if not paths:
+                        response_text = "I don't have anything remembered to delete."
+                    elif len(paths) > 1:
+                        response_text = "I'm not sure exactly which of those you mean — please name the file or folder directly."
                     else:
-                        response_text = "I couldn't delete those — they may no longer exist."
+                        _mref_target = paths[0]
+                        _mref_prompt = f"Delete {_mref_target}? Say yes to confirm or no to cancel."
+                        _session_state["pending_confirmation"] = {
+                            "tool":   "delete_file",
+                            "params": {"path": _mref_target},
+                            "prompt": _mref_prompt,
+                            "created_at": time.time(),
+                        }
+                        logger.info("[CONFIRMATION_PENDING] tool=delete_file prompt=%r reason=memory_delete_ref",
+                                    _mref_prompt[:60])
+                        response_text = _mref_prompt
                 elif tool:
                     logger.info("[MEMORY_USED] %s ref tool=%s", decision.reason, tool)
-                    response_text = await _run_tool(tool, decision.tool_params, goal=transcript)
+                    response_text = await _run_tool(tool, decision.tool_params, goal=transcript, trace_id=_trace_id)
                 else:
                     response_text = "I couldn't resolve what you're referring to."
             except Exception as exc:
@@ -4154,11 +4585,110 @@ async def ws_session(websocket: WebSocket) -> None:
             }
             _is_silent_tool = decision.tool_name in _SILENT_TOOLS
 
+            # ── Action-confidence invariant (real-mic Urdu test Issue 1B) ─────
+            # By the time an utterance reaches dispatch it has already had
+            # two recovery chances: the multilingual STT retry
+            # (hybrid_stt_router) and semantic transcript correction. If the
+            # routed action is STILL open_application for a target that no
+            # layer can identify (object_resolver: unknown) AND the STT
+            # confidence was poor, executing is a coin flip — the live
+            # failure was tiny.en mishearing "Urdu mein baat karo" as
+            # "Xyron, open barhao." (conf -0.67) and blindly launching
+            # "barhao". Never execute that class of action: ask a concise
+            # clarification instead. Known targets (chrome/settings/youtube/
+            # existing folders) and clear transcripts are untouched.
+            if decision.tool_name == "open_application":
+                _gate_target = str(decision.tool_params.get("app_name", "") or "").strip()
+                _gate_stt_conf = result.get("confidence") if isinstance(result, dict) else None
+                _gate_obj = None
+                if _gate_target:
+                    try:
+                        from api.services.object_resolver import resolve as _gate_resolve
+                        _gate_obj = _gate_resolve(_gate_target)
+                    except Exception:
+                        _gate_obj = None
+                _gate_target_unknown = (
+                    _gate_obj is not None
+                    and _gate_obj.object_type == "unknown"
+                    and _gate_obj.confidence < 0.5
+                )
+                _gate_garbled = False
+                try:
+                    from api.tools.system_tools import is_garbled_app_name as _gate_garbled_fn
+                    _gate_garbled = bool(_gate_garbled_fn(_gate_target))
+                except Exception:
+                    pass
+                _gate_poor_stt = isinstance(_gate_stt_conf, (int, float)) and _gate_stt_conf < -0.3
+                if _gate_garbled or (_gate_target_unknown and _gate_poor_stt):
+                    logger.warning(
+                        "[LOW_CONF_ACTION_BLOCKED] tool=open_application target=%r stt_conf=%s "
+                        "obj_type=%s obj_conf=%s reason=%s",
+                        _gate_target, _gate_stt_conf,
+                        _gate_obj.object_type if _gate_obj else "?",
+                        _gate_obj.confidence if _gate_obj else 0.0,
+                        "garbled_target" if _gate_garbled else "unknown_target+poor_stt",
+                    )
+                    # ── Rescue via local_comprehension before giving up ────────
+                    # Live-caught bug (2026-09-04 real backend log): for a
+                    # noisy Urdu sentence, mixed_language_engine's deterministic
+                    # canonicalization just prepends "open" to the WHOLE raw
+                    # transcript without stripping filler words ("چلو پھرکام
+                    # کرو YouTube کو کھولو" -> "open چلو پھرکام کرو YouTube
+                    # کو"), and intent_router's generic "open X" catch-all then
+                    # confidently (conf=1.00) matches that whole garbled string
+                    # as an app name. Because that confidence clears
+                    # orchestrator._route_intent's >=0.55 early-return
+                    # threshold, local_comprehension's OpenAI/Qwen
+                    # comprehension tier — the one actually built to parse
+                    # noisy/compound non-English sentences — never got a
+                    # chance to run at all; this gate caught the garbage
+                    # afterward but only apologized instead of trying the
+                    # tier that exists for exactly this case. Retry on the
+                    # ORIGINAL pre-canonicalization transcript now, before
+                    # giving up for real.
+                    _gate_rescued = False
+                    if _detected_ml not in ("en",):
+                        try:
+                            from api.services.local_comprehension import (
+                                comprehend as _gate_comprehend,
+                                validate_and_map as _gate_vmap,
+                            )
+                            from api.tools import registry as _gate_registry
+                            _gate_lc = await asyncio.to_thread(
+                                _gate_comprehend, _original_transcript, _detected_ml, _trace_id,
+                            )
+                            if _gate_lc:
+                                _gate_lc = _gate_vmap(_gate_lc, _gate_registry)
+                                if _gate_lc.mapped:
+                                    logger.info(
+                                        "[LOW_CONF_RESCUE_MAPPED] canonical=%r tool=%s conf=%.2f",
+                                        _gate_lc.canonical_text, _gate_lc.tool_name,
+                                        _gate_lc.route_confidence,
+                                    )
+                                    decision.tool_name   = _gate_lc.tool_name
+                                    decision.tool_params = _gate_lc.tool_params
+                                    decision.reason      = "low_conf_rescue_comprehension"
+                                    _gate_rescued = True
+                        except Exception as _gate_rescue_exc:
+                            logger.debug("[LOW_CONF_RESCUE_FAILED] error=%s", _gate_rescue_exc)
+
+                    if not _gate_rescued:
+                        if _session_state.get("ml_resp_lang", "en") in ("ur", "ur_roman", "mixed"):
+                            _clarify = "Sorry, ye command clear nahi hui — dobara bolenge?"
+                        else:
+                            _clarify = "Sorry, I didn't catch that clearly — could you say it again?"
+                        await _send(websocket, {"type": "response", "text": _clarify, "chunk": 1})
+                        await _tts_with_fallback(_clarify)
+                        await _send(websocket, {"type": "listening"})
+                        return
+                    # else: decision now holds the rescued tool/params — fall
+                    # through into the normal TOOL execution flow below.
+
             # Fix 3: Start tool execution IMMEDIATELY as a background task —
             # don't block on ACK synthesis before calling the OS.
             _tool_t0 = time.time()
             _tool_task = asyncio.create_task(
-                _run_tool(decision.tool_name, decision.tool_params, goal=transcript)
+                _run_tool(decision.tool_name, decision.tool_params, goal=transcript, trace_id=_trace_id)
             )
 
             # Fix 2 / Part 2 polish: build the ack while the tool runs in
@@ -4180,33 +4710,80 @@ async def ws_session(websocket: WebSocket) -> None:
             ):
                 try:
                     from api.services.tts_cache_service import tts_cache as _tcc
-                    _ack_text = _build_ack_text(decision.tool_name, decision.tool_params)
+                    _ack_text = _build_ack_text(
+                        decision.tool_name, decision.tool_params,
+                        emotion=_emo.emotion if _emo else None,
+                    )
                     # ── Localize ACK for non-English sessions ─────────────────────────
+                    # Use natural qwen generation first (varied, conversational),
+                    # fall back to template-based localization if qwen is
+                    # unavailable or too slow. This is what makes Xyron sound
+                    # natural instead of robotic in Urdu.
                     _ack_ml_lang = _session_state.get("ml_resp_lang", "en")
                     if _ack_ml_lang != "en":
                         try:
-                            from api.services.response_localizer import localize_response as _ack_loc
-                            _loc_ack = _ack_loc(_ack_text, _ack_ml_lang)
-                            if _loc_ack:
+                            from api.services.urdu_ack_generator import localize_with_fallback as _ack_loc_async
+                            _loc_ack = await _ack_loc_async(_ack_text, _ack_ml_lang, decision.tool_name)
+                            if _loc_ack and _loc_ack != _ack_text:
                                 logger.info("[ACK_LOCALIZED] %r → %r", _ack_text, _loc_ack)
                                 _ack_text = _loc_ack
                         except Exception:
                             pass
-                        # Non-English ACK: synthesize via XTTS (bypass Kokoro cache)
                         _ack_wav: Optional[bytes] = None
-                        try:
-                            from voice.tts_router import synthesize as _ack_route
-                            _ack_synth_t0 = time.time()
-                            _ack_wav = await asyncio.wait_for(
-                                asyncio.to_thread(_ack_route, _ack_text, _ack_ml_lang, voice),
-                                timeout=30.0,
-                            )
-                            _ack_synth_ms = (time.time() - _ack_synth_t0) * 1000
-                            logger.info("[ACK_SYNTH_ML_MS] ms=%.0f lang=%s text=%r",
-                                        _ack_synth_ms, _ack_ml_lang, _ack_text)
-                            _lat["tts"] = _ack_synth_ms
-                        except Exception as _xa:
-                            logger.warning("[ACK_ML_TTS_FAIL] lang=%s err=%s — no ACK audio", _ack_ml_lang, _xa)
+                        # Fast path: ur_roman/mixed deterministic tool acks
+                        # go through the local Kokoro cache/synth
+                        # (tts_cache_service.synthesize_or_cached_ml) — a
+                        # 380-400ms warm/cached-instant path — instead of
+                        # tts_router.synthesize()'s OpenAI-TTS-first routing
+                        # for this lang class, which measured ~2.3-2.5s per
+                        # ack live (2026-09-04). Pure Urdu script (lang ==
+                        # "ur") deliberately falls through to the unchanged
+                        # OpenAI/Edge-TTS path below — Kokoro can't render
+                        # Nastaliq script intelligibly (see tts_cache_service
+                        # .py's synthesize_or_cached_ml docstring).
+                        if _ack_ml_lang in ("ur_roman", "mixed"):
+                            try:
+                                from api.services.tts_cache_service import tts_cache as _ml_tcc
+                                _ack_fast_t0 = time.time()
+                                _ack_wav = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        _ml_tcc.synthesize_or_cached_ml, _ack_text, voice, speed, _ack_ml_lang,
+                                    ),
+                                    timeout=8.0,  # generous vs measured ~400ms warm / ~4.5s cold Kokoro load
+                                )
+                                _ack_synth_ms = (time.time() - _ack_fast_t0) * 1000
+                                logger.info("[ACK_SYNTH_FAST_MS] ms=%.0f lang=%s text=%r engine=kokoro_cache",
+                                            _ack_synth_ms, _ack_ml_lang, _ack_text)
+                                _lat["tts"] = _ack_synth_ms
+                            except Exception as _fast_exc:
+                                logger.warning("[ACK_FAST_TTS_FAIL] lang=%s err=%s — falling back to OpenAI/Edge",
+                                               _ack_ml_lang, _fast_exc)
+                                _ack_wav = None
+                        # Reached when: lang is "ur" (pure script — always
+                        # uses this path), OR lang is ur_roman/mixed but the
+                        # fast Kokoro path above genuinely failed (exception,
+                        # not just a cache miss — a cache miss already
+                        # synthesizes inline above and never leaves _ack_wav
+                        # None). A real fast-path failure is rare enough
+                        # that paying for one OpenAI/Edge-TTS call as a last
+                        # resort — rather than silently going ack-less — is
+                        # the right tradeoff; this is exactly "OpenAI TTS
+                        # only when needed" from the target policy, not a
+                        # reversion to OpenAI-first.
+                        if _ack_wav is None:
+                            try:
+                                from voice.tts_router import synthesize as _ack_route
+                                _ack_synth_t0 = time.time()
+                                _ack_wav = await asyncio.wait_for(
+                                    asyncio.to_thread(_ack_route, _ack_text, _ack_ml_lang, voice),
+                                    timeout=30.0,
+                                )
+                                _ack_synth_ms = (time.time() - _ack_synth_t0) * 1000
+                                logger.info("[ACK_SYNTH_ML_MS] ms=%.0f lang=%s text=%r",
+                                            _ack_synth_ms, _ack_ml_lang, _ack_text)
+                                _lat["tts"] = _ack_synth_ms
+                            except Exception as _xa:
+                                logger.warning("[ACK_ML_TTS_FAIL] lang=%s err=%s — no ACK audio", _ack_ml_lang, _xa)
                     else:
                         # English ACK: cache is keyed by (voice, text) — a
                         # hit is only ever returned for this exact session
@@ -4256,7 +4833,15 @@ async def ws_session(websocket: WebSocket) -> None:
             # that delta also spans the ack-synthesis block above and used to
             # misreport ack-wait time as tool_ms (e.g. tool_ms=9840 for a
             # 244ms tool while ack synthesis alone took 9817ms).
-            _lat["tool"] = _last_tool_exec_ms["ms"]
+            #
+            # Keyed by THIS turn's own _trace_id (see _last_tool_exec_ms's
+            # declaration comment for the cross-turn contamination this
+            # closes) — .pop() with a 0.0/True default so a lookup miss
+            # (tool call failed before ever writing, or trace_id somehow
+            # wasn't threaded through) degrades to the old "no data" value
+            # instead of raising, and so the dict never grows unbounded
+            # across a long-lived WS connection.
+            _lat["tool"] = _last_tool_exec_ms.pop(_trace_id, 0.0)
             if _perf_rec:
                 _perf_rec.set("tool", _lat["tool"])
 
@@ -4267,7 +4852,7 @@ async def ws_session(websocket: WebSocket) -> None:
                     "type":   "frontend_action",
                     "action": _FE_ACTIONS[decision.tool_name],
                 })
-            _tool_succeeded = _last_tool_success["ok"]
+            _tool_succeeded = _last_tool_success.pop(_trace_id, True)
             if _ack_spoken:
                 logger.info("[FINAL_RESPONSE_SKIPPED] reason=ack_already_spoken tool=%s", decision.tool_name)
                 interrupted = False
@@ -4294,7 +4879,10 @@ async def ws_session(websocket: WebSocket) -> None:
                 # open."), which a generic "Done."/"All set." fallback would
                 # otherwise silently clobber (live-measured regression).
                 if _tool_succeeded and decision.tool_name in _slow_tools:
-                    response_text = _build_completion_text(decision.tool_name, decision.tool_params)
+                    response_text = _build_completion_text(
+                        decision.tool_name, decision.tool_params,
+                        emotion=_emo.emotion if _emo else None,
+                    )
                 # User feedback: deterministic tool commands felt "scripted"
                 # — this fast path never touched personality_engine at all
                 # (only agent-driven flows like browser_agent/coding_agent
@@ -4322,20 +4910,42 @@ async def ws_session(websocket: WebSocket) -> None:
 
         # ── MULTI_STEP — compound command via planner ─────────────────────────
         elif decision.action == ActionType.MULTI_STEP:
-            from brain.planner import planner as _planner
+            from brain.planner import planner as _planner, Plan as _Plan, PlanStep as _PlanStep
             from brain.orchestrator import orchestrator as _o2, ActionType as _AT
 
             async def _step_fn(step_text: str, hist: list[dict]) -> str:
                 step_dec = await _o2.decide(step_text, hist)
                 if step_dec.action == _AT.TOOL:
-                    return await _run_tool(step_dec.tool_name, step_dec.tool_params, goal=step_text)
+                    return await _run_tool(step_dec.tool_name, step_dec.tool_params, goal=step_text, trace_id=_trace_id)
                 elif step_dec.action == _AT.MEMORY_REF and step_dec.tool_name:
-                    return await _run_tool(step_dec.tool_name, step_dec.tool_params, goal=step_text)
+                    return await _run_tool(step_dec.tool_name, step_dec.tool_params, goal=step_text, trace_id=_trace_id)
                 else:
                     from api.services.response_pipeline import quick_response
-                    return await quick_response(step_text, hist)
+                    return await quick_response(
+                        step_text, hist, response_lang=_session_state.get("ml_resp_lang", "en"),
+                    )
 
-            plan = _planner.build(transcript)
+            # Urdu/Roman-Urdu compound commands arrive with the canonical
+            # English steps ALREADY resolved (orchestrator.decide() —
+            # either the deterministic mixed_language_engine.split_compound
+            # path or the Tier-4 comprehend_multi() fallback; see
+            # decision.reason for which). Build the Plan directly from that
+            # list instead of _planner.build(transcript): transcript at
+            # this point is still the ORIGINAL (possibly Urdu-script)
+            # utterance, and planner.build()'s _SPLIT_RE only recognizes
+            # English connectors ("and then"/"also") — re-splitting on it
+            # would just fail to find >=2 parts and lose the compound
+            # entirely. Each canonical step below still goes back through
+            # _step_fn -> orchestrator.decide() -> intent_router/tool
+            # registry exactly like every other planner step, English or
+            # Urdu — no new execution path, same trust boundary.
+            _canonical_steps = decision.context.get("canonical_steps")
+            if _canonical_steps:
+                plan = _Plan([_PlanStep(index=i, text=s) for i, s in enumerate(_canonical_steps, 1)])
+                logger.info("[TRACE %s] [PLANNER_CANONICAL_STEPS] source=%s steps=%s",
+                            _trace_id, decision.context.get("compound_source", "?"), _canonical_steps)
+            else:
+                plan = _planner.build(transcript)
             if plan:
                 if _trace:
                     _trace.plan_steps = [s.text for s in plan.steps]
@@ -4371,7 +4981,7 @@ async def ws_session(websocket: WebSocket) -> None:
         )
 
         # ── Async: learning service + episodic recording (non-blocking) ───────
-        _bp_transcript = transcript
+        _bp_transcript = _session_state.get("last_original_transcript", transcript)
         _bp_tool       = decision.tool_name or ""
         _bp_response   = response_text or ""
         async def _post_dispatch_brain() -> None:
@@ -4379,7 +4989,11 @@ async def ws_session(websocket: WebSocket) -> None:
             if _bp_tool:
                 try:
                     from api.services.learning_service import learning_service as _ls
-                    _lr = _ls.record(_bp_transcript, _bp_tool)
+                    # sqlite3.connect() + read/write on every turn — was
+                    # running synchronously on the event loop thread, a real
+                    # contributor to the EVENT_LOOP_BLOCKER lag spikes seen
+                    # in [_post_dispatch_brain] task snapshots.
+                    _lr = await asyncio.to_thread(_ls.record, _bp_transcript, _bp_tool)
                     if _lr.has_suggestion:
                         logger.info("[LEARNING_PATTERN_DETECTED] tool=%s count=%d", _bp_tool, _lr.count)
                         logger.info("[LEARNING_SUGGESTION] %s", _lr.suggestion)
@@ -4416,6 +5030,32 @@ async def ws_session(websocket: WebSocket) -> None:
         _turn_total_ms = _tl["perf_total"]
         logger.info("[PERF_TOTAL] turn=%d ms=%.0f interrupted=%s", my_turn, _turn_total_ms, interrupted)
         logger.info("[TOTAL_PIPELINE] turn=%d ms=%.0f", my_turn, _turn_total_ms)
+        # ── Structured multilingual-turn summary — one line per turn, for
+        # pairing real-speech manual test runs against exactly what the
+        # pipeline decided (see MULTILINGUAL_MANUAL_VALIDATION.md). Every
+        # field is read defensively (session_state/locals may be unset on
+        # early-return turns that never reach this point) so this can never
+        # itself break a turn.
+        try:
+            _mlt_resp_lang = _session_state.get("ml_resp_lang", "en")
+            logger.info(
+                "[ML_TURN] original=%r stt_model=%s stt_conf=%.2f detected_lang=%s "
+                "normalized=%r fast_path=%s local_qwen_used=%s intent=%s "
+                "response_lang=%s tts_engine=%s total_ms=%.0f",
+                (_session_state.get("last_original_transcript", "") or "")[:80],
+                locals().get("_stt_model", "?"),
+                (result.get("confidence", -999.0) if isinstance(locals().get("result"), dict) else -999.0),
+                _session_state.get("ml_detected_lang", "en"),
+                (transcript or "")[:80],
+                decision.tier <= 2 if "decision" in locals() and decision else "?",
+                decision.context.get("local_qwen_used", False) if "decision" in locals() and decision else False,
+                (decision.tool_name or decision.action.name) if "decision" in locals() and decision else "?",
+                _mlt_resp_lang,
+                "kokoro" if _mlt_resp_lang == "en" else "xtts_or_kokoro_fallback(see ML_TTS_WARM_HIT/XTTS_FALLBACK logs)",
+                _turn_total_ms,
+            )
+        except Exception as _mlt_exc:
+            logger.debug("[ML_TURN] logging skipped: %s", _mlt_exc)
         # Timeline: show ms-from-turn-start at each checkpoint to find hidden gaps
         _tl_parts = " ".join(f"{k}={v:.0f}" for k, v in _tl.items())
         logger.info("[V_TIMELINE] %s", _tl_parts)
@@ -4878,6 +5518,15 @@ async def ws_session(websocket: WebSocket) -> None:
     finally:
         try:
             _narration_task.cancel()
+        except Exception:
+            pass
+        try:
+            _wa_announce_task.cancel()
+        except Exception:
+            pass
+        try:
+            from api.services import voice_announcer as _voice_announcer_cleanup
+            _voice_announcer_cleanup.unregister(asyncio.get_event_loop())
         except Exception:
             pass
         try:

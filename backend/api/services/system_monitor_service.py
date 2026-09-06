@@ -9,8 +9,8 @@ Architecture
   (wmic is removed in Windows 11 22H2+, so we use Get-Counter / CimInstance)
 
   Threads:
-    sysmon-winfast  — Get-Counter CPU (1s sample) + CimInstance RAM every 2 s
-    sysmon-slow     — GPU (nvidia-smi → all-engine counter) + disk every 10 s
+    sysmon-winfast  — Get-Counter CPU (1s sample) + CimInstance RAM every 5 s
+    sysmon-slow     — GPU (nvidia-smi → all-engine counter) + disk every 20 s
     sysmon-static   — one-shot: CPU name, core count, OS, hostname, boot time
     sysmon-loop     — 1 Hz tick: merges cached Windows values with psutil
                       battery/net/uptime, then pushes to WS subscribers
@@ -43,8 +43,13 @@ MiB = 1024 ** 2
 KiB = 1024
 
 HISTORY_LEN       = 60   # sparkline history depth (seconds)
-WIN_FAST_TTL      = 5.0  # treat cached Windows sample stale after 5 s
-WIN_FAST_INTERVAL = 2.0  # re-query Windows every 2 s
+WIN_FAST_TTL      = 8.0  # treat cached Windows sample stale after 8 s
+# Perf fix: was 2.0 s — each refresh spawns powershell.exe running a 1 s
+# Get-Counter sample, which kept the (4-core) host pinned at 83–99% CPU during
+# voice sessions and starved the event loop (EVENT_LOOP_BLOCKER lag>1.2s,
+# one turn measured at 11.3 s). 5 s keeps the dashboard reasonably fresh at
+# a fraction of the cost. (WIN_FAST_TTL raised to match.)
+WIN_FAST_INTERVAL = 5.0  # re-query Windows every 5 s
 
 _PS = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
 
@@ -502,7 +507,7 @@ class SystemMonitorService:
             self._last_win_fast_refresh = now
             threading.Thread(target=self._collect_windows_fast, daemon=True,
                              name="sysmon-winfast").start()
-        if now - self._last_slow_refresh >= 10.0:
+        if now - self._last_slow_refresh >= 20.0:
             self._last_slow_refresh = now
             threading.Thread(target=self._collect_slow, daemon=True,
                              name="sysmon-slow").start()

@@ -185,7 +185,14 @@ _CANCEL_RE = re.compile(
 
 
 def is_cancel_phrase(text: str) -> bool:
-    return bool(_CANCEL_RE.search(text.strip()))
+    if _CANCEL_RE.search(text.strip()):
+        return True
+    # Roman Urdu / Urdu-script cancel words ("nahi", "rehne do", "نہیں") go
+    # through the ONE shared approval/cancel classifier — see
+    # api.services.approval_intent module docstring for why this isn't a
+    # second, Urdu-only cancel regex living here instead.
+    from api.services.approval_intent import parse_yes_no
+    return parse_yes_no(text) == "no"
 
 
 def store_context_active(active_ctx: dict[str, Any], session_state: dict) -> bool:

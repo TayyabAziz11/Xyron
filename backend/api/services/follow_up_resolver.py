@@ -51,9 +51,14 @@ _ORDINAL_SELECTION_RE = re.compile(
 # searching for the word "it". Live bug: "now play it." after "open youtube"
 # → "play a song called believer" was matching here with group(1)=="it",
 # producing search_youtube(query="it") instead of replaying believer.
+# Same guard for activity-memory recall phrasings ("play the same songs you
+# played yesterday") — those must reach voice_ws Tier 0m, not become a literal
+# search for the whole sentence.
 _PLAY_RE = re.compile(
     r'^(?:play|watch|listen\s+to)[,\s]+'
     r'(?!(?:it|this|that|these|those|them)\s*[.!]?\s*$)'
+    r'(?!the\s+same\b)'
+    r'(?!.*\byou\s+(?:played|were\s+playing)\b)'
     r'(.+)$',
     re.IGNORECASE,
 )

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Optional
@@ -78,6 +79,8 @@ class Orchestrator:
         self,
         transcript: str,
         history:    list[dict] | None = None,
+        detected_language: str = "en",
+        trace_id: str = "",
     ) -> OrchestratorDecision:
         t = transcript.strip()
 
@@ -114,12 +117,56 @@ class Orchestrator:
         if mem:
             return mem
 
-        # 6. Intent routing → tool
-        tool_dec = await self._route_intent(t)
+        # 6. Compound-command detection (Urdu/Roman-Urdu) — deterministic,
+        # MUST run before step 7's single-shot intent routing. A garbled
+        # compound transcript's single-shot intent_router match (e.g. the
+        # whole remaining string mis-swallowed whole as an
+        # open_application app_name, at confidence 1.0) wins and returns
+        # immediately at step 7 below — step 8's English-only
+        # _MULTISTEP_RE would never even get a chance to fire, since it's
+        # only checked AFTER step 7 already failed to find a tool. Live
+        # bug this closes (2026-09-04 real backend log): "YouTube کو کھولو
+        # اور کوئی گانا چلا دو" ("open YouTube and play some song")
+        # collapsed to a single "open YouTube" action — the second half
+        # was silently discarded. See
+        # mixed_language_engine.split_compound()'s docstring for the full
+        # mechanism. English is completely untouched: split_compound() is
+        # gated on detected_language != "en" and returns None immediately
+        # for English input, so this step is a no-op there.
+        if detected_language not in ("en",):
+            try:
+                from api.services.mixed_language_engine import split_compound as _mle_split_compound
+                _canonical_steps = _mle_split_compound(t, detected_language, trace_id)
+                if _canonical_steps:
+                    logger.info(
+                        "[ORCHESTRATOR] MULTI_STEP via deterministic compound split steps=%s",
+                        _canonical_steps,
+                    )
+                    return OrchestratorDecision(
+                        action=ActionType.MULTI_STEP,
+                        context={"canonical_steps": _canonical_steps, "transcript": t,
+                                 "compound_source": "deterministic"},
+                        reason="urdu_compound_split",
+                    )
+            except Exception as _split_exc:
+                logger.debug("[ORCHESTRATOR] compound split error: %s", _split_exc)
+
+        # 7. Intent routing → tool
+        tool_dec = await self._route_intent(t, detected_language, trace_id)
         if tool_dec and tool_dec.action == ActionType.TOOL:
             return tool_dec
+        if tool_dec and tool_dec.action == ActionType.MULTI_STEP:
+            # Tier 4 (comprehend_multi(), inside _route_intent below)
+            # resolved >=2 confident intents where the deterministic
+            # splitter above could not. Same MULTI_STEP shape either way —
+            # the caller (voice_ws.py) doesn't need to know which tier
+            # produced canonical_steps.
+            return tool_dec
 
-        # 7. Multi-step compound command
+        # 8. Multi-step compound command (English-only connector marker —
+        # unchanged, still the fallback for "create X and then open it"
+        # style English compounds that never go through split_compound()
+        # above since detected_language == "en" short-circuits it).
         if _MULTISTEP_RE.search(t):
             logger.info("[ORCHESTRATOR] MULTI_STEP transcript=%r", t[:60])
             return OrchestratorDecision(
@@ -130,9 +177,20 @@ class Orchestrator:
 
         # 8. LLM fallback
         model_hint = (tool_dec.context.get("model") if tool_dec else None) or "gpt-4o-mini"
+        # _route_intent's context (local_qwen_used/local_qwen_ms) would
+        # otherwise be silently discarded here — only tool_dec.action ==
+        # ActionType.TOOL is ever returned directly above, so an LLM-bound
+        # tool_dec (Qwen understood the intent but it had no safe tool
+        # mapping — e.g. compare_records) loses that telemetry unless it's
+        # carried forward explicitly, same as model_hint already is.
+        _llm_context = {"model": model_hint}
+        if tool_dec:
+            _llm_context["local_qwen_used"] = tool_dec.context.get("local_qwen_used", False)
+            if "local_qwen_ms" in tool_dec.context:
+                _llm_context["local_qwen_ms"] = tool_dec.context["local_qwen_ms"]
         return OrchestratorDecision(
             action=ActionType.LLM,
-            context={"model": model_hint},
+            context=_llm_context,
             reason=tool_dec.reason if tool_dec else "llm_fallback",
         )
 
@@ -144,10 +202,13 @@ class Orchestrator:
             refs = await asyncio.to_thread(_cm.resolve_references, transcript)
 
             if refs.get("is_delete_ref") and refs.get("resolved_paths"):
+                # NOTE: voice_ws.py's MEMORY_REF handler gates this behind a
+                # spoken confirmation before calling delete_file — never
+                # execute a pronoun-resolved delete straight from here.
                 return OrchestratorDecision(
                     action=ActionType.MEMORY_REF,
                     tool_name="delete_file",
-                    tool_params={"paths": refs["resolved_paths"], "confirmed": True},
+                    tool_params={"paths": refs["resolved_paths"]},
                     confidence=1.0,
                     context={"refs": refs},
                     reason="memory_delete_ref",
@@ -180,7 +241,9 @@ class Orchestrator:
             logger.debug("[ORCHESTRATOR] memory ref check error: %s", exc)
         return None
 
-    async def _route_intent(self, transcript: str) -> Optional[OrchestratorDecision]:
+    async def _route_intent(
+        self, transcript: str, detected_language: str = "en", trace_id: str = "",
+    ) -> Optional[OrchestratorDecision]:
         try:
             from api.services.intent_router import intent_router as _ir
             from api.tools import registry as _registry
@@ -198,13 +261,107 @@ class Orchestrator:
                     tool_params=route.params,
                     confidence=route.confidence,
                     tier=route.tier,
-                    context={"model": model},
+                    context={"model": model, "local_qwen_used": False},
                     reason="intent_router",
                 )
 
+            # Deterministic routing found nothing confident enough. Only for
+            # non-English/mixed input (the case that actually motivated it,
+            # and where a keyword-only router is weakest) try the local
+            # Qwen/OpenAI fallback before giving up to the general LLM path
+            # — it NEVER executes a tool itself, only proposes structured
+            # intent(s) that get validated against the real tool registry.
+            #
+            # comprehend_multi() ALWAYS asks for the compound-aware
+            # "intents" schema (local_comprehension._SYSTEM_PROMPT_COMPOUND)
+            # — a single-action utterance still comes back as a 1-element
+            # list, handled below with EXACTLY the same TOOL/LLM decision
+            # shape this returned before compound support existed (see
+            # TestOrchestratorLocalQwenCanonicalizationWiring in
+            # test_multilingual_pipeline.py for the contract this
+            # preserves). A >=2-element list is the compound path.
+            _qwen_invoked = False  # True as soon as comprehend_multi() actually
+                                    # runs, regardless of whether it ends up
+                                    # mapped to a tool — this is what the
+                                    # manual-validation [ML_TURN] log means by
+                                    # "was Qwen used", not "did its output
+                                    # execute a tool".
+            _qwen_ms: float = 0.0
+            if detected_language not in ("en",):
+                try:
+                    from api.services.local_comprehension import comprehend_multi, validate_and_map
+                    _lc_t0 = time.monotonic()
+                    lc_results = await asyncio.to_thread(comprehend_multi, transcript, detected_language, trace_id)
+                    _qwen_ms = (time.monotonic() - _lc_t0) * 1000
+                    if lc_results:
+                        _qwen_invoked = True
+                        mapped_results = []
+                        for lc_result in lc_results:
+                            lc_result = validate_and_map(lc_result, _registry)
+                            if lc_result.mapped:
+                                mapped_results.append(lc_result)
+
+                        if len(lc_results) == 1:
+                            if mapped_results:
+                                lc_result = mapped_results[0]
+                                logger.info(
+                                    "[ORCHESTRATOR] TOOL via local_qwen_canonicalization canonical=%r tool=%s "
+                                    "route_conf=%.2f ms=%.0f",
+                                    lc_result.canonical_text, lc_result.tool_name,
+                                    lc_result.route_confidence, _qwen_ms,
+                                )
+                                return OrchestratorDecision(
+                                    action=ActionType.TOOL,
+                                    tool_name=lc_result.tool_name,
+                                    tool_params=lc_result.tool_params,
+                                    confidence=lc_result.route_confidence,
+                                    tier=4,
+                                    context={"model": model, "local_qwen_used": True, "local_qwen_ms": _qwen_ms},
+                                    reason="local_qwen_canonicalization",
+                                )
+                            logger.info(
+                                "[ORCHESTRATOR] local_qwen understood but unmapped action=%s — falling to LLM",
+                                lc_results[0].action,
+                            )
+                        else:
+                            # Compound path — only proceed if EVERY proposed
+                            # intent mapped to a confident tool. Running a
+                            # partial subset (some clauses mapped, others
+                            # didn't) would silently drop part of what the
+                            # user asked for. Never execute only the
+                            # clauses that happened to parse — fail through
+                            # to the general LLM path instead, exactly like
+                            # an unmapped single intent already does.
+                            if len(mapped_results) == len(lc_results):
+                                _canonical_steps = [r.canonical_text for r in mapped_results]
+                                logger.info(
+                                    "[ORCHESTRATOR] MULTI_STEP via local_qwen_compound_canonicalization "
+                                    "steps=%s ms=%.0f",
+                                    _canonical_steps, _qwen_ms,
+                                )
+                                return OrchestratorDecision(
+                                    action=ActionType.MULTI_STEP,
+                                    context={
+                                        "canonical_steps": _canonical_steps, "transcript": transcript,
+                                        "compound_source": "qwen_or_openai", "local_qwen_used": True,
+                                        "local_qwen_ms": _qwen_ms,
+                                    },
+                                    reason="local_qwen_compound_canonicalization",
+                                )
+                            logger.info(
+                                "[ORCHESTRATOR] local_qwen compound partially unmapped (%d/%d) — "
+                                "falling to LLM rather than dropping a clause",
+                                len(mapped_results), len(lc_results),
+                            )
+                except Exception as _lc_exc:
+                    logger.debug("[ORCHESTRATOR] local_qwen comprehension error: %s", _lc_exc)
+
             return OrchestratorDecision(
                 action=ActionType.LLM,
-                context={"model": model, "low_conf_tool": route.tool_name},
+                context={
+                    "model": model, "low_conf_tool": route.tool_name,
+                    "local_qwen_used": _qwen_invoked, "local_qwen_ms": _qwen_ms,
+                },
                 reason="low_confidence",
             )
         except Exception as exc:

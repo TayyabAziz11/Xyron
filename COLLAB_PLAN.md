@@ -323,3 +323,4 @@ pytest tests/ -v
 | **VAD** | Voice Activity Detection — filters silence before Whisper |
 | **rapidfuzz** | Fast fuzzy string matching library used for file search |
 | **Tauri** | Rust + WebView2 framework for native desktop app |
+kend

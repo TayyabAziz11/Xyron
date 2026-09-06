@@ -588,16 +588,23 @@ export function useVoiceWS() {
         window.dispatchEvent(new Event('xyron:session-start'))
 
         // Brief yield: give GStreamer time to settle before attaching mic.
-        await new Promise<void>(r => setTimeout(r, 250))
+        // Was 250ms — trimmed since this mostly overlaps with the server's
+        // own greeting synth/playback window anyway (server doesn't start
+        // reading PCM into VAD until the greeting-wait loop exits regardless
+        // of this flag), and every ms here is dead time on the greeting-
+        // disabled/failed path where this IS the only gate before listening.
+        await new Promise<void>(r => setTimeout(r, 120))
         if (!aliveRef.current) return
 
         // Start mic but keep stabilization gate open — dirty frames from wake-word
-        // pipeline teardown are silently dropped for 400ms.
+        // pipeline teardown are silently dropped briefly. Was 400ms; shortened
+        // for the same reason as above — still enough to clear teardown noise,
+        // just less arbitrary margin stacked onto every single activation.
         stabilizingRef.current = true
-        log('AUDIO_STABILIZE_START', 'dropping frames for 400ms post-wake')
+        log('AUDIO_STABILIZE_START', 'dropping frames briefly post-wake')
         const ok = await startMic()
         if (ok) {
-          await new Promise<void>(r => setTimeout(r, 400))
+          await new Promise<void>(r => setTimeout(r, 200))
           stabilizingRef.current = false
           log('AUDIO_STABILIZE_END', 'mic buffer flushed — VAD now armed')
         }

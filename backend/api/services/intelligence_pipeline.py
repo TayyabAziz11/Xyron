@@ -84,6 +84,9 @@ def _update_language_memory(detected_lang: str, session_state: dict) -> None:
                 dominant, memory[dominant],
             )
             session_state["ml_detected_lang"] = dominant
+            # Memory-dominant is deliberate multilingual evidence — give it a
+            # high conf so hybrid_stt_router's confidence gate honors it.
+            session_state["ml_detected_lang_conf"] = 0.95
 
 
 # ── Skip heuristic ────────────────────────────────────────────────────────────
@@ -114,6 +117,7 @@ async def process(
     session_state: dict,
     secondary_result: Optional[dict] = None,
     audio_dur_ms: float = 0.0,
+    trace_id: str = "",
 ) -> IntelligenceResult:
     """
     Run the Phase 2 intelligence pipeline on a Whisper STT result.
@@ -123,6 +127,10 @@ async def process(
         session_state:    current WebSocket session state dict (mutated in-place for lang_memory)
         secondary_result: optional fast-model result (tiny.en) if available
         audio_dur_ms:     audio duration for logging
+        trace_id:         per-turn trace ID (api.services.tracer) — passed through
+                          to mixed_language_engine.analyze() so its
+                          [MIXED_LANGUAGE] log can be correlated with the
+                          rest of this turn's logs.
 
     Returns:
         IntelligenceResult with winner_text (possibly improved transcript)
@@ -177,12 +185,46 @@ async def process(
 
     # ── Phase 2.5: Mixed-language pre-pass ────────────────────────────────────
     mixed_canonical: Optional[str] = None
+    _is_compound = False
     if detected_lang not in ("en",):
         try:
-            from api.services.mixed_language_engine import analyze as _mixed_analyze
-            mixed_canonical = _mixed_analyze(original_text, detected_lang)
+            from api.services.mixed_language_engine import (
+                analyze as _mixed_analyze,
+                split_compound as _mixed_split_compound,
+            )
+            # Compound check FIRST. analyze() takes the FIRST _VERB_MAP
+            # pattern that matches ANYWHERE in the text and canonicalizes
+            # only that one action — on a compound utterance ("YouTube کو
+            # کھولو اور کوئی گانا چلا دو") it silently collapses to a
+            # single garbled canonical and DISCARDS the rest. If this were
+            # allowed to override winner_text below (the unconditional-for-
+            # non-English override a few lines down), orchestrator.decide()
+            # downstream would receive an already-mangled, no-longer-
+            # splittable string, and its OWN split_compound() call (see
+            # brain/orchestrator.py) would never get a fair shot at the
+            # real original wording — the exact live-caught bug
+            # (2026-09-04) this whole change closes. So: when the
+            # utterance IS a confident compound, skip the single-shot
+            # analyze()/override entirely and let winner_text stay as the
+            # untouched original_text (see the override block below),
+            # so orchestrator sees clean, splittable input.
+            _compound_steps = _mixed_split_compound(original_text, detected_lang, trace_id=trace_id)
+            if _compound_steps:
+                _is_compound = True
+                logger.info(
+                    "[INTEL_MIXED_COMPOUND] original=%r steps=%s — skipping single-shot override",
+                    original_text[:60], _compound_steps,
+                )
+            else:
+                mixed_canonical = _mixed_analyze(original_text, detected_lang, trace_id=trace_id)
             if mixed_canonical:
                 logger.info("[INTEL_MIXED] %r → %r", original_text[:60], mixed_canonical[:60])
+                logger.info(
+                    "[ML_CANONICALIZATION] original=%r lang=%s method=deterministic "
+                    "canonical=%r confidence=%.2f context_refs=none latency_ms=%.0f",
+                    original_text[:80], detected_lang, mixed_canonical[:80],
+                    lang_confidence, (time.monotonic() - t0) * 1000,
+                )
         except Exception as _me:
             logger.debug("[INTEL] mixed_language failed: %s", _me)
 
@@ -238,7 +280,11 @@ async def process(
     try:
         from api.services.context_resolver import resolve as _ctx_resolve
         _session_id = session_state.get("session_id", "")
-        repaired = _ctx_resolve(winner_text, _session_id)
+        # Was the one synchronous call left in this otherwise fully-threaded
+        # pipeline — can trigger a blocking PowerShell round-trip via
+        # window_context (for "close/minimize/switch to..." style phrasing)
+        # directly on the event loop thread. Thread it like every other step.
+        repaired = await asyncio.to_thread(_ctx_resolve, winner_text, _session_id)
         if repaired != winner_text:
             logger.info("[INTEL_CTX_REPAIR] %r → %r", winner_text[:60], repaired[:60])
             winner_text = repaired
@@ -248,7 +294,17 @@ async def process(
     # ── Mixed-language override ────────────────────────────────────────────────
     # If mixed engine produced a canonical and it looks more actionable than the
     # voted winner, prefer it.
-    if mixed_canonical:
+    if _is_compound:
+        # See the Phase 2.5 comment above: a confident compound split means
+        # the single-shot mixed_canonical was never computed. Reset
+        # winner_text to the clean original transcript rather than
+        # whatever N-best voting/context-repair produced — orchestrator's
+        # own split_compound() call downstream needs the real original
+        # wording (connectors intact) to split correctly, not a
+        # candidate-voted/context-repaired variant that was never
+        # validated against compound input.
+        winner_text = original_text
+    elif mixed_canonical:
         from api.services.candidate_scorer import _tool_confidence
         mc_conf = _tool_confidence(mixed_canonical)
         wt_conf = _tool_confidence(winner_text)

@@ -23,7 +23,7 @@
   ],
   "completion_message": "VS Code and GitHub are open — looks like we're on {project}. What are we building today?",
   "steps": [
-    { "action": "open_app", "app_name": "vscode", "delay": 1.5 },
-    { "action": "desktop.open_url", "url": "https://github.com/TayyabAziz11", "delay": 1.0 }
+    { "action": "open_app", "app_name": "vscode", "delay": 0.6 },
+    { "action": "desktop.open_url", "url": "https://github.com/TayyabAziz11", "delay": 0.5 }
   ]
 }

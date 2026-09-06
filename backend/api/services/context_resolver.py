@@ -45,9 +45,24 @@ _URL_CMD_RE = re.compile(
 _VAGUE_RE = re.compile(
     r'\b(it|this|that|them|these|those|the\s+file|the\s+folder|the\s+video|'
     r'the\s+app|the\s+document|that\s+file|that\s+folder|that\s+video|'
-    r'that\s+app|the\s+same(?:\s+one)?)\b',
+    r'that\s+app|the\s+same(?:\s+one)?|'
+    # Roman Urdu / Urdu-script pronoun references — only the longer,
+    # unambiguous forms (never bare "is"/"us", which collide with common
+    # English words). Handles bare no-verb follow-ups like "Isko." or
+    # "Wo wala." that reach this resolver before mixed_language_engine gets
+    # a chance to normalize them (mixed_language_engine only fires when a
+    # verb is also present in the same utterance — see its module docstring).
+    r'isko|usko|isay|usay|issay|ussay|'
+    r'yeh\s+wala|ye\s+wala|yehi\s+wala|woh\s+wala|wo\s+wala|wohi\s+wala|wahi\s+wala|'
+    r'اسے|یہ\s*والا|یہ\s*والی|وہ\s*والا|وہ\s*والی)\b',
     re.IGNORECASE,
 )
+
+# Roman Urdu / Urdu-script ordinal words — same disambiguation-list
+# selection as English "the first one" (see _ORDINAL_RE below), just a
+# different vocabulary. Mapped into the same _ORDINAL_MAP indices.
+_ROMAN_ORDINAL_WORDS = r'pehla|pehli|doosra|dusra|doosri|dusri|teesra|teesri|chautha|chauthi'
+_URDU_ORDINAL_WORDS  = r'پہلا|پہلی|دوسرا|دوسری|تیسرا|تیسری|چوتھا|چوتھی'
 
 # Commands where "the folder" is part of the syntax, NOT a vague pronoun.
 # Context resolution must be skipped for these to avoid corrupting the intent.
@@ -146,16 +161,22 @@ def _typed_slot_entity(text: str) -> str | None:
 
 _ORDINAL_RE = re.compile(
     r'\b(?:'
-    r'(?:the\s+)?(?P<word>first|second|third|fourth|1st|2nd|3rd|4th)'
+    r'(?:the\s+)?(?P<word>first|second|third|fourth|1st|2nd|3rd|4th|'
+    + _ROMAN_ORDINAL_WORDS + r'|' + _URDU_ORDINAL_WORDS +
+    r')'
     r'|(?:number|no\.?)\s+(?P<digit>[1-4])'
     r'|open\s+(?P<nopen>[1-4])'
-    r')\s*(?:one|option|result|folder|file|match)?\b',
+    r')\s*(?:one|option|result|folder|file|match|wala|wali)?\b',
     re.IGNORECASE,
 )
 
 _ORDINAL_MAP = {
     "1st": 0, "first": 0, "2nd": 1, "second": 1,
     "3rd": 2, "third": 2, "4th": 3, "fourth": 3,
+    "pehla": 0, "pehli": 0, "پہلا": 0, "پہلی": 0,
+    "doosra": 1, "dusra": 1, "doosri": 1, "dusri": 1, "دوسرا": 1, "دوسری": 1,
+    "teesra": 2, "teesri": 2, "تیسرا": 2, "تیسری": 2,
+    "chautha": 3, "chauthi": 3, "چوتھا": 3, "چوتھی": 3,
 }
 
 

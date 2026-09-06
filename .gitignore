@@ -76,6 +76,11 @@ backend/data/voice_tests/
 .secrets/whatsapp_session/
 .secrets/whatsapp_session_meta.json
 .secrets/whatsapp_openwa_session/
+# WhatsApp runtime state (real contact names/phone numbers/chat history — never commit)
+backend/data/whatsapp_context.json
+backend/data/whatsapp_identities.json
+backend/data/whatsapp_send_idempotency.db
+backend/data/_test_temp/
 # WhatsApp sidecar (Node) — deps + secrets, never commit
 backend/integrations/whatsapp/sidecar/node_modules/
 backend/integrations/whatsapp/sidecar/.env

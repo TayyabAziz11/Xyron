@@ -94,33 +94,50 @@ def _exec_list_approvals(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolRes
 
 
 def _exec_general_query(params: Dict[str, Any], ctx: Dict[str, Any]) -> ToolResult:
-    query    = params.get("query", "").strip()
-    openai_k = ctx.get("openai_key", "")
+    """Answer a free-form request. Local-first: works with OPENAI_API_KEY
+    absent or quota-exhausted via openai_client's Ollama fallback (qwen2.5:1.5b
+    by default — see api.services.openai_client.LOCAL_OLLAMA_MODEL), and
+    replies in the caller's detected session language instead of always
+    English. Previously this hard-required an OpenAI key and echoed the raw
+    query back ("I heard: ...") when one wasn't present — that broke complex
+    Urdu/Roman-Urdu requests whenever OpenAI was unavailable.
+    """
+    query         = params.get("query", "").strip()
+    response_lang = ctx.get("response_lang", "en")
 
-    if not openai_k:
-        return ToolResult(success=True, text=f"Processed: {query}", spoken=f"I heard: {query}")
+    mem_ctx = ""
+    try:
+        from ..services.memory_service import memory_service
+        mem_ctx = memory_service.get_context_string()
+    except Exception:
+        pass
 
     try:
-        from openai import OpenAI
-        # Inject memory context
-        mem_ctx = ""
-        try:
-            from ..services.memory_service import memory_service
-            mem_ctx = memory_service.get_context_string()
-        except Exception:
-            pass
+        from ..services.response_pipeline import _LANG_REPLY_INSTRUCTIONS
+        lang_instr = _LANG_REPLY_INSTRUCTIONS.get(response_lang, _LANG_REPLY_INSTRUCTIONS["en"])
+    except Exception:
+        lang_instr = "Reply in plain English only."
 
-        system = CORE_IDENTITY + "\nAnswer in 1-3 concise sentences. No markdown."
-        if mem_ctx:
-            system += f"\n\n{mem_ctx}"
+    system = CORE_IDENTITY + f"\nAnswer in 1-3 concise sentences. No markdown. {lang_instr}"
+    if mem_ctx:
+        system += f"\n\n{mem_ctx}"
 
-        resp = OpenAI(api_key=openai_k).chat.completions.create(
+    try:
+        from ..services.openai_client import openai_client
+        answer = openai_client.generate(
+            [{"role": "system", "content": system}, {"role": "user", "content": query}],
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": query}],
             max_tokens=150,
         )
-        answer = resp.choices[0].message.content or query
-        return ToolResult(success=True, text=answer, spoken=answer)
+        if answer:
+            return ToolResult(success=True, text=answer, spoken=answer)
+        # Both OpenAI (absent/quota) and Ollama (unavailable) failed — this is
+        # a genuine infra outage, not a language gap, so a clear apology beats
+        # silently executing nothing.
+        return ToolResult(
+            success=False, text="", spoken="I couldn't reach any language model right now.",
+            error="openai_and_ollama_unavailable",
+        )
     except Exception as exc:
         return ToolResult(success=False, text=str(exc), spoken="Couldn't answer that.", error=str(exc))
 

@@ -39,27 +39,40 @@ Add to `~/.claude/mcp_config.json`:
 
 ## Available tools
 
-| Tool | Type | Description |
-|------|------|-------------|
-| `get_messages` | Perception | Fetch unread WhatsApp messages |
-| `find_chat` | Perception | Search for a chat by name or phone |
-| `open_chat` | Perception | Open a chat and read recent messages |
-| `mark_read` | Action | Mark a chat as read |
-| `send_message` | **ACTION** | Send a message — requires approved plan |
-| `healthcheck` | Utility | Check WhatsApp Web connection status |
+| Tool | Type | Engine | Description |
+|------|------|--------|-------------|
+| `get_messages` | Perception | Playwright | Fetch unread WhatsApp messages |
+| `find_chat` | Perception | Playwright | Search for a chat by name or phone |
+| `open_chat` | Perception | Playwright | Open a chat and read recent messages |
+| `mark_read` | Action | Playwright | Mark a chat as read |
+| `send_message` | **ACTION** | open-wa | Send a text message — requires approved plan |
+| `send_file` | **ACTION** | open-wa | Send a document — requires approved plan |
+| `send_image` | **ACTION** | open-wa | Send an image — requires approved plan |
+| `reply_to_message` | **ACTION** | open-wa | Send a quoted reply — requires approved plan |
+| `healthcheck` | Utility | open-wa | Check the open-wa sidecar/session status |
+
+Two engines are intentionally live side by side as of Step 1: perception
+tools stay on the original Playwright `WhatsAppWebClient` (unchanged), while
+outbound/health tools were migrated to `OpenWATransport` — an HTTP client to
+a local open-wa sidecar — because open-wa ships file/image/reply support
+that the Playwright client didn't, without hand-rolling fragile DOM
+automation for it. See `backend/api/integrations/whatsapp/` for the
+transport interface and `backend/integrations/whatsapp/sidecar/` for the
+sidecar itself.
 
 ## Architecture
 
 ```
 Claude CLI
     │
-    ├─ get_messages / find_chat / open_chat   ← PERCEPTION-ONLY
+    ├─ get_messages / find_chat / open_chat / mark_read   ← Playwright, unchanged
     │       │
     │       └─ WhatsAppWebClient (Playwright) → WhatsApp Web
     │
-    └─ send_message                           ← ACTION (requires approved plan)
+    └─ send_message / send_file / send_image /             ← ACTION (requires approved plan)
+       reply_to_message / healthcheck
             │
-            └─ WhatsAppWebClient.send_message() → WhatsApp Web
+            └─ OpenWATransport (HTTP) → open-wa sidecar → WhatsApp Web
 ```
 
 **Safety pipeline (Gold Tier):**

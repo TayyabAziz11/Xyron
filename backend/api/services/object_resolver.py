@@ -202,6 +202,28 @@ def _looks_like_known_app(name: str) -> bool:
         return False
 
 
+# Known websites — mirrors web_tools._URL_MAP (kept local to avoid importing
+# the tool layer into this hot-path service). Real-mic Urdu test Issue 6:
+# "open youtube" used to resolve as type=unknown and masquerade as an
+# unknown application launch; classifying it as a website lets the shared
+# routing layer pick the browser/site path deliberately.
+_KNOWN_WEBSITES = frozenset({
+    "youtube", "yt", "gmail", "google", "github", "twitter", "x",
+    "linkedin", "netflix", "reddit", "amazon", "chatgpt", "facebook",
+    "instagram", "wikipedia", "whatsapp",
+})
+
+
+def _looks_like_known_website(name: str) -> bool:
+    n = name.lower().strip().rstrip(".")
+    if n in _KNOWN_WEBSITES:
+        return True
+    return (
+        n.startswith(("http://", "https://", "www."))
+        or n.endswith((".com", ".org", ".net", ".io", ".pk"))
+    )
+
+
 _ENTITY_TO_OBJECT_TYPE = {
     "folder": "folder", "file": "file", "app": "application",
     "drive": "drive", "url": "website", "installed_app": "application",
@@ -260,10 +282,41 @@ def resolve(text: str) -> ObjectResolution:
         return result
 
     # ── No explicit noun — "open perfume", "take me to perfume" ──────────────
-    # Compositional fallback: prefer filesystem scope evidence over a bare
-    # app-name guess when we're already in a filesystem context (Explorer
-    # open, a drive/folder was just navigated).
+    # Known app/website name always wins over a fuzzy filesystem-scope guess.
+    # Live bug (2026-08-24): "Microsoft Store kholo" right after a "...in C
+    # drive" turn left scope.drive="C" set, so the filesystem probe below
+    # ran FIRST, fuzzy-matched "microsoft store" against something under
+    # C:\, and returned type=folder before the known-app check ever got a
+    # turn — routing it to smart_open's filesystem search (which then
+    # correctly failed to find a folder called "microsoft store", since
+    # there isn't one) instead of open_application. A name that's
+    # unambiguously a known app/website is decisive; only truly unknown
+    # names should fall through to the fuzzy filesystem probe.
     candidate_name = name or text
+    if candidate_name and _looks_like_known_app(candidate_name):
+        evidence.append(f"matches known application name: {candidate_name!r}")
+        result = ObjectResolution(
+            action="open", object_type="application", name=candidate_name,
+            scope=scope, confidence=0.75, evidence=evidence,
+        )
+        _log(result, text)
+        return result
+
+    # Known websites — checked AFTER installed apps so names that are both
+    # (spotify, netflix) prefer the desktop app when one is known.
+    if candidate_name and _looks_like_known_website(candidate_name):
+        evidence.append(f"matches known website: {candidate_name!r}")
+        result = ObjectResolution(
+            action="open", object_type="website", name=candidate_name,
+            scope=scope, confidence=0.85, evidence=evidence,
+        )
+        _log(result, text)
+        return result
+
+    # Fuzzy filesystem-scope probe — only for names that are NOT already a
+    # known app/website (see reasoning above). Prefers filesystem scope
+    # evidence over a bare guess when already in a filesystem context
+    # (Explorer open, a drive/folder was just navigated).
     if candidate_name and (scope.get("current_folder") or scope.get("drive")):
         try:
             from . import file_resolver as _fr
@@ -278,15 +331,6 @@ def resolve(text: str) -> ObjectResolution:
                 return result
         except Exception:
             pass
-
-    if candidate_name and _looks_like_known_app(candidate_name):
-        evidence.append(f"matches known application name: {candidate_name!r}")
-        result = ObjectResolution(
-            action="open", object_type="application", name=candidate_name,
-            scope=scope, confidence=0.75, evidence=evidence,
-        )
-        _log(result, text)
-        return result
 
     evidence.append("no explicit type noun, no scope filesystem match, not a known app name")
     result = ObjectResolution(

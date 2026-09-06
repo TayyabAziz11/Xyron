@@ -126,10 +126,11 @@ class ToolRegistry:
             return result
         except Exception as exc:
             logger.exception("Tool %s crashed", name)
+            from api.services.failure_messages import spoken_for_exception
             return ToolResult(
                 success=False,
                 text=f"Tool error: {exc}",
-                spoken="Something went wrong executing that action.",
+                spoken=spoken_for_exception(exc),
                 error=str(exc),
                 risk=tool.risk,
             )

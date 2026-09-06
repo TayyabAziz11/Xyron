@@ -29,6 +29,16 @@ ModelType = Literal["gpt-4o-mini", "gpt-4o"]
 _DEFAULT_MAX_GPT4O_PER_HOUR = 20
 _DEFAULT_MAX_MINI_PER_HOUR  = 500
 
+# ── Local Ollama model for offline fallback ──────────────────────────────────
+# mistral:7b (4.4GB) OOMs on low-VRAM GPUs like the T1200 (4GB) once Whisper/
+# Kokoro/XTTS are also resident — benchmarked 2026-08-19: qwen2.5:1.5b answers
+# in ~0.8-1s warm at 1.4GB VRAM with reliable structured-JSON output, vs.
+# mistral:7b's OOM risk and qwen3:4b's ~20s+ "thinking mode" overhead (its
+# `think:false` request param is not honored by the installed build). Override
+# via OLLAMA_LOCAL_MODEL if a different local model is verified to fit.
+import os as _os
+LOCAL_OLLAMA_MODEL = _os.getenv("OLLAMA_LOCAL_MODEL", "qwen2.5:1.5b")
+
 
 # ── Cost tracker ──────────────────────────────────────────────────────────────
 
@@ -81,8 +91,8 @@ class OpenAIClient:
 
     # Maps OpenAI model names → best available local Ollama model
     _OLLAMA_MODEL_MAP: dict[str, str] = {
-        "gpt-4o":      "mistral:7b",
-        "gpt-4o-mini": "mistral:7b",
+        "gpt-4o":      LOCAL_OLLAMA_MODEL,
+        "gpt-4o-mini": LOCAL_OLLAMA_MODEL,
     }
     _OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
@@ -283,13 +293,16 @@ def offline_generate(
     system: Optional[str] = None,
     complex: bool = False,
 ) -> Optional[str]:
-    """Local Ollama fallback. llama3.2:3b for quick tasks, mistral:7b for complex ones.
+    """Local Ollama fallback — llama3.2:3b for quick tasks, LOCAL_OLLAMA_MODEL
+    (qwen2.5:1.5b by default) for complex ones. mistral:7b (4.4GB) was the prior
+    default for `complex` but OOMs on low-VRAM GPUs like the T1200 (4GB) once
+    Whisper/Kokoro/XTTS are also resident — see LOCAL_OLLAMA_MODEL above.
 
     Respects OLLAMA_MODEL and OLLAMA_API_URL env vars.
     Returns None silently if Ollama is not running or the package is not installed.
     """
     import os as _os
-    _default_model = "mistral:7b" if complex else "llama3.2:3b"
+    _default_model = LOCAL_OLLAMA_MODEL if complex else "llama3.2:3b"
     model = _os.getenv("OLLAMA_MODEL", _default_model)
     try:
         import ollama as _ollama

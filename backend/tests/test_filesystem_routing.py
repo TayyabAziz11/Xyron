@@ -260,7 +260,7 @@ class TestPreSTTSilenceFilter(unittest.TestCase):
         """voice_ws.py must contain the RMS silence threshold"""
         import importlib.util, ast
         path = Path(__file__).parent.parent / "api" / "routers" / "voice_ws.py"
-        src = path.read_text()
+        src = path.read_text(encoding="utf-8")
         self.assertIn("STT_SKIPPED_SILENCE", src,
                       "Pre-STT silence log tag [STT_SKIPPED_SILENCE] not found in voice_ws.py")
         self.assertIn("0.010", src,
@@ -269,7 +269,7 @@ class TestPreSTTSilenceFilter(unittest.TestCase):
     def test_silence_filter_before_stt(self):
         """[STT_SKIPPED_SILENCE] block must appear BEFORE the transcribe_audio call"""
         path = Path(__file__).parent.parent / "api" / "routers" / "voice_ws.py"
-        src = path.read_text()
+        src = path.read_text(encoding="utf-8")
         idx_silence  = src.find("STT_SKIPPED_SILENCE")
         idx_transcribe = src.find("transcribe_audio")
         self.assertGreater(idx_transcribe, idx_silence,

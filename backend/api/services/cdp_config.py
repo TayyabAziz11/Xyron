@@ -35,9 +35,15 @@ CDP_CHROME_LOCAL_PORT = int(os.environ.get("XYRON_CDP_LOCAL_PORT", "9222"))
 CDP_BRIDGE_PORT_PREFERRED = int(os.environ.get("XYRON_CDP_BRIDGE_PORT", "9223"))
 CDP_PORT_RANGE = list(range(9223, 9231))  # 9223–9230, preferred port first if present
 
-CDP_CONNECT_TIMEOUT_MS = 8_000
-CDP_RETRY_COUNT = 4
-CDP_RETRY_DELAY_S = 2.0
+# A HEALTHY CDP connect over the local bridge completes in well under
+# 500ms — live-measured. The old 8s timeout let a stale/dead bridge hold
+# the very first probe (and every retry) hostage for seconds each, which
+# on a cold flight search inflated perceived latency by ~8–10s before the
+# fallback launch even started. 3s still has 6x headroom over a healthy
+# connect but fails fast on a dead endpoint.
+CDP_CONNECT_TIMEOUT_MS = 3_000
+CDP_RETRY_COUNT = 2
+CDP_RETRY_DELAY_S = 0.5
 
 FIREWALL_RULE_NAME = "XyronCDPBridge"
 

@@ -37,7 +37,8 @@ _MEDIUM_RISK_KEYWORDS = frozenset([
 ])
 
 _ALWAYS_CONFIRM_ROUTES = frozenset([
-    "send_whatsapp", "send_email", "post_linkedin",
+    "send_whatsapp", "wa_send_text", "wa_send_file", "wa_reply",
+    "send_email", "post_linkedin",
     "post_instagram", "post_twitter", "run_shell_command",
     "delete_file", "delete_folder",
 ])

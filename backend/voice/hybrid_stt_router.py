@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ── Known simple commands — accept tiny.en even at low confidence ─────────────
 # Distinct enough that tiny.en almost never mis-transcribes them.
 _SIMPLE_VOCAB: frozenset[str] = frozenset({
-    # App opens
+    # App opens (English)
     "open chrome", "open firefox", "open edge", "open microsoft edge",
     "open vs code", "open vscode", "open visual studio code",
     "open notepad", "open calculator", "open explorer", "open file explorer",
@@ -41,7 +41,21 @@ _SIMPLE_VOCAB: frozenset[str] = frozenset({
     "open task manager", "open spotify", "open discord", "open steam",
     "open slack", "open zoom", "open teams", "open microsoft teams",
     "open word", "open excel", "open powershell",
-    # Pronoun follow-ups
+    # Roman Urdu app opens (common commands Pakistani users say daily)
+    "chrome kholo", "settings kholo", "notepad kholo",
+    "calculator kholo", "explorer kholo", "terminal kholo",
+    "spotify kholo", "discord kholo", "vs code kholo",
+    "firefox kholo", "edge kholo", "teams kholo",
+    "chrome khol", "settings khol", "chrome open",
+    "settings open", "explorer open",
+    # Roman Urdu close/quit
+    "band karo", "band karo", "close karo",
+    # Roman Urdu volume
+    "volume barhao", "awaz barhao", "awaz barha",
+    "volume kam karo", "awaz kam karo", "awaz kam",
+    # Roman Urdu misc
+    "screenshot lo", "screenshot le lo", "lock karo",
+    # Pronoun follow-ups (English)
     "open it", "open it again", "open this", "open that",
     "close it", "close this", "close that",
     "install it", "download it", "install this", "download this",
@@ -49,6 +63,8 @@ _SIMPLE_VOCAB: frozenset[str] = frozenset({
     # Confirmations
     "yes", "yeah", "yep", "yup", "sure", "no", "nope",
     "cancel", "stop", "ok", "okay", "go ahead", "do it", "confirm",
+    # Roman Urdu confirmations
+    "haan", "nahi", "theek hai", "theek", "karo",
     # Media
     "pause", "play", "resume", "mute", "unmute", "skip", "next", "back",
     # Volume/brightness
@@ -86,10 +102,26 @@ def _decide_mode(audio_dur_ms: float, session_state: dict) -> tuple[str, str]:
 
     # Multilingual session — previous turn was non-English → skip tiny.en entirely.
     # tiny.en is English-only and produces garbage on Urdu/Hindi/Arabic audio.
+    #
+    # Confidence gate: only honor the session language when it was detected
+    # with real evidence (strong keyword/script match ≥ 0.75, explicit config
+    # hint, or language-memory dominant — all stored with conf ≥ 0.78). A
+    # low-confidence detection (Whisper acoustic-only guess at 0.60, or a
+    # legacy mis-detection) must NOT poison every following turn onto the
+    # slow multilingual "accurate" model (~3s vs ~0.8s on tiny.en). When no
+    # conf was recorded (older code paths) we preserve the legacy behavior.
+    _ML_SESSION_MIN_CONF = 0.75
     _ml_lang = session_state.get("ml_detected_lang", "en")
-    if _ml_lang and _ml_lang not in ("en",):
-        logger.info("[STT_LANG_ROUTE] mode=multilingual reason=multilingual_session lang=%s", _ml_lang)
+    _ml_conf_raw = session_state.get("ml_detected_lang_conf")
+    try:
+        _ml_conf = float(_ml_conf_raw) if _ml_conf_raw is not None else 1.0
+    except (TypeError, ValueError):
+        _ml_conf = 1.0
+    if _ml_lang and _ml_lang not in ("en",) and _ml_conf >= _ML_SESSION_MIN_CONF:
+        logger.info("[STT_LANG_ROUTE] mode=multilingual reason=multilingual_session lang=%s conf=%.2f", _ml_lang, _ml_conf)
         return "accurate", f"multilingual_session_lang={_ml_lang}"
+    if _ml_lang and _ml_lang not in ("en",):
+        logger.info("[STT_LANG_ROUTE] mode=default reason=low_conf_session_lang lang=%s conf=%.2f", _ml_lang, _ml_conf)
 
     # Very short audio (≤ 1.2s ≈ 1–2 words at normal pace) → simple, no retry needed
     if audio_dur_ms <= 1200:
@@ -273,6 +305,12 @@ def _needs_retry(result: dict, audio_dur_ms: float) -> tuple[bool, str]:
       1. Empty transcript — nothing was heard
       2. Very low confidence (< -0.7) — tiny.en not confident at all
       3. Medium-low confidence (< -0.45) with 3+ words — probable entity name
+      4. Transcript contains strong Roman Urdu vocabulary — tiny.en is
+         English-only, so any Urdu token in its output proves the audio is
+         not English and the transcript is a mishearing (language-switch
+         bootstrap: the FIRST Urdu command of a session, e.g. "Urdu mein
+         baat karo" misheard as "Xyron, open barhao." conf -0.67 — too
+         "confident" for the confidence rules above)
 
     Never retry when:
       - Transcript matches known simple vocab (pattern overrides confidence)
@@ -295,10 +333,64 @@ def _needs_retry(result: dict, audio_dur_ms: float) -> tuple[bool, str]:
     if norm in _SIMPLE_VOCAB:
         return False, "simple_vocab_match"
 
-    # Commands with folder/file keywords → entity name expected → always use accurate
-    _ENTITY_HINTS = frozenset({"folder", "file", "directory", "document"})
-    if _ENTITY_HINTS & set(norm.split()):
+    # ── Language-switch bootstrap ─────────────────────────────────────────
+    # tiny.en cannot transcribe Urdu/Hindi — if its output still contains
+    # strong Roman Urdu vocabulary, the audio is definitely not English and
+    # the transcript is necessarily a mishearing. Retry with the
+    # multilingual model regardless of confidence. The ambiguous short
+    # tokens (ka/ki/ke/ko/pe/se/...) are excluded — STT noise in a genuine
+    # English utterance can produce those, and each retry costs ~3s on the
+    # T1200, so only distinctive markers trigger. Known bilingual commands
+    # like "settings kholo" never reach here (simple-vocab check above).
+    try:
+        from api.services.language_detector import _ROMAN_URDU_KWS as _RU_KWS
+        _AMBIGUOUS_RU = frozenset({
+            "ka", "ki", "ke", "ko", "pe", "se", "de", "ab", "ho", "hai",
+            "bhi", "ye", "yeh", "tha", "thi", "hain", "hun", "kar", "kam",
+        })
+        _ru_hits = sum(
+            1 for w in norm.split()
+            if w.strip(".,!?'\"") in _RU_KWS and w.strip(".,!?'\"") not in _AMBIGUOUS_RU
+        )
+        if _ru_hits >= 1:
+            return True, f"roman_urdu_vocab_hits_{_ru_hits}"
+    except Exception:
+        pass
+
+    # Commands with folder/file keywords → entity name (filename) expected
+    # → always use accurate, regardless of confidence. Pre-existing rule,
+    # unchanged — filenames are exactly the case tiny.en is worst at, and
+    # this shape hasn't shown the runaway-latency problem the messaging
+    # rule below did.
+    _norm_words = {w.strip(".,!?;:'\"") for w in norm.split()}
+    _FS_ENTITY_HINTS = frozenset({"folder", "file", "directory", "document"})
+    if _FS_ENTITY_HINTS & _norm_words:
         return True, "entity_hint_keyword"
+
+    # Messaging keywords ("message"/"reply"/"whatsapp"/...) → entity name
+    # (contact) expected → use accurate ONLY if the fast model wasn't
+    # already confident. Checked per-word with punctuation stripped —
+    # `norm` only strips the trailing punctuation of the WHOLE string, so a
+    # mid-sentence hit like tiny.en's mishearing "No message. Custom." (the
+    # internal period on "message." survives) would otherwise never match
+    # "message" here even after adding it below. This was the exact root
+    # cause of "message Qasim" being transcribed as "No message. Custom."
+    # and never retried with the accurate model (that mishearing scored
+    # conf=-0.43).
+    #
+    # Live-caught follow-up regression: this rule originally forced the
+    # retry unconditionally (same shape as the filesystem rule above), so a
+    # real WhatsApp reply command the fast model already transcribed
+    # correctly and confidently (conf=-0.15, "Send him a reply, I am
+    # good...") still paid the full ~1.1s accurate-model round trip for
+    # nothing, blowing the turn's latency budget (3833ms against a 2000ms
+    # target). Gating on confidence keeps the fix for genuinely uncertain
+    # mishearings (-0.43 and below) while skipping the retry once the fast
+    # model is already reasonably sure — -0.25 sits with margin below the
+    # confident real case and margin above the original bug case.
+    _MSG_ENTITY_HINTS = frozenset({"message", "msg", "whatsapp", "text", "chat", "reply"})
+    if _MSG_ENTITY_HINTS & _norm_words and conf < -0.25:
+        return True, f"msg_entity_hint_keyword_conf_{conf:.2f}"
 
     # Very uncertain → retry no matter the length
     if conf < -0.7:
@@ -339,7 +431,23 @@ def route(
     # ── Accurate path — skip tiny.en entirely ────────────────────────────────
     if mode == "accurate":
         t0 = time.monotonic()
-        result = transcribe_audio(audio, 16000, None, True)   # None → auto-detect (Urdu/English)
+        try:
+            result = transcribe_audio(audio, 16000, None, True)   # None → auto-detect (Urdu/English)
+        except Exception as exc:
+            # Unlike the fast→accurate fallback below, this path had no
+            # try/except at all — an accurate-model failure (e.g. cold/broken
+            # CUDA load) used to propagate straight out of route() with no
+            # degradation, landing on voice_ws.py's generic STT-exception
+            # branch. Degrade to tiny.en instead, matching the sibling
+            # fallback direction used everywhere else in this function.
+            logger.warning("[STT_ACCURATE_FAILED] error=%s — falling back to tiny.en", exc)
+            fast_result = transcribe_fast(audio)
+            ms = (time.monotonic() - t0) * 1000
+            logger.info(
+                "[STT_FINAL_SELECTED] model=tiny.en(accurate_failed) transcript=%r total_ms=%.0f",
+                (fast_result.get("text") or "")[:80], ms,
+            )
+            return fast_result, "tiny.en", None
         ms = (time.monotonic() - t0) * 1000
         logger.info(
             "[STT_ACCURATE_RESULT] transcript=%r confidence=%.2f ms=%.0f",

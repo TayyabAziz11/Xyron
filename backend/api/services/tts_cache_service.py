@@ -65,8 +65,12 @@ class TTSCacheService:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _text_lookup_key(voice: str, text: str) -> str:
-        return f"{voice}::{text.lower().strip()}"
+    def _text_lookup_key(voice: str, text: str, lang: str = "en") -> str:
+        # lang defaults to "en" so every pre-existing English call site
+        # (get_by_text/synthesize_or_cached with no lang arg) produces the
+        # EXACT SAME key it always has — this extension is additive, not a
+        # behavior change for English callers.
+        return f"{lang}:{voice}::{text.lower().strip()}"
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -133,18 +137,23 @@ class TTSCacheService:
             logger.info("[TTS_CACHE_HIT] key=%s", key)
         return result
 
-    def get_by_text(self, text: str, voice: str) -> Optional[bytes]:
+    def get_by_text(self, text: str, voice: str, lang: str = "en") -> Optional[bytes]:
         """Return cached WAV matching exact text AND voice (case-insensitive
         text), or None. Voice is part of the lookup key — a phrase cached
         for one voice is never returned as a hit for another; a mismatch is
         a clean cache miss, not a wrong-voice hit.
+
+        lang defaults to "en" — every pre-existing English call site is
+        unaffected. Non-English callers (get_by_text_ml below) pass the
+        actual ml_resp_lang so a Roman-Urdu ack phrase and its literal-
+        English homograph (rare, but possible) never collide in cache.
 
         Also asserts the invariant with `_voice_of` as a safety net: even
         though the (voice, text) key makes a cross-voice hit structurally
         very unlikely, if some future change ever managed to store the wrong
         voice under a key, this catches and refuses it loudly rather than
         silently playing the wrong voice."""
-        key = self._text_map.get(self._text_lookup_key(voice, text))
+        key = self._text_map.get(self._text_lookup_key(voice, text, lang))
         if not key:
             return None
         wav = self.get(key)
@@ -195,6 +204,104 @@ class TTSCacheService:
     def is_ready(self) -> bool:
         with self._lock:
             return self._ready
+
+    # ── Roman-Urdu/mixed deterministic-ack fast path ───────────────────────
+    # Live-caught latency bug (2026-09-04): a deterministic tool ack like
+    # "YouTube khol raha hoon." was unconditionally routed through
+    # tts_router.synthesize(), which tries OpenAI TTS FIRST for ALL of
+    # ur/ur_roman/mixed (voice/tts_router.py's _EDGE_TTS_LANGS) — a ~2.3-
+    # 2.5s network round-trip measured live for a 4-word acknowledgement
+    # that never needed cloud-quality prosody in the first place. Measured
+    # directly (2026-09-04): Kokoro synthesizes the SAME phrase in ~380-
+    # 400ms warm (voice/api/routers/voice.py's _kokoro_to_wav — same engine
+    # tts_router.py's own module docstring already documents as an accepted
+    # quality tier for ur_roman/mixed: "Latin-script text is reasonably
+    # renderable by Kokoro's English phonemizer" — this promotes an
+    # already-vetted FALLBACK engine to the PRIMARY engine for exactly this
+    # one case, it does not introduce a new, unvalidated quality tier.
+    #
+    # Deliberately scoped to ur_roman/mixed ONLY — pure Urdu script (lang
+    # == "ur") stays on the existing OpenAI-first/Edge-TTS path unchanged;
+    # Kokoro's English phonemizer cannot render Nastaliq script
+    # intelligibly (see tts_router.py's _synthesize_edge lang=="ur" guard),
+    # and this module has no way to validate that quality tradeoff.
+    #
+    # Persisted to the SAME on-disk _CACHE_DIR the English build() cache
+    # uses, so a phrase synthesized once survives process restarts —
+    # "subsequent commands should be near-instant" applies across sessions,
+    # not just within one.
+    _LATIN_RENDERABLE_ML_LANGS = frozenset({"ur_roman", "mixed"})
+
+    @staticmethod
+    def _ml_disk_path(voice: str, lang: str, text: str) -> pathlib.Path:
+        import hashlib
+        h = hashlib.sha1(f"{lang}:{text.lower().strip()}".encode("utf-8")).hexdigest()[:20]
+        return _CACHE_DIR / f"ml_{voice}_{lang}_{h}.wav"
+
+    def get_by_text_ml(self, text: str, voice: str, lang: str) -> Optional[bytes]:
+        """ur_roman/mixed variant of get_by_text — checks the in-memory
+        cache first, then falls back to an on-disk hit (a phrase cached in
+        a PRIOR process run) before reporting a miss. Returns None
+        immediately for any lang outside _LATIN_RENDERABLE_ML_LANGS —
+        callers must not use this for pure Urdu script."""
+        if lang not in self._LATIN_RENDERABLE_ML_LANGS:
+            return None
+        hit = self.get_by_text(text, voice, lang)
+        if hit is not None:
+            return hit
+        # Cold in-memory cache (fresh process) but a prior run already
+        # synthesized this exact phrase to disk — load and re-populate the
+        # in-memory index so this is a true one-time-per-process disk read.
+        path = self._ml_disk_path(voice, lang, text)
+        if path.exists():
+            try:
+                wav = path.read_bytes()
+                if len(wav) >= 100:
+                    vkey = f"ml:{lang}:{voice}:{text.lower().strip()}"
+                    with self._lock:
+                        self._cache[vkey] = wav
+                        self._text_map[self._text_lookup_key(voice, text, lang)] = vkey
+                        self._voice_of[vkey] = voice
+                    logger.info("[TTS_CACHE_ML_DISK_HIT] lang=%s voice=%s text=%r", lang, voice, text[:50])
+                    return wav
+            except Exception:
+                pass
+        return None
+
+    def synthesize_or_cached_ml(self, text: str, voice: str, speed: float, lang: str) -> Optional[bytes]:
+        """ur_roman/mixed fast path: cache hit (memory or disk) returns
+        immediately; a miss synthesizes via Kokoro directly — NOT via
+        voice.tts_router (which would try OpenAI TTS first for this lang,
+        exactly the latency this method exists to avoid) — and persists
+        the result both in memory and to disk for next time.
+
+        Returns None for any lang outside _LATIN_RENDERABLE_ML_LANGS — the
+        caller must fall through to the existing OpenAI/Edge-TTS path for
+        pure Urdu script."""
+        if lang not in self._LATIN_RENDERABLE_ML_LANGS:
+            return None
+        cached = self.get_by_text_ml(text, voice, lang)
+        if cached:
+            return cached
+        logger.info("[TTS_CACHE_ML_MISS] lang=%s text=%r voice=%s", lang, text[:50], voice)
+        try:
+            from api.routers.voice import _kokoro_to_wav
+            wav = _kokoro_to_wav(text, voice, speed)
+            if wav:
+                vkey = f"ml:{lang}:{voice}:{text.lower().strip()}"
+                with self._lock:
+                    self._cache[vkey] = wav
+                    self._text_map[self._text_lookup_key(voice, text, lang)] = vkey
+                    self._voice_of[vkey] = voice
+                try:
+                    self._ml_disk_path(voice, lang, text).write_bytes(wav)
+                except Exception:
+                    pass
+                logger.info("[TTS_CACHE_ML_STORED] lang=%s text=%r voice=%s", lang, text[:50], voice)
+            return wav
+        except Exception as exc:
+            logger.warning("[TTS_CACHE_ML] kokoro synthesis error lang=%s: %s", lang, exc)
+            return None
 
 
 tts_cache = TTSCacheService()

@@ -44,6 +44,24 @@ _XYRON_LEADING_VARIANTS_RE = re.compile(
 import logging as _logging
 _norm_log = _logging.getLogger(__name__)
 
+# "WhatsApp" is not a dictionary word Whisper reliably transcribes as one
+# token — it commonly comes out as two words ("whats app" / "what's app").
+# Requiring the "'s"/"s" (what'?s, not bare "what") is what keeps this from
+# ever touching a genuinely different phrase like "what app is this" (no s).
+# Placed BEFORE contraction expansion (step 2) — otherwise "what's app"
+# would already be "what is app" by the time this ran, one word further
+# from being fixable with a single targeted pattern.
+_WHATSAPP_VARIANTS_RE = re.compile(r"\bwhat'?s\s+app\b", re.IGNORECASE)
+
+
+def _normalize_whatsapp_variants(text: str) -> str:
+    """Fix STT splitting 'WhatsApp' into two words ('whats app'/'what's app')."""
+    def _replace(m: re.Match) -> str:
+        raw = m.group(0)
+        _norm_log.info("[NAME_NORMALIZE] raw=%r normalized='whatsapp'", raw)
+        return "whatsapp"
+    return _WHATSAPP_VARIANTS_RE.sub(_replace, text)
+
 # "Watch on my screen/skin" is a recurring tiny.en mishearing of "what's on
 # my screen" (live-observed 3x across two sessions: "screen" x2, "skin" x1)
 # — it silently misses the dedicated screen-query fast path's regex entirely
@@ -85,6 +103,39 @@ def _normalize_xyron_variants(text: str) -> str:
         return "xyron, "
     text = _XYRON_LEADING_VARIANTS_RE.sub(_replace_leading, text)
     return _XYRON_VARIANTS_RE.sub(_replace, text)
+
+
+# ── Drive-letter phonetic correction (real-mic Urdu test Issue 2A) ────────────
+# Whisper spells a spoken drive LETTER as a homophone word ("C drive kholo"
+# → "see/sea/cee/seed drive", "D drive" → "dee drive"). Correction is
+# strictly context-scoped: only a homophone IMMEDIATELY before "drive" is
+# rewritten, so ordinary verbs/nouns ("see my files", "dee is a name") are
+# never touched. This is the SHARED post-Whisper layer — whisper_service's
+# _CORRECTIONS handles the raw-STT comma variants, intent_router's drive
+# rules consume the corrected "<letter> drive" form. Do not add parallel
+# drive resolvers elsewhere.
+_DRIVE_PHONETIC_MAP: dict[str, str] = {
+    "see": "c", "sea": "c", "si": "c", "cee": "c", "seed": "c",
+    "dee": "d",
+    "ee": "e",
+    "eff": "f",
+}
+_DRIVE_PHONETIC_RE = re.compile(
+    r'\b(?:' + '|'.join(sorted(_DRIVE_PHONETIC_MAP, key=len, reverse=True)) + r')\s+drive\b',
+    re.IGNORECASE,
+)
+
+
+def _correct_drive_phonetics(text: str) -> str:
+    """Rewrite drive-letter homophones ("open see drive" → "open c drive")."""
+    def _repl(m: re.Match) -> str:
+        word = m.group(0).split()[0].lower()
+        letter = _DRIVE_PHONETIC_MAP.get(word)
+        if not letter:
+            return m.group(0)
+        _norm_log.info("[DRIVE_PHONETIC_FIX] %r → '%s drive'", m.group(0), letter)
+        return f"{letter} drive"
+    return _DRIVE_PHONETIC_RE.sub(_repl, text)
 
 
 # ── 1. Wake-word stripping ────────────────────────────────────────────────────
@@ -197,6 +248,10 @@ def normalize(text: str) -> str:
     # 0. Fix STT phonetic mishearings of "Xyron" before wake-word strip
     text = _normalize_xyron_variants(text)
 
+    # 0.2. Fix "whats app"/"what's app" -> "whatsapp" before contraction
+    # expansion turns "what's" into "what is" (see _WHATSAPP_VARIANTS_RE).
+    text = _normalize_whatsapp_variants(text)
+
     # 0.5. Fix "watch on my screen" mishearing of "what's on my screen"
     text = _normalize_screen_query_mishearing(text)
 
@@ -219,5 +274,12 @@ def normalize(text: str) -> str:
 
     # 5. Collapse whitespace + lowercase
     text = _WHITESPACE_RE.sub(" ", text).strip().lower()
+
+    # 6. Drive-letter phonetic correction (context-scoped to "<word> drive")
+    text = _correct_drive_phonetics(text)
+
+    # 7. Strip trailing sentence punctuation — routing regexes and object
+    #    resolution work on clean phrases ("open c drive." → "open c drive").
+    text = text.rstrip(".,!?;: ").strip()
 
     return text

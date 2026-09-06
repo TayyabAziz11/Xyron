@@ -131,8 +131,15 @@ def _resolve(
     # website opened via open_application's web-shortcut branch or open_url
     # that ISN'T youtube specifically (github, gmail, etc.) — added for the
     # generic click/select/fill/submit interaction tier in follow_up_resolver.py.
+    #
+    # Suspended while a YouTube disambiguation list is pending: the user's
+    # reply is a selection from THAT list ("play love me like you do" names a
+    # listed candidate) and voice_ws Tier 0f4 matches it against the exact
+    # candidates — v1's generic "play X" → fresh search would bypass the
+    # pending list and re-search the title text instead.
+    _video_pending = bool((session_state or {}).get("pending_video_candidates"))
     platform = (active_ctx.get("current_platform") or "").lower()
-    if platform in ("microsoft_store", "youtube", "explorer", "web"):
+    if platform in ("microsoft_store", "youtube", "explorer", "web") and not _video_pending:
         from api.services.follow_up_resolver import resolve as _v1
         v1 = _v1(text, active_ctx)
         if v1.was_resolved or v1.tool_name or v1.needs_clarification:
@@ -178,6 +185,15 @@ def _resolve(
     # ── Tier 5: V1 full fallback ─────────────────────────────────────────────
     from api.services.follow_up_resolver import resolve as _v1
     v1 = _v1(text, active_ctx)
+    # Same suspension as the fast path above: while a YouTube disambiguation
+    # list is pending, v1's "play X" would resolve to a fresh search and
+    # voice_ws would execute it BEFORE Tier 0f4 ever sees the utterance —
+    # bypassing exact candidate matching. Drop ONLY the media resolution and
+    # let voice_ws Tier 0f4 handle the selection.
+    if _video_pending and v1.tool_name in ("search_youtube", "play_youtube_video"):
+        logger.info("[FOLLOWUP_SOURCE] tier=v1_fallback suppressed "
+                    "tool=%s reason=video_selection_pending", v1.tool_name)
+        return FollowUpResult(resolved=text)
     v1.context_used["_source"] = "v1_fallback"
     if v1.was_resolved or v1.tool_name:
         logger.info("[FOLLOWUP_SOURCE] tier=v1_fallback")

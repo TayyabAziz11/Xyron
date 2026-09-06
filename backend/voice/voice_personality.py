@@ -52,6 +52,10 @@ MODES: dict[str, VoiceMode] = {
             "All systems nominal.",
             "Interface locked in.",
             "Processing complete.",
+            "Ho gaya... control mere haath mein hai.",
+            "System tayyar hai... shuru karte hain.",
+            "Aapka kaam ab Xyron sambhal raha hai.",
+            "Sab kuch online hai... chalte hain.",
         ),
     ),
     "CHILL": VoiceMode(
@@ -75,11 +79,24 @@ _FILLER_WORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Urdu/Roman Urdu filler phrases that can be stripped in WORK mode
+_URDU_FILLER_WORDS = re.compile(
+    r'\b(Ji bilkul|Ji haan|Zaroor|Bilkul|Haan ji|Theek hai|Koi baat nahi|'
+    r'Ji zaroor|Haan bilkul|Beshak|Yaqeenan)[,.]?\s*',
+    re.IGNORECASE,
+)
+
 _MARKDOWN_ARTIFACTS = re.compile(r'\*+([^*]+)\*+|`([^`]+)`|#{1,6}\s+')
 
 _PAUSE_TRIGGERS = frozenset({
     "ready", "complete", "done", "acknowledged", "initiated",
     "online", "locked", "nominal", "synchronized", "activated",
+})
+
+# Urdu/Roman Urdu pause trigger words for TAKEOVER mode
+_URDU_PAUSE_TRIGGERS = frozenset({
+    "tayyar", "ho gaya", "complete", "mukammal", "shuru",
+    "online", "chalu", "done", "khatam", "band",
 })
 
 _mode_lock = threading.Lock()
@@ -130,10 +147,28 @@ def reset_cancel() -> None:
     _cancel_flag.clear()
 
 
+def _is_urdu_text(text: str) -> bool:
+    """Check if text contains Urdu script characters or is predominantly Roman Urdu."""
+    if not text:
+        return False
+    # Check for Urdu script characters (U+0600–U+06FF)
+    urdu_chars = sum(1 for c in text if 0x0600 <= ord(c) <= 0x06FF)
+    if urdu_chars > 2:
+        return True
+    # Check for Roman Urdu indicators (common Urdu sentence-enders)
+    _urdu_endings = re.compile(
+        r'\b(hai|hain|karo|karo|do|lo|batao|dikha|chalo|ho gaya|'
+        r'tayyar|complete|done|bhai|yaar|boss)\b',
+        re.IGNORECASE
+    )
+    return bool(_urdu_endings.search(text))
+
+
 def shape_text(text: str, mode: Optional[str] = None) -> str:
     """
-    Apply cinematic text shaping for Kokoro delivery.
+    Apply cinematic text shaping for Kokoro/Edge-TTS delivery.
     Adds pauses, removes filler, strips markdown artifacts.
+    Handles both English and Urdu text appropriately.
     """
     if not text:
         return text
@@ -145,9 +180,10 @@ def shape_text(text: str, mode: Optional[str] = None) -> str:
     text = _MARKDOWN_ARTIFACTS.sub(lambda m: m.group(1) or m.group(2) or "", text)
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # Strip filler phrases in WORK mode
+    # Strip filler phrases in WORK mode (both English and Urdu)
     if vm.strip_filler:
         text = _FILLER_WORDS.sub("", text).strip()
+        text = _URDU_FILLER_WORDS.sub("", text).strip()
 
     # TAKEOVER: add dramatic pauses at sentence-final status words
     if vm.name == "TAKEOVER" and vm.pause_factor >= 1.8:
@@ -158,12 +194,24 @@ def shape_text(text: str, mode: Optional[str] = None) -> str:
                 text,
                 flags=re.IGNORECASE,
             )
+        for word in _URDU_PAUSE_TRIGGERS:
+            text = re.sub(
+                rf'\b({re.escape(word)})\b',
+                r'\1...',
+                text,
+                flags=re.IGNORECASE,
+            )
         # De-duplicate repeated ellipses
         text = re.sub(r'\.{4,}', '...', text)
 
     # HOME / CHILL: very light softening — ensure sentence ends naturally
-    if vm.name in ("HOME", "CHILL") and text and text[-1] not in ".!?":
-        text = text + "."
+    if vm.name in ("HOME", "CHILL") and text and text[-1] not in ".!?\u06D4":
+        # Use Urdu full stop (۔) for Urdu script text, period for Latin
+        urdu_chars = sum(1 for c in text if 0x0600 <= ord(c) <= 0x06FF)
+        if urdu_chars > 2:
+            text = text + "\u06D4"  # Urdu full stop
+        else:
+            text = text + "."
 
     return text.strip()
 

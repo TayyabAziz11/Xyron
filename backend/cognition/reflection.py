@@ -52,8 +52,12 @@ class ReflectionEngine:
             logger.debug("[Reflection] LLM unavailable — skipping storage")
             return {"skipped": True, "reason": "llm_unavailable"}
 
-        self._store_insight(insight)
-        self._maybe_adapt_personality(insight)
+        # Both call semantic_store (ChromaDB SentenceTransformer .encode()) —
+        # CPU-bound embedding inference that was running directly on the
+        # event loop thread every reflection cycle, a confirmed contributor
+        # to the EVENT_LOOP_BLOCKER lag spikes naming ReflectionEngine.start_loop.
+        await asyncio.to_thread(self._store_insight, insight)
+        await asyncio.to_thread(self._maybe_adapt_personality, insight)
 
         elapsed = round(time.time() - start, 2)
         insight["elapsed_s"] = elapsed

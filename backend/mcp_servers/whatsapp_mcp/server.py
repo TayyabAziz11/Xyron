@@ -5,18 +5,28 @@ WhatsApp MCP Server — JSON-RPC 2.0 over stdin/stdout.
 Exposes WhatsApp Web automation as MCP tools for Claude CLI.
 
 Tools:
-  get_messages(limit, unread_only)
-  send_message(to, message)
-  find_chat(query)
-  open_chat(chat_id)
-  mark_read(chat_id)
-  healthcheck()
+  get_messages(limit, unread_only)         [Baileys transport — Phase 2]
+  find_chat(query)                          [Baileys transport — Phase 2]
+  open_chat(chat_id)                        [Playwright — unchanged]
+  mark_read(chat_id)                        [Baileys transport — Phase 2]
+  send_message(to, message)                 [Baileys transport — Phase 2]
+  send_file(to, file_path, caption)         [Baileys transport — Phase 2]
+  send_image(to, file_path, caption)        [Baileys transport — Phase 2]
+  reply_to_message(to, message, reply_to_message_id)  [Baileys transport — Phase 2]
+  healthcheck()                             [Baileys transport — Phase 2]
 
-Architecture:
-  - Browser is started lazily on first tool call.
-  - One browser instance shared for the process lifetime (persistent mode).
+Architecture (Phase 2):
+  - Perception tool open_chat still runs on the original Playwright
+    WhatsAppWebClient — unchanged, not migrated.
+  - All other tools (get_messages/find_chat/send_message/send_file/send_image/
+    reply_to_message/mark_read/healthcheck) now go through BaileysTransport,
+    an HTTP client to the local Baileys sidecar
+    (backend/integrations/whatsapp/sidecar) — see
+    backend/api/integrations/whatsapp/baileys_transport.py. The Playwright
+    path stays available for open_chat until Baileys replacements are
+    fully verified in real use.
   - File lock at /tmp/wa_mcp.lock prevents concurrent server instances.
-  - CTRL-C / SIGTERM → clean shutdown (browser closed).
+  - CTRL-C / SIGTERM → clean shutdown (browser + transport both closed).
 
 Usage:
     python3 mcp_servers/whatsapp_mcp/server.py
@@ -34,6 +44,7 @@ Register in Claude CLI (~/.claude/mcp_config.json):
 
 import sys
 import os
+import hashlib
 import json
 import fcntl
 import signal
@@ -154,8 +165,58 @@ TOOLS = [
         },
     },
     {
+        "name": "send_file",
+        "description": (
+            "Send a document/file over WhatsApp. REQUIRES approved plan — never call autonomously. "
+            "Use 'to' as E.164 phone number or chat_id from get_messages. 'file_path' must be an "
+            "absolute local path readable by the backend process."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Phone number (E.164) or chat_id"},
+                "file_path": {"type": "string", "description": "Absolute local path to the file to send"},
+                "caption": {"type": "string", "description": "Optional caption to send with the file"},
+            },
+            "required": ["to", "file_path"],
+        },
+    },
+    {
+        "name": "send_image",
+        "description": (
+            "Send an image over WhatsApp. REQUIRES approved plan — never call autonomously. "
+            "Use 'to' as E.164 phone number or chat_id from get_messages. 'file_path' must be an "
+            "absolute local path readable by the backend process."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Phone number (E.164) or chat_id"},
+                "file_path": {"type": "string", "description": "Absolute local path to the image to send"},
+                "caption": {"type": "string", "description": "Optional caption to send with the image"},
+            },
+            "required": ["to", "file_path"],
+        },
+    },
+    {
+        "name": "reply_to_message",
+        "description": (
+            "Send a quoted reply to a specific WhatsApp message. REQUIRES approved plan — never call "
+            "autonomously. 'reply_to_message_id' comes from a message returned by get_messages/open_chat."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Phone number (E.164) or chat_id"},
+                "message": {"type": "string", "description": "Reply text"},
+                "reply_to_message_id": {"type": "string", "description": "Message id being replied to"},
+            },
+            "required": ["to", "message", "reply_to_message_id"],
+        },
+    },
+    {
         "name": "healthcheck",
-        "description": "Check WhatsApp Web connection status.",
+        "description": "Check WhatsApp connection status (Baileys sidecar).",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -163,7 +224,7 @@ TOOLS = [
     },
 ]
 
-# ── Lazy browser singleton ────────────────────────────────────────────────────
+# ── Lazy browser singleton (perception tools — unchanged Playwright path) ─────
 
 _client: Optional[Any] = None
 _client_started = False
@@ -185,36 +246,54 @@ def _ensure_client():
     return _client
 
 
+# ── Lazy transport singleton (Baileys sidecar — Phase 2) ─────────────────
+
+_transport: Optional[Any] = None
+
+
+def _ensure_transport():
+    global _transport
+    if _transport is not None:
+        return _transport
+
+    from api.integrations.whatsapp import BaileysTransport
+    _transport = BaileysTransport.from_settings()
+    return _transport
+
+
+def _idempotency_key(*parts: str) -> str:
+    """
+    Deterministic key from the call's own arguments (no timestamp/nonce) so
+    that a genuine duplicate call — e.g. a JSON-RPC client retrying after a
+    dropped response — dedupes, while two independent calls with different
+    content never collide.
+    """
+    h = hashlib.sha256("\x1f".join(parts).encode("utf-8"))
+    return h.hexdigest()[:32]
+
+
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
 def handle_get_messages(args: Dict) -> str:
     limit = int(args.get("limit", 10))
     unread_only = bool(args.get("unread_only", True))
 
-    client = _ensure_client()
+    transport = _ensure_transport()
+    messages = transport.get_messages(limit=limit, unread_only=unread_only)
+    return json.dumps(messages, ensure_ascii=False)
 
-    if not client.is_logged_in():
-        return json.dumps({
-            "error": "Not logged in to WhatsApp Web",
-            "action": "Run: python3 scripts/wa_setup.py"
-        })
 
-    if unread_only:
-        msgs = client.get_unread_messages(limit=limit)
-    else:
-        chats = client.list_chats(limit=limit)
-        msgs = [
-            {
-                "from_name": c["name"],
-                "chat_id": c["chat_id"],
-                "text": c["last_msg_preview"],
-                "unread_count": c["unread_count"],
-                "timestamp": c["timestamp"],
-            }
-            for c in chats
-        ]
-
-    return json.dumps(msgs, ensure_ascii=False)
+def _result_to_json(to: str, result) -> str:
+    payload = {
+        "success": result.success,
+        "to": to[:5] + "****",   # partial redaction in response
+        "message_id": result.message_id,
+        "deduped": result.deduped,
+    }
+    if not result.success:
+        payload["error_code"] = result.error_code.value if result.error_code else None
+        payload["error"] = result.error_message
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def handle_send_message(args: Dict) -> str:
@@ -224,26 +303,93 @@ def handle_send_message(args: Dict) -> str:
     if not to or not message:
         return json.dumps({"success": False, "error": "Both 'to' and 'message' are required"})
 
-    client = _ensure_client()
+    from api.integrations.whatsapp import WAAction, WhatsAppRequest
 
-    if not client.is_logged_in():
-        return json.dumps({"success": False, "error": "Not logged in to WhatsApp Web"})
+    transport = _ensure_transport()
+    request = WhatsAppRequest(
+        action=WAAction.SEND_TEXT,
+        recipient=to,
+        content=message,
+        idempotency_key=_idempotency_key("send_text", to, message),
+    )
+    result = transport.send_text(request)
+    return _result_to_json(to, result)
 
-    success = client.send_message(to=to, text=message)
-    return json.dumps({
-        "success": success,
-        "to": to[:5] + "****",   # partial redaction in response
-        "chars": len(message),
-    })
+
+def handle_send_file(args: Dict) -> str:
+    to = args.get("to", "")
+    file_path = args.get("file_path", "")
+    caption = args.get("caption", "")
+
+    if not to or not file_path:
+        return json.dumps({"success": False, "error": "Both 'to' and 'file_path' are required"})
+
+    from api.integrations.whatsapp import WAAction, WhatsAppRequest
+
+    transport = _ensure_transport()
+    request = WhatsAppRequest(
+        action=WAAction.SEND_FILE,
+        recipient=to,
+        content=caption,
+        attachment=file_path,
+        idempotency_key=_idempotency_key("send_file", to, file_path, caption),
+    )
+    result = transport.send_file(request)
+    return _result_to_json(to, result)
+
+
+def handle_send_image(args: Dict) -> str:
+    to = args.get("to", "")
+    file_path = args.get("file_path", "")
+    caption = args.get("caption", "")
+
+    if not to or not file_path:
+        return json.dumps({"success": False, "error": "Both 'to' and 'file_path' are required"})
+
+    from api.integrations.whatsapp import WAAction, WhatsAppRequest
+
+    transport = _ensure_transport()
+    request = WhatsAppRequest(
+        action=WAAction.SEND_IMAGE,
+        recipient=to,
+        content=caption,
+        attachment=file_path,
+        idempotency_key=_idempotency_key("send_image", to, file_path, caption),
+    )
+    result = transport.send_image(request)
+    return _result_to_json(to, result)
+
+
+def handle_reply_to_message(args: Dict) -> str:
+    to = args.get("to", "")
+    message = args.get("message", "")
+    reply_to_message_id = args.get("reply_to_message_id", "")
+
+    if not to or not message or not reply_to_message_id:
+        return json.dumps({
+            "success": False,
+            "error": "'to', 'message' and 'reply_to_message_id' are all required",
+        })
+
+    from api.integrations.whatsapp import WAAction, WhatsAppRequest
+
+    transport = _ensure_transport()
+    request = WhatsAppRequest(
+        action=WAAction.REPLY,
+        recipient=to,
+        content=message,
+        reply_to_message_id=reply_to_message_id,
+        idempotency_key=_idempotency_key("reply", to, message, reply_to_message_id),
+    )
+    result = transport.reply(request)
+    return _result_to_json(to, result)
 
 
 def handle_find_chat(args: Dict) -> str:
     query = args.get("query", "")
-    client = _ensure_client()
-    chats = client.list_chats(limit=50)
-    q = query.lower()
-    results = [c for c in chats if q in c["name"].lower() or q in c.get("chat_id", "").lower()]
-    return json.dumps(results[:10], ensure_ascii=False)
+    transport = _ensure_transport()
+    contacts = transport.find_contact(query)
+    return json.dumps(contacts, ensure_ascii=False)
 
 
 def handle_open_chat(args: Dict) -> str:
@@ -260,23 +406,26 @@ def handle_open_chat(args: Dict) -> str:
 
 def handle_mark_read(args: Dict) -> str:
     chat_id = args.get("chat_id", "")
-    client = _ensure_client()
-    success = client.mark_chat_read(chat_id)
+    transport = _ensure_transport()
+    success = transport.mark_read(chat_id)
     return json.dumps({"success": success, "chat_id": chat_id})
 
 
 def handle_healthcheck(_args: Dict) -> str:
     try:
-        client = _ensure_client()
-        status = client.healthcheck()
+        transport = _ensure_transport()
+        status = transport.healthcheck()
     except Exception as e:
         status = {"status": "error", "error": str(e)}
-    return json.dumps(status)
+    return json.dumps(status, ensure_ascii=False)
 
 
 HANDLERS = {
     "get_messages": handle_get_messages,
     "send_message": handle_send_message,
+    "send_file": handle_send_file,
+    "send_image": handle_send_image,
+    "reply_to_message": handle_reply_to_message,
     "find_chat": handle_find_chat,
     "open_chat": handle_open_chat,
     "mark_read": handle_mark_read,
@@ -355,10 +504,15 @@ def dispatch(msg: Dict) -> Optional[Dict]:
 
 def _shutdown(sig, frame):
     logger.info("Shutting down …")
-    global _client
+    global _client, _transport
     if _client:
         try:
             _client.stop()
+        except Exception:
+            pass
+    if _transport:
+        try:
+            _transport.close()
         except Exception:
             pass
     _release_lock()

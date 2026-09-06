@@ -238,7 +238,8 @@ async def run(
             summary = "I couldn't establish control of Chrome. I haven't started the flight search."
         except Exception as exc:
             logger.error("[BROWSER_AGENT_ERROR] task=%s error=%r", task.task_id, str(exc))
-            summary = f"Browser agent encountered an error: {exc}"
+            from api.services.failure_messages import spoken_for_exception
+            summary = spoken_for_exception(exc)
         logger.info("[BROWSER_AGENT_DONE] task=%s summary_chars=%d", task.task_id, len(summary))
         await _send(task, {"type": "agent_done", "task_id": task.task_id, "summary": summary})
         return summary

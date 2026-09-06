@@ -30,6 +30,11 @@ _OLLAMA_MODEL      = "qwen2.5:1.5b"  # override with OLLAMA_MODEL env var at sta
 # ~170ms once warm and is what api/main.py already preloads at startup.
 _openai_failed_until: float = 0.0 # epoch time; 0 = circuit closed (use OpenAI)
 
+# response_lang codes that currently justify spending an OpenAI call — see
+# Settings.openai_urdu_only in api/config.py. Everything else routes to
+# Ollama directly instead of eating a guaranteed-429 round trip first.
+_URDU_LANGS = frozenset({"ur", "ur_roman", "mixed"})
+
 # A fresh AsyncOpenAI() rebuilds the whole httpx connection pool (new TCP+TLS
 # handshake) on every single voice turn. Combined with the SDK's default
 # max_retries=2, one slow/failed connect attempt turns an 8s timeout into a
@@ -50,17 +55,65 @@ def _get_openai_client() -> "AsyncOpenAI":
         )
     return _openai_client
 
-# Sentence boundary after .  !  ?  followed by whitespace or end-of-string
-_SENT_RE = re.compile(r'(?<=[.!?])(?:\s+|$)')
+# Sentence boundary after .  !  ?  (or Urdu ۔ ؟) followed by whitespace or
+# end-of-string. Urdu ۔ (U+06D4 Arabic full stop) and ؟ (U+061F Arabic
+# question mark) are what the model actually emits for Urdu-script replies
+# (response_lang="ur", per _LANG_REPLY_INSTRUCTIONS below) — without them
+# here, a whole Urdu response never split into sentences until the stream
+# ended, silently defeating the pipelined-synthesis latency win this module
+# exists for, and denying the response any inter-sentence pause at all.
+_SENT_RE = re.compile(r'(?<=[.!?۔؟])(?:\s+|$)')
 # Strip markdown artifacts before TTS
 _MD_RE   = re.compile(r'\*{1,2}([^*]+)\*{1,2}|`([^`]+)`|#{1,6}\s|>\s?|~~([^~]+)~~|\[([^\]]+)\]\([^)]+\)')
 
 VOICE_SYSTEM_PROMPT = (
     "You are Xyron, a voice-first AI assistant built by Tayyab Aziz. "
-    "Reply in plain English only — no markdown, no lists, no bullet points. "
+    "No markdown, no lists, no bullet points. "
     "Keep responses concise (1-2 sentences) unless detail is genuinely needed. "
-    "The user may use Urdu/Hindi phrasing — understand intent, always reply in English."
+    "Reply in plain English only."
 )
+
+# response_lang -> reply-language instruction. Codes match
+# api.services.language_detector / api.services.response_language output
+# (en | ur | ur_roman | hi | ar | mixed) — this module does not detect
+# language itself, it only speaks whatever the caller already decided via
+# that existing pipeline (voice_ws.py's session_state["ml_resp_lang"]).
+_LANG_REPLY_INSTRUCTIONS: dict[str, str] = {
+    "en": "Reply in plain English only.",
+    "ur": (
+        "Reply in natural conversational Urdu script (Nastaliq), the way Pakistanis "
+        "actually speak — not overly formal or literary. Keep common technical terms "
+        "(Chrome, WhatsApp, GitHub, Excel, file, folder, order, invoice, download, "
+        "delivery) in English/Latin script inside the Urdu sentence when that sounds "
+        "more natural, exactly as Pakistani speakers do."
+    ),
+    "ur_roman": (
+        "Reply in natural conversational Roman Urdu (Urdu written in Latin letters), "
+        "the way Pakistanis actually speak — not overly formal. Keep common technical "
+        "terms (Chrome, WhatsApp, GitHub, Excel, file, folder, order, invoice, "
+        "download, delivery) in English when that sounds more natural."
+    ),
+    "hi": "Reply in natural conversational Hindi.",
+    "ar": "Reply in natural conversational Arabic.",
+    "mixed": (
+        "Reply in natural mixed Roman Urdu-English code-switching, the way Pakistanis "
+        "actually speak day to day — keep English nouns/technical terms in English, "
+        "Urdu grammar and verbs in Roman Urdu. Not overly formal."
+    ),
+}
+
+
+def _build_voice_system_prompt(response_lang: str = "en") -> str:
+    """Language-aware system prompt — same base persona, swaps only the
+    reply-language instruction based on the caller's already-detected
+    session language (never re-detects language itself)."""
+    instr = _LANG_REPLY_INSTRUCTIONS.get(response_lang, _LANG_REPLY_INSTRUCTIONS["en"])
+    return (
+        "You are Xyron, a voice-first AI assistant built by Tayyab Aziz. "
+        "No markdown, no lists, no bullet points. "
+        "Keep responses concise (1-2 sentences) unless detail is genuinely needed. "
+        f"{instr}"
+    )
 
 
 def _strip_md(text: str) -> str:
@@ -91,16 +144,46 @@ async def _kokoro_async(text: str, voice: str, speed: float) -> Optional[bytes]:
     return None
 
 
+async def _synthesize_for_lang(text: str, voice: str, speed: float, response_lang: str) -> Optional[bytes]:
+    """Route this pipeline's per-sentence synthesis by language, same as
+    voice_ws.py's _tts_ml does for tool-completion responses.
+
+    Bug this closes: every synthesis call in this file (streaming
+    conversational replies — the general-LLM-fallback path, which is what
+    answers anything that doesn't match a deterministic tool) called
+    _kokoro_async() directly and unconditionally, regardless of
+    response_lang. tts_router.py's Edge-TTS routing (voice/tts_router.py)
+    was wired in for tool-completion responses only — a free-form Urdu
+    conversational answer never reached it at all, so Kokoro's English
+    phonemizer was asked to pronounce Urdu/Arabic script text and either
+    produced garbage or returned None outright (live-observed:
+    "[Pipeline] Kokoro returned None for 'حسناً، ...'").
+    """
+    if response_lang == "en":
+        return await _kokoro_async(text, voice, speed)
+    try:
+        from voice.tts_router import synthesize as _route_synth
+        return await asyncio.wait_for(
+            asyncio.to_thread(_route_synth, text, response_lang, voice),
+            timeout=15.0,
+        )
+    except Exception as exc:
+        logger.warning("[Pipeline] tts_router synth failed for lang=%s: %s — falling back to Kokoro",
+                        response_lang, exc)
+        return await _kokoro_async(text, voice, speed)
+
+
 async def _ollama_stream(
     transcript: str,
     history: list[dict],
     voice: str,
     speed: float,
+    response_lang: str = "en",
 ) -> AsyncIterator[tuple[str, Optional[bytes], int, bool]]:
     """Fallback: non-streaming Ollama call wrapped as a single-chunk stream."""
     import os as _os
     model = _os.getenv("OLLAMA_MODEL", _OLLAMA_MODEL)
-    messages: list[dict] = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": _build_voice_system_prompt(response_lang)}]
     for h in history[-6:]:
         role = h.get("role", "user")
         text = h.get("text", h.get("content", ""))
@@ -116,9 +199,10 @@ async def _ollama_stream(
     # that got us here in the first place. Skip straight to the fallback
     # text instead of repeating a check we already know will fail.
     from api.services.readiness_service import readiness_service as _rs_ollama
+    from api.services.failure_messages import offline_fallback as _offline_fallback
     if not _rs_ollama.is_service_ready("ollama"):
         logger.warning("[MODEL_FALLBACK] ollama skipped — marked unavailable at boot (model=%s)", model)
-        text_out = "I'm having trouble connecting right now. Please try again."
+        text_out = _offline_fallback()
     else:
         try:
             import httpx
@@ -131,11 +215,11 @@ async def _ollama_stream(
                 text_out = (resp.json()["choices"][0]["message"]["content"] or "").strip()
         except Exception as exc:
             logger.warning("[MODEL_FALLBACK] ollama failed: %s", exc)
-            text_out = "I'm having trouble connecting right now. Please try again."
+            text_out = _offline_fallback()
 
     text_out = _strip_md(text_out)
     if text_out:
-        wav = await _kokoro_async(text_out, voice, speed)
+        wav = await _synthesize_for_lang(text_out, voice, speed, response_lang)
         yield text_out, wav, 1, True
 
 
@@ -144,6 +228,7 @@ async def stream_response_with_tts(
     history: list[dict],
     voice: str = "af_nova",
     speed: float = 1.0,
+    response_lang: str = "en",
 ) -> AsyncIterator[tuple[str, Optional[bytes], int, bool]]:
     """
     Async generator — yields (sentence_text, wav_bytes, chunk_index, is_final).
@@ -151,13 +236,31 @@ async def stream_response_with_tts(
     Synthesis is pipelined: as soon as a sentence boundary is found, Kokoro
     starts synthesizing it while OpenAI continues generating the next sentence.
     The consumer receives the audio chunk as soon as synthesis completes.
+
+    response_lang: en | ur | ur_roman | hi | ar | mixed — from the caller's
+    already-detected session language (api.services.response_language).
+    Controls only which language the reply is generated in, never re-detects.
     """
     global _openai_failed_until
     from api.config import settings as _cfg
     from api.services.model_router import select_model
 
+    if _cfg.openai_urdu_only and response_lang not in _URDU_LANGS:
+        # Local-first for non-Urdu: skip the OpenAI attempt entirely instead
+        # of paying its full timeout/429 latency before falling back.
+        logger.info("[MODEL_ROUTE] lang=%s not urdu — using=ollama reason=openai_urdu_only", response_lang)
+        async for item in _ollama_stream(transcript, history, voice, speed, response_lang):
+            yield item
+        return
+
     if not _cfg.openai_api_key:
-        logger.warning("[Pipeline] No OpenAI key — returning empty stream")
+        # No key at all — not a transient failure, so this used to just
+        # return an empty stream (dead air for the user). Complex/free-form
+        # Urdu requests must still work without OpenAI configured at all
+        # (local-first requirement) — go straight to Ollama instead.
+        logger.info("[MODEL_ROUTE] no OpenAI key configured — using Ollama directly")
+        async for item in _ollama_stream(transcript, history, voice, speed, response_lang):
+            yield item
         return
 
     # Circuit-breaker: OpenAI failed recently → route to Ollama immediately
@@ -165,7 +268,7 @@ async def stream_response_with_tts(
     if use_ollama:
         logger.info("[MODEL_SWITCH_LOCAL] [MODEL_ROUTE] using=ollama reason=circuit_open remaining=%.0fs",
                     _openai_failed_until - time.time())
-        async for item in _ollama_stream(transcript, history, voice, speed):
+        async for item in _ollama_stream(transcript, history, voice, speed, response_lang):
             yield item
         return
 
@@ -175,7 +278,7 @@ async def stream_response_with_tts(
         model = "gpt-4o-mini"
     logger.info("[MODEL_ROUTE] using=openai model=%s", model)
 
-    messages: list[dict] = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": _build_voice_system_prompt(response_lang)}]
     for h in history[-10:]:
         role = h.get("role", "user")
         text = h.get("text", h.get("content", ""))
@@ -228,7 +331,7 @@ async def stream_response_with_tts(
                             if sentence:
                                 chunk_idx += 1
                                 tts_task = asyncio.create_task(
-                                    _kokoro_async(sentence, voice, speed)
+                                    _synthesize_for_lang(sentence, voice, speed, response_lang)
                                 )
                                 await queue.put((sentence, tts_task, chunk_idx, False))
                         pending = parts[-1]
@@ -262,18 +365,29 @@ async def stream_response_with_tts(
                 try:
                     async def _passthrough(_w: Optional[bytes]) -> Optional[bytes]:
                         return _w
-                    async for _sent, _wav, _idx, _fin in _ollama_stream(transcript, history, voice, speed):
+                    async for _sent, _wav, _idx, _fin in _ollama_stream(transcript, history, voice, speed, response_lang):
                         chunk_idx += 1
                         tts_task = asyncio.create_task(_passthrough(_wav))
                         await queue.put((_sent, tts_task, chunk_idx, _fin))
                 except Exception as _fallback_exc:
                     logger.error("[MODEL_FALLBACK] same-turn ollama rescue also failed: %s", _fallback_exc)
+                    if chunk_idx == 0:
+                        # Both OpenAI and the Ollama rescue failed with nothing
+                        # queued — without this, the turn ends in total silence
+                        # (no text, no audio, no exception the caller can catch).
+                        from api.services.failure_messages import offline_fallback as _offline_fallback_p
+                        _msg = _offline_fallback_p()
+                        chunk_idx += 1
+                        tts_task = asyncio.create_task(
+                            _synthesize_for_lang(_msg, voice, speed, response_lang)
+                        )
+                        await queue.put((_msg, tts_task, chunk_idx, True))
         finally:
             # Flush remaining fragment as final
             remaining = _strip_md(pending)
             if remaining:
                 chunk_idx += 1
-                tts_task = asyncio.create_task(_kokoro_async(remaining, voice, speed))
+                tts_task = asyncio.create_task(_synthesize_for_lang(remaining, voice, speed, response_lang))
                 await queue.put((remaining, tts_task, chunk_idx, True))
             elif chunk_idx > 0:
                 # Mark the last queued item as final — handled below
@@ -317,23 +431,23 @@ async def quick_response(
     history: list[dict] | None = None,
     model: str = "gpt-4o-mini",
     system_override: Optional[str] = None,
+    response_lang: str = "en",
 ) -> str:
     """
     Non-streaming LLM call. Returns the full response text.
     Used for tool narration, clarification prompts, and low-latency paths.
+
+    response_lang: en | ur | ur_roman | hi | ar | mixed — see stream_response_with_tts.
+    Ignored when system_override is given (caller owns the full prompt then).
     """
     global _openai_failed_until
     from api.config import settings as _cfg
-    if not _cfg.openai_api_key:
-        return "I'm not sure how to help with that."
 
-    # Circuit-breaker: OpenAI failed recently → call Ollama instead
-    if time.time() < _openai_failed_until:
+    async def _ollama_quick(sys_prompt: str) -> str:
         import os as _os
         import httpx
         ol_model = _os.getenv("OLLAMA_MODEL", _OLLAMA_MODEL)
         logger.info("[MODEL_ROUTE] quick_response using=ollama model=%s", ol_model)
-        sys_prompt = system_override or VOICE_SYSTEM_PROMPT
         msgs = [{"role": "system", "content": sys_prompt}]
         for h in (history or [])[-6:]:
             r = h.get("role", "user")
@@ -351,9 +465,24 @@ async def quick_response(
                 return (resp.json()["choices"][0]["message"]["content"] or "").strip()
         except Exception as exc:
             logger.warning("[MODEL_FALLBACK] ollama quick_response failed: %s", exc)
-            return "I'm having trouble connecting right now."
+            from api.services.failure_messages import offline_fallback as _offline_fallback_qr
+            return _offline_fallback_qr()
 
-    sys_prompt = system_override or VOICE_SYSTEM_PROMPT
+    if _cfg.openai_urdu_only and response_lang not in _URDU_LANGS:
+        # Local-first for non-Urdu — see Settings.openai_urdu_only.
+        logger.info("[MODEL_ROUTE] quick_response lang=%s not urdu — using=ollama reason=openai_urdu_only", response_lang)
+        return await _ollama_quick(system_override or _build_voice_system_prompt(response_lang))
+
+    if not _cfg.openai_api_key:
+        # No key at all — go straight to Ollama instead of a canned English
+        # non-answer (local-first requirement; must not silently degrade).
+        return await _ollama_quick(system_override or _build_voice_system_prompt(response_lang))
+
+    # Circuit-breaker: OpenAI failed recently → call Ollama instead
+    if time.time() < _openai_failed_until:
+        return await _ollama_quick(system_override or _build_voice_system_prompt(response_lang))
+
+    sys_prompt = system_override or _build_voice_system_prompt(response_lang)
     messages: list[dict] = [{"role": "system", "content": sys_prompt}]
     for h in (history or [])[-6:]:
         role = h.get("role", "user")
@@ -376,4 +505,7 @@ async def quick_response(
         _openai_failed_until = time.time() + _FALLBACK_DURATION
         logger.warning("[MODEL_FALLBACK] openai quick_response failed: %s — ollama for %.0fs",
                        exc, _FALLBACK_DURATION)
-        return "I ran into an issue. Please try again."
+        # This turn discovered the failure — answer it via Ollama too instead
+        # of a canned English non-answer (mirrors stream_response_with_tts's
+        # same-turn rescue).
+        return await _ollama_quick(sys_prompt)

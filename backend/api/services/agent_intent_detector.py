@@ -184,13 +184,6 @@ _AUTO_CLEAN_RE = re.compile(
     re.IGNORECASE,
 )
 
-_AUTO_ORGANIZE_RE = re.compile(
-    r'\b(?:organize\s+(?:my\s+)?(?:downloads|desktop|files|folder)|'
-    r'sort\s+(?:my\s+)?(?:downloads|files|desktop)|'
-    r'(?:downloads|files)\s+(?:ko\s+)?organize)\b',
-    re.IGNORECASE,
-)
-
 _AUTO_DUPLICATE_RE = re.compile(
     r'\b(?:find\s+(?:duplicate|duplicate\s+files|duplicates)|'
     r'remove\s+duplicates|delete\s+duplicates|'
@@ -391,11 +384,6 @@ class AgentIntentDetector:
             return AgentIntentResult(
                 is_agent_command=True, agent_type="automation",
                 confidence=0.90, reason="clean_pattern",
-            )
-        if _AUTO_ORGANIZE_RE.search(t):
-            return AgentIntentResult(
-                is_agent_command=True, agent_type="automation",
-                confidence=0.88, reason="organize_pattern",
             )
         if _AUTO_DUPLICATE_RE.search(t):
             return AgentIntentResult(

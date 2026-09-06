@@ -4,9 +4,10 @@ Generates natural-language assistant responses for spoken TTS output.
 Priority:
 1. OpenAI generates a concise spoken response (when key is available)
 2. Ollama local LLM fallback (when OpenAI is unavailable or returns None)
-3. Template fallback per-agent (always works)
+3. Template fallback per-agent (always works, language-aware)
 
-Each response is ≤ 2 sentences, no markdown, natural spoken English.
+Each response is ≤ 2 sentences, no markdown, natural spoken language.
+Supports English, Urdu, Roman Urdu, and mixed Urdu-English fallbacks.
 """
 from __future__ import annotations
 
@@ -18,6 +19,26 @@ _XYRON_SYSTEM = (
     "You are Xyron, a voice AI built by Tayyab Aziz. "
     "Keep replies under 2 sentences. No markdown."
 )
+
+
+def _detect_response_language(text: str) -> str:
+    """
+    Quick language detection for template fallback responses.
+    Returns: "en" | "ur" | "ur_roman" | "mixed"
+    """
+    try:
+        from cognition.language_detector import detect as _detect_lang
+        result = _detect_lang(text)
+        lang = result.get("language", "english")
+        if lang == "urdu":
+            return "ur"
+        elif lang == "roman_urdu":
+            return "ur_roman"
+        elif lang == "mixed":
+            return "mixed"
+        return "en"
+    except Exception:
+        return "en"
 
 
 def generate_response(
@@ -77,12 +98,13 @@ def generate_response(
     if reply:
         return reply
 
-    # Tier 3: Template fallback
+    # Tier 3: Template fallback — language-aware
+    resp_lang = _detect_response_language(text)
     if tool_output:
-        return tool_output[:150]
+        return _localize_text(tool_output[:150], resp_lang)
     if tool_name:
-        return f"Done — {tool_name.replace('_', ' ')}."
-    return "Sure, done."
+        return _urdu_done(tool_name, resp_lang)
+    return _urdu_generic_done(resp_lang)
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +350,32 @@ def _resolve_spoken_response(
     return base
 
 
+# ── Urdu/Roman Urdu template helpers ─────────────────────────────────────────
+
+def _urdu_generic_done(lang: str) -> str:
+    """Generic 'done' response in the appropriate language."""
+    if lang == "ur":
+        return "Ho gaya, aapka kaam ho gaya hai."
+    elif lang in ("ur_roman", "mixed"):
+        return "Ho gaya bhai, aapka kaam done."
+    return "Sure, done."
+
+
+def _urdu_done(tool_name: str, lang: str) -> str:
+    """'Done — {tool}' response in the appropriate language."""
+    friendly_name = tool_name.replace('_', ' ')
+    if lang == "ur":
+        return f"Ho gaya, {friendly_name} complete ho gaya."
+    elif lang in ("ur_roman", "mixed"):
+        return f"Ho gaya, {friendly_name} done."
+    return f"Done — {friendly_name}."
+
+
+def _localize_text(text: str, lang: str) -> str:
+    """Pass through text as-is (tool output); the caller should handle language."""
+    return text
+
+
 def _clean_for_speech(text: str) -> str:
     """Remove markdown and technical noise, keep the essential content."""
     if not text:
@@ -352,7 +400,15 @@ def _clean_for_speech(text: str) -> str:
 
 
 def _email_response(skill: str, clean: str, command: str) -> str:
+    lang = _detect_response_language(command)
     cmd_lower = command.lower()
+    if lang in ("ur", "ur_roman", "mixed"):
+        if 'summarize' in cmd_lower or 'summary' in skill:
+            return "Aapka email summary tayyar hai. Inbox check karlo."
+        elif 'reply' in cmd_lower:
+            return "Reply draft tayyar ho gaya hai."
+        else:
+            return "Aapka email draft tayyar hai."
     if 'summarize' in cmd_lower or 'summary' in skill:
         return "Here's your email summary. Check your inbox for full details."
     elif 'reply' in cmd_lower:
@@ -362,6 +418,11 @@ def _email_response(skill: str, clean: str, command: str) -> str:
 
 
 def _linkedin_response(skill: str, clean: str, command: str) -> str:
+    lang = _detect_response_language(command)
+    if lang in ("ur", "ur_roman", "mixed"):
+        if 'publish' in skill:
+            return "Aapki LinkedIn post publish ho gayi hai."
+        return "Aapka LinkedIn draft tayyar hai."
     if 'publish' in skill:
         return "Your LinkedIn post has been published successfully."
     return "Your LinkedIn draft is ready."
@@ -382,31 +443,36 @@ def _reporting_response(skill: str, clean: str) -> str:
 
 
 def _workflow_response(skill: str, clean: str) -> str:
-    return "Workflow status retrieved. Check active workflows in the dashboard."
+    return "Workflow status checked. Dashboard mein active workflows dekhlo."
 
 
 def _integration_response(clean: str) -> str:
-    return "Integration status checked. View details in the integrations panel."
+    return "Integration status checked. Integrations panel mein details dekhlo."
 
 
 def _activity_response(clean: str) -> str:
-    return "Here's your recent activity. Check the activity log for full details."
+    return "Recent activity tayyar hai. Activity log check karlo."
 
 
 def _whatsapp_response(skill: str, clean: str) -> str:
     if 'send' in skill:
-        return "Your WhatsApp message is ready and needs approval before sending."
-    return "WhatsApp status retrieved. Check the dashboard for details."
+        return "Aapka WhatsApp message tayyar hai, bhejne se pehle approval chahiye."
+    return "WhatsApp status check ho gaya. Dashboard mein details dekhlo."
 
 
 def _instagram_response(skill: str, clean: str) -> str:
-    return "Your Instagram content is ready. Open the dashboard to review it."
+    return "Aapka Instagram content tayyar hai. Dashboard mein review karlo."
 
 
 def _odoo_response(skill: str, clean: str) -> str:
-    return "Odoo data retrieved. Check the accounting dashboard for details."
+    return "Odoo se data aa gaya. Accounting dashboard mein dekhlo."
 
 
 def _general_response(clean: str, command: str) -> str:
+    lang = _detect_response_language(command)
     cmd_short = command[:50].rstrip()
+    if lang == "ur":
+        return f"Ho gaya. Aapki request process ho gayi. Dashboard mein result dekhlo."
+    elif lang in ("ur_roman", "mixed"):
+        return f"Ho gaya bhai, {cmd_short} ka kaam done. Dashboard check karlo."
     return f"Done. I've processed your request about {cmd_short}. Check the dashboard for results."

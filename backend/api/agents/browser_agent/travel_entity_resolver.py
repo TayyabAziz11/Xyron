@@ -137,6 +137,94 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
+# ── Countries ─────────────────────────────────────────────────────────────────
+# Users routinely name a COUNTRY, not a city ("find me a flight from Dubai
+# to Japan"). The city gazetteer above has no countries, so a perfectly
+# clean "Japan" fell through to fuzzy city scoring and its "best match" was
+# Jakarta at 0.47 — ambiguous, which wasted a full clarification round-trip
+# ("Did you mean Jakarta, Casablanca or Johannesburg?") on live speech.
+# Google Flights accepts country names directly in the destination field, so
+# an exact country match resolves at full confidence with no airport lookup.
+# canonical name → spoken aliases (all matched via _norm, case/punct-free)
+_COUNTRIES: dict[str, list[str]] = {
+    # Asia-Pacific
+    "Japan": ["japan", "jpn"],
+    "Pakistan": ["pakistan", "pak"],
+    "India": ["india"],
+    "Bangladesh": ["bangladesh"],
+    "Sri Lanka": ["sri lanka", "srilanka"],
+    "Nepal": ["nepal"],
+    "China": ["china"],
+    "South Korea": ["south korea", "korea"],
+    "Thailand": ["thailand"],
+    "Malaysia": ["malaysia"],
+    "Indonesia": ["indonesia"],
+    "Philippines": ["philippines", "philippine"],
+    "Vietnam": ["vietnam", "viet nam"],
+    "Singapore": ["singapore"],
+    "Australia": ["australia"],
+    "New Zealand": ["new zealand", "newzealand"],
+    "Maldives": ["maldives"],
+    "Uzbekistan": ["uzbekistan"],
+    "Azerbaijan": ["azerbaijan"],
+    "Georgia": ["georgia"],
+    # Middle East
+    "Saudi Arabia": ["saudi arabia", "saudi", "ksa"],
+    "United Arab Emirates": ["uae", "united arab emirates"],
+    "Qatar": ["qatar"],
+    "Oman": ["oman"],
+    "Kuwait": ["kuwait"],
+    "Bahrain": ["bahrain"],
+    "Jordan": ["jordan"],
+    "Iraq": ["iraq"],
+    "Iran": ["iran"],
+    "Israel": ["israel"],
+    "Turkey": ["turkey", "turkiye"],
+    # Europe
+    "United Kingdom": ["uk", "united kingdom", "england", "britain", "great britain", "scotland", "wales"],
+    "Ireland": ["ireland"],
+    "France": ["france"],
+    "Germany": ["germany"],
+    "Italy": ["italy"],
+    "Spain": ["spain"],
+    "Portugal": ["portugal"],
+    "Netherlands": ["netherlands", "holland"],
+    "Switzerland": ["switzerland", "swiss"],
+    "Austria": ["austria"],
+    "Belgium": ["belgium"],
+    "Greece": ["greece"],
+    "Sweden": ["sweden"],
+    "Norway": ["norway"],
+    "Denmark": ["denmark"],
+    "Finland": ["finland"],
+    "Poland": ["poland"],
+    "Russia": ["russia"],
+    "Ukraine": ["ukraine"],
+    # Americas
+    "United States": ["usa", "us", "united states", "united states of america", "america"],
+    "Canada": ["canada"],
+    "Mexico": ["mexico"],
+    "Brazil": ["brazil", "brasil"],
+    "Argentina": ["argentina"],
+    "Chile": ["chile"],
+    # Africa
+    "Egypt": ["egypt"],
+    "Morocco": ["morocco"],
+    "South Africa": ["south africa"],
+    "Kenya": ["kenya"],
+    "Nigeria": ["nigeria"],
+    "Ethiopia": ["ethiopia"],
+    "Ghana": ["ghana"],
+}
+
+# Normalized alias → canonical country name (built once at import).
+_COUNTRY_BY_ALIAS: dict[str, str] = {}
+for _canonical, _aliases in _COUNTRIES.items():
+    _COUNTRY_BY_ALIAS[_norm(_canonical)] = _canonical
+    for _alias in _aliases:
+        _COUNTRY_BY_ALIAS[_norm(_alias)] = _canonical
+
+
 def _combined_score(query: str, candidate: str) -> float:
     q, c = _norm(query), _norm(candidate)
     if not q or not c:
@@ -173,6 +261,23 @@ class TravelEntityResolver:
             return TravelLocation(
                 raw_text=raw_text, canonical_city=entry["city"], airport_name=entry["name"],
                 iata_code=code, country=entry["country"], confidence=1.0, evidence="exact_iata_code",
+            )
+
+        # Exact country match ("Japan", "the UK") — checked BEFORE fuzzy city
+        # scoring so a clean country name never degrades into meaningless
+        # city candidates. canonical_city carries the country name so
+        # TravelGoal picks it up unchanged; Google Flights accepts country
+        # names directly in the location field.
+        q = _norm(raw_text)
+        if q.startswith("the") and len(q) > 3:  # "the UK" / "the Philippines"
+            q = q[3:]
+        country = _COUNTRY_BY_ALIAS.get(q)
+        if country:
+            logger.info("[TRAVEL_ENTITY_RESOLVED] type=location raw=%r -> %s via=exact_country_match",
+                        raw_text, country)
+            return TravelLocation(
+                raw_text=raw_text, canonical_city=country, country=country,
+                confidence=0.97, evidence="exact_country_match",
             )
 
         scored = [(city, _combined_score(raw_text, city)) for city in _MAJOR_CITIES]

@@ -5,6 +5,8 @@ Detects 10 emotional states from transcript text using regex, punctuation
 analysis, capitalization, and vocabulary scoring. Falls back to local LLM
 only when heuristic confidence < 0.4.
 
+Supports both English and Urdu/Roman Urdu vocabulary for emotion detection.
+
 Target: <15ms heuristic path. LLM path adds ~200-400ms (llama3.2:3b).
 """
 from __future__ import annotations
@@ -36,6 +38,10 @@ _HYPE_WORDS = frozenset({
     "fire", "insane", "goat", "bussin", "sheesh", "slay", "lit",
     "banger", "beast", "monster", "absurd", "cracked", "unreal",
     "lets", "go", "wagwan", "yessir", "bro", "actually",
+    # Urdu/Roman Urdu hype words
+    "zabardast", "kamaal", "yaar", "bhai", "wah", "maza",
+    "bohat", "buhat", "shandar", "laajawab", "dhamaka",
+    "zordaar", "khalnak", "tez", "dhansu",
 })
 
 _EXCITEMENT_WORDS = frozenset({
@@ -43,6 +49,11 @@ _EXCITEMENT_WORDS = frozenset({
     "perfect", "great", "brilliant", "love", "excellent",
     "nice", "cool", "sick", "dope", "sweet", "beautiful", "fantastic",
     "wonderful", "outstanding", "superb", "woooo", "yesss",
+    # Urdu/Roman Urdu excitement words
+    "behtareen", "zabardast", "shandar", "kamaal", "wah",
+    "acha", "accha", "maza", "khoob", "khoobsurat",
+    "lajawab", "alhamdullilah", "mashallah",
+    "aakhir", "milgaya", "milgayi", "hogaya", "hogayi",
 })
 
 _FRUSTRATION_WORDS = frozenset({
@@ -50,29 +61,57 @@ _FRUSTRATION_WORDS = frozenset({
     "crash", "bug", "ruined", "hate", "terrible", "awful",
     "stupid", "dumb", "annoying", "useless", "wtf", "seriously",
     "nothing", "keeps", "cant", "wont", "doesnt", "isnt",
+    # Urdu/Roman Urdu frustration words
+    "yaar", "phir", "dobara", "nahi", "nahin", "pagal",
+    "bekaar", "bekar", "bakwas", "ajeeb", "mushkil",
+    "pareshan", "tang", "ghussa", "naraaz",
+    "kharab", "toot", "toota", "bigra", "bigri",
+    "kuch_nahi", "kuchnahi", "phirse", "dobara", "phir se",
 })
 
 _STRESS_WORDS = frozenset({
     "asap", "urgent", "hurry", "rush", "quickly", "deadline",
-    "pressure", "panic", "emergency", "immediately", "now",
-    "fast", "time", "running", "out",
+    "pressure", "panic", "emergency", "immediately",
+    # NOTE: "now", "time", "running", "out", "fast" were removed — they are
+    # far too common in ordinary commands ("Now open YouTube", "It's work
+    # time, buddy") and mis-flagged calm users as stressed (live regression).
+    # Urdu/Roman Urdu stress words
+    "jaldi", "abhi", "turant", "foran", "tez",
+    "fikr", "tension", "pareshani", "musibat",
+    "jaldi karo", "waqt nahi", "deadline",
 })
 
 _CURIOSITY_WORDS = frozenset({
     "wonder", "curious", "interesting", "hmm", "maybe", "possibly",
     "perhaps", "explore", "test", "trying", "experiment", "what",
     "why", "how", "could", "would", "might", "think",
+    # Urdu/Roman Urdu curiosity words
+    "kya", "kyun", "kaise", "kaisa", "interesting",
+    "soch", "sochta", "lagta", "shayad",
+    "ho_sakta", "hosakta", "mumkin", "pta nahi",
+    "pta", "nahi pta", "maloom",
+    "dekhte hain", "dekhen", "samjho",
 })
 
 _PRIDE_WORDS = frozenset({
     "fixed", "done", "finished", "built", "shipped", "deployed",
     "working", "solved", "passed", "nailed", "completed", "achieved",
     "got", "made", "created", "added", "merged",
+    # Urdu/Roman Urdu pride words
+    "hogaya", "hogayi", "ho gaya", "ho gayi", "done",
+    "tayyar", "mukammal", "khatam", "bana_diya",
+    "banadiya", "banadi", "theek", "sahi",
+    "kaam ho gaya", "ho gaya bhai", "ban_gaya",
+    "banao", "banaya", "kiya",
 })
 
 _HUMOR_WORDS = frozenset({
     "lol", "lmao", "lmfao", "haha", "hehe", "rofl", "xd", "joking",
     "funny", "joke", "hilarious", "💀", "😂", "bruh", "no way",
+    # Urdu/Roman Urdu humor words
+    "haha", "hahaha", "mazak", "mazaak", "mazaakiya",
+    "funny", "hasi", "hansi", "mazaq",
+    "arre", "arey", "waah", "😂",
 })
 
 # ── Regex patterns ────────────────────────────────────────────────────────────
@@ -83,12 +122,25 @@ _MULTI_QUESTION = re.compile(r'\?{2,}|\?\s*\?')
 _LETS_GO        = re.compile(
     r'\b(lets?\s*go|yessir|wagwan|no\s*way|bro\s*what|are\s*you\s*serious)\b', re.I
 )
+# Urdu/Roman Urdu hype patterns
+_URDU_HYPE      = re.compile(
+    r'\b(chalo\s*shuru|ho\s*gaya\s*bhai|yeh\s*hui\s*baat|'
+    r'zabardast\s*yaar|kamaal\s*ho\s*gaya|ab\s*maza\s*aaya)\b', re.I
+)
 _SARCASM_PAT = [
     re.compile(r'\b(oh\s+great|yeah\s+sure|oh\s+wow|as\s+if|totally|right)\b', re.I),
     re.compile(r'\b(brilliant|wonderful|perfect|amazing)\b.{0,20}\b(not|never|broken|failed)\b', re.I),
+    # Urdu sarcasm patterns
+    re.compile(r'\b(haan\s+haan|bilkul\s+nahi|wah\s+wah|kya\s+baat\s+hai)\b', re.I),
+    re.compile(r'\b(zabardast|behtareen|shandar)\b.{0,20}\b(nahi|nahin|bekaar|kharab)\b', re.I),
 ]
 _PRIDE_PAST = re.compile(
     r'\b(i\s+)(fixed|built|shipped|solved|finished|got\s+it|made\s+it|nailed\s+it)\b', re.I
+)
+# Urdu pride patterns
+_URDU_PRIDE_PAST = re.compile(
+    r'\b(maine?\s+)(bana\s*diya?|kar\s*diya?|theek\s+kar\s+diya|'
+    r'fix\s+kar\s+diya|ho\s+gaya|complete\s+kar\s+diya)\b', re.I
 )
 
 
@@ -132,12 +184,14 @@ class EmotionEngine:
 
         sarcasm_hit   = any(p.search(t) for p in _SARCASM_PAT)
         lets_go_hit   = bool(_LETS_GO.search(t))
+        urdu_hype_hit = bool(_URDU_HYPE.search(t))
         pride_pattern = bool(_PRIDE_PAST.search(t))
+        urdu_pride    = bool(_URDU_PRIDE_PAST.search(t))
 
         # ── Decision tree ─────────────────────────────────────────────────
 
         # HYPE: explicit pattern OR hype vocab + caps/multi-exclaim
-        if lets_go_hit or (hype_hits >= 2 and (caps_count >= 1 or multi_exclaim)):
+        if lets_go_hit or urdu_hype_hit or (hype_hits >= 2 and (caps_count >= 1 or multi_exclaim)):
             en = min(1.0, 0.75 + 0.05 * exclaim_count + 0.05 * hype_hits)
             return EmotionResult("hype", en, 0.88, 0.92)
 
@@ -163,15 +217,24 @@ class EmotionEngine:
             conf = 0.80 if frustrate_hits >= 2 else 0.62
             return EmotionResult("frustration", en, conf, 0.78)
 
+        # EXCITEMENT (vocab-only, no punctuation energy): spoken praise like
+        # "Perfect. Now can you open YouTube..." — previously fell through to
+        # stress because generic words ("now", "time") were stress markers.
+        # Sarcasm had its chance above; frustration vocab overrides this.
+        if excite_hits >= 1:
+            en = min(0.70, 0.40 + 0.08 * excite_hits + 0.04 * exclaim_count)
+            conf = 0.70 if excite_hits >= 2 else 0.62
+            return EmotionResult("excitement", en, conf, 0.60)
+
         # STRESS: urgency words or rapid-fire questions
         if stress_hits >= 1 or (multi_q and question_count >= 2):
             en = min(0.72, 0.42 + 0.10 * stress_hits)
             return EmotionResult("stress", en, 0.72, 0.70)
 
         # PRIDE: achievement pattern or pride vocab + no frustration
-        if (pride_pattern or pride_hits >= 1) and frustrate_hits == 0 and word_count >= 3:
+        if (pride_pattern or urdu_pride or pride_hits >= 1) and frustrate_hits == 0 and word_count >= 3:
             en = min(0.78, 0.50 + 0.08 * pride_hits)
-            conf = 0.80 if pride_pattern else 0.68
+            conf = 0.80 if (pride_pattern or urdu_pride) else 0.68
             return EmotionResult("pride", en, conf, 0.75)
 
         # CURIOSITY: multiple curiosity words OR one + question mark
